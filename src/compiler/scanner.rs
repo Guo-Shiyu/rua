@@ -45,7 +45,7 @@ impl<'a> Scanner<'a> {
     }
 
     /// Consume while predicate returns `true` or until the end of input.
-    pub fn eat_while(&mut self, predicate: impl Fn(char) -> bool) -> &'a str {
+    pub fn eat_while(&mut self, mut predicate: impl FnMut(char) -> bool) -> &'a str {
         let mut len = 0;
         let record  = self.chars.as_str();
         while predicate(self.first()) && !self.is_eof() {

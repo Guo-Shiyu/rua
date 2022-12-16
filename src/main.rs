@@ -2,10 +2,12 @@ use crate::compiler::token::Token;
 
 pub mod compiler;
 
-fn main() {}
+fn main() {
+    test();
+}
 
 fn test() {
-    let src = std::fs::read_to_string("testes/all.lua").expect("can't open test source file");
+    let src = std::fs::read_to_string("testes/strings.lua").expect("can't open test source file");
 
     let mut lex = compiler::lexer::Lexer::new(&src);
     loop {

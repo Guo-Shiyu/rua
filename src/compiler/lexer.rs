@@ -41,16 +41,19 @@ impl<'a> Lexer<'a> {
     }
 
     pub fn next(&mut self) -> Result<Token, SyntaxErr> {
-        if self.scan.is_eof() {
-            return Ok(Token::Eof);
-        }
-
         use Token::*;
+        let whitespaces = [' ', '\t', '\u{013}', '\u{014}'];
         loop {
+            if self.scan.is_eof() {
+                return Ok(Token::Eof);
+            }
             match self.scan.first() {
-                wp if [' ', '\t', '\u{013}', '\u{014}'].contains(&wp) => {
-                    let count = self.scan.eat_while(|x| x == wp).len();
+                wp if whitespaces.contains(&wp) => {
+                    let count = self.scan.eat_while(|x| whitespaces.contains(&x)).len();
                     self.advance(count);
+                    if self.scan.is_eof() {
+                        return Ok(Token::Eof);
+                    }
                 }
 
                 '\n' => {
@@ -65,18 +68,21 @@ impl<'a> Lexer<'a> {
                     self.new_line();
                 }
 
+                '[' => match self.scan.second() {
+                    '=' | '[' => return Ok(Token::Literial(self.lex_multiline())),
+                    _ => {
+                        self.scan.eat();
+                        return Ok(Token::LS);
+                    }
+                },
+
                 num if num.is_ascii_digit() => return self.lex_number(),
 
                 // UTF8 identity support :)
                 id if id.is_alphabetic() || id == '_' => {
                     let suffix = self.scan.eat_while(|ch| ch == '_' || ch.is_alphabetic());
                     self.advance(suffix.len());
-
-                    let mut ident = String::with_capacity(16);
-                    ident.push(id);
-                    ident.push_str(suffix);
-
-                    return Ok(Token::Ident(ident));
+                    return Ok(self.reserve_or_ident(suffix));
                 }
 
                 punc if punc.is_ascii_punctuation() => {
@@ -98,7 +104,6 @@ impl<'a> Lexer<'a> {
                         ')' => RP,
                         '{' => LB,
                         '}' => RB,
-                        '[' => LS,
                         ']' => RS,
                         ';' => Semi,
                         ',' => Comma,
@@ -108,7 +113,9 @@ impl<'a> Lexer<'a> {
                                 '-' => match peek {
                                     '-' => {
                                         self.scan.eat();
-                                        return self.lex_comment();
+                                        self.advance(1);
+                                        self.lex_comment();
+                                        continue;
                                     }
                                     _ => Minus,
                                 },
@@ -147,9 +154,8 @@ impl<'a> Lexer<'a> {
                                 quote if quote == '\'' || quote == '\"' => {
                                     let lit = self.scan.eat_while(|ch| ch != quote);
                                     self.scan.eat();
-                                    self.advance(1);
-
-                                    Literial(String::from_str(lit).unwrap())
+                                    self.advance(lit.len() + 1);
+                                    Literial(lit.to_string())
                                 }
 
                                 _ => unreachable!(),
@@ -180,10 +186,10 @@ impl<'a> Lexer<'a> {
     }
 
     fn lex_number(&mut self) -> Result<Token, SyntaxErr> {
-        let is_number_digit = |c: char| c.is_ascii_digit() || c == 'x' || c == 'X' || c == '.';
+        let is_number_digit = |c: char| c.is_ascii_hexdigit() || c == 'x' || c == 'X' || c == '.';
         let num_str = self.scan.eat_while(is_number_digit);
 
-        if num_str.contains('.') {
+        if num_str.contains('.') || num_str.contains('e') || num_str.contains('E') {
             if let Ok(f) = f64::from_str(num_str) {
                 Ok(Token::Float(f))
             } else {
@@ -193,7 +199,15 @@ impl<'a> Lexer<'a> {
             }
         } else {
             let hex = num_str.contains('x') || num_str.contains('X');
-            if let Ok(i) = u64::from_str_radix(num_str, if hex { 16 } else { 10 }) {
+
+            let src = if hex {
+                &num_str[2..num_str.len()]
+            } else {
+                &num_str
+            };
+            let radix = if hex { 16 } else { 10 };
+
+            if let Ok(i) = u64::from_str_radix(src, radix) {
                 Ok(Token::Integer(i))
             } else {
                 Err(SyntaxErr::BrokenInteger {
@@ -207,45 +221,80 @@ impl<'a> Lexer<'a> {
     //     todo!()
     // }
 
-    fn lex_comment(&mut self) -> Result<Token, SyntaxErr> {
+    fn lex_comment(&mut self) {
         match self.scan.first() {
             // multiline comment
             '[' => {
-                self.scan.eat();
-                self.scan.eat();
-                self.advance(2);
-
-                loop {
-                    let count = self.scan.eat_while(|x| x != ']').len();
-                    self.advance(count);
-
-                    debug_assert_eq!(self.scan.first(), ']');
-
-                    match self.scan.second() {
-                        ']' => {
-                            self.scan.eat();
-                            self.scan.eat();
-                            self.advance(2);
-                        }
-                        '\n' => {
-                            self.scan.eat();
-                            self.advance(1).new_line();
-                        }
-                        '\r' => {
-                            self.scan.eat();
-                            if self.scan.first() == '\n' {
-                                self.scan.eat();
-                            }
-                            self.new_line();
-                        }
-                        _ => {}
-                    }
-                }
+                self.lex_multiline();
             }
+
             // single line comment
-            _ => {}
-        };
-        self.next()
+            _ => {
+                let count = self.scan.eat_while(|x| x != '\n' && x != '\r').len();
+                self.advance(count);
+            }
+        }
+    }
+
+    fn lex_multiline(&mut self) -> String {
+        let mut pattern = String::with_capacity(16);
+        pattern.push('[');
+        for _ in 0..self.scan.eat_while(|c| c == '=').len() {
+            pattern.push('=');
+        }
+        pattern.push('[');
+        pattern = pattern.replace("[", "]");
+
+        self.advance(pattern.len());
+
+        let mut content = String::with_capacity(256);
+        self.scan.eat_while(|c| {
+            content.push(c);
+            !content.ends_with(pattern.as_str())
+        });
+
+        for _ in 0..pattern.len() {
+            content.pop();
+        }
+
+        // count new line
+        let lines = content.lines();
+        for _ in 0..lines.clone().count() {
+            self.new_line();
+        }
+
+        self.advance(lines.last().unwrap().len());
+
+        content.shrink_to_fit();
+        content
+    }
+
+    fn reserve_or_ident(&self, name: &'a str) -> Token {
+        use Token::*;
+        match name {
+            "and" => And,
+            "break" => Break,
+            "do" => Do,
+            "else" => Else,
+            "elseif" => Elseif,
+            "end" => End,
+            "false" => False,
+            "for" => For,
+            "function" => Function,
+            "if" => If,
+            "in" => In,
+            "local" => Local,
+            "nil" => Nil,
+            "not" => Not,
+            "or" => Or,
+            "repeat" => Repeat,
+            "return" => Return,
+            "then" => Then,
+            "true" => True,
+            "until" => Until,
+            "while" => While,
+            _ => Ident(name.to_string()),
+        }
     }
 }
 
