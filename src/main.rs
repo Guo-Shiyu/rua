@@ -1,13 +1,29 @@
+use std::fs;
+
 use crate::compiler::token::Token;
 
 pub mod compiler;
 
 fn main() {
-    test();
+    let dir = fs::read_dir("./testes/").unwrap();
+    let mut paths = dir
+        .map(|e| e.map(|e| e.path()))
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    paths.sort();
+
+    paths.iter().for_each(|p| {
+        if let Some("lua") = p.extension().map(|ex| ex.to_str().unwrap_or("")) {
+            test(&p)
+        }
+    });
 }
 
-fn test() {
-    let src = std::fs::read_to_string("testes/strings.lua").expect("can't open test source file");
+fn test(path: &std::path::PathBuf) {
+    let src = std::fs::read_to_string(path)
+        .map_err(|e| println!("error: {} while read src file: {:?}", e, path))
+        .unwrap();
 
     let mut lex = compiler::lexer::Lexer::new(&src);
     loop {
@@ -24,23 +40,17 @@ fn test() {
             })
             .map_err(|e| {
                 println!(
-                    "tokenize error: {:?} line: {} column: {}",
+                    "tokenize error: {:?} line: {} column: {} file: {:?}",
                     e,
                     lex.line(),
-                    lex.column()
+                    lex.column(),
+                    path
                 );
                 assert!(false);
-                ()
-            })
-            .unwrap();
-
-        match some {
-            Token::Eof => break,
-            _ => continue,
+                e
+            });
+        if let Ok(Token::Eof) = some {
+            break;
         }
     }
-}
-
-fn add(x: usize) -> usize {
-    x + 1
 }

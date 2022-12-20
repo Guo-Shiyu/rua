@@ -25,7 +25,7 @@ pub enum Token {
     Semi,    Colon,   Comma,  Dot,   Concat,  Dots, 
 
     // others
-    Integer(u64),
+    Integer(i64),
     Float(f64),
     Ident(String),
     Literial(String),
