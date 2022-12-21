@@ -13,3 +13,6 @@ Cargo.lock
 # Added by cargo
 
 /target
+
+# test file 
+/testes/_.lua 

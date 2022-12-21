@@ -1,4 +1,4 @@
-use std::str::Chars;
+use std::{str::Chars, cmp::min_by};
 
 pub struct Scanner<'a> {
     chars: Chars<'a>,
@@ -31,11 +31,6 @@ impl<'a> Scanner<'a> {
     pub fn is_eof(&self) -> bool {
         self.chars.as_str().is_empty()
     }
-
-    // /// Remainning character
-    // pub fn remainning(&self) -> usize {
-    //     self.chars.as_str().len()
-    // }
 }
 
 impl<'a> Scanner<'a> {
@@ -46,12 +41,23 @@ impl<'a> Scanner<'a> {
 
     /// Consume while predicate returns `true` or until the end of input.
     pub fn eat_while(&mut self, mut predicate: impl FnMut(char) -> bool) -> &'a str {
+        let record = self.chars.as_str();
         let mut len = 0;
-        let record  = self.chars.as_str();
         while predicate(self.first()) && !self.is_eof() {
             self.eat();
             len += 1;
         }
         &record[0..len]
+    }
+
+    /// Consume n character or until the end of input.
+    pub fn eat_n(&mut self, n: usize) -> &'a str {
+        let record = self.chars.as_str();
+        let mut i = 0;
+        while !self.is_eof() && i < n {
+            self.eat();
+            i += 1;
+        }
+        &record[0.. n.min(record.len())]
     }
 }

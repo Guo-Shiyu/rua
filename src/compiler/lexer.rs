@@ -1,11 +1,10 @@
-use std::num::{ParseIntError, IntErrorKind};
+use std::num::IntErrorKind;
 use std::str::FromStr;
 
 use super::scanner::Scanner;
 use super::token::Token;
 
 pub struct Lexer<'a> {
-    src: &'a str,
     scan: Scanner<'a>,
     line: usize,
     colume: usize,
@@ -14,7 +13,6 @@ pub struct Lexer<'a> {
 impl<'a> Lexer<'a> {
     pub fn new(input: &'a str) -> Lexer<'a> {
         Lexer {
-            src: input,
             scan: Scanner::new(input),
             line: 1,
             colume: 1,
@@ -41,6 +39,7 @@ impl<'a> Lexer<'a> {
         self.colume = 1;
     }
 
+    /// Get next token or an error
     pub fn next(&mut self) -> Result<Token, LexicalErr> {
         use Token::*;
         let whitespaces = [' ', '\t', '\u{013}', '\u{014}'];
@@ -63,10 +62,6 @@ impl<'a> Lexer<'a> {
                 }
                 '\r' => {
                     self.scan.eat();
-                    if self.scan.first() == '\n' {
-                        self.scan.eat();
-                    }
-                    self.new_line();
                 }
 
                 '[' => match self.scan.second() {
@@ -83,11 +78,9 @@ impl<'a> Lexer<'a> {
 
                 // UTF8 identity support :)
                 id if id.is_alphabetic() || id == '_' => {
-                    let suffix = self
-                        .scan
-                        .eat_while(|ch| ch == '_' || ch.is_alphabetic() || ch.is_ascii_digit());
-                    self.advance(suffix.len());
-                    return Ok(Self::reserve_or_ident(suffix));
+                    return Ok(self.scan.eat_while(|ch| ch == '_' || ch.is_alphabetic() || ch.is_ascii_digit()))
+                        .map(|id| {self.advance(id.len()); id})
+                        .map(Self::keyword_or_ident);
                 }
 
                 punc if punc.is_ascii_punctuation() => {
@@ -119,8 +112,9 @@ impl<'a> Lexer<'a> {
                             let token = match punc {
                                 '-' => match peek {
                                     '-' => {
+                                        // eat "--"
                                         self.scan.eat();
-                                        self.advance(1);
+                                        self.advance(1); 
                                         self.lex_comment();
                                         continue;
                                     }
@@ -161,7 +155,7 @@ impl<'a> Lexer<'a> {
                                 _ => unreachable!(),
                             };
 
-                            // eat follows char
+                            // eat follows character
                             match token {
                                 IDiv | Follow | GE | Shr | LE | Shl | Neq | Concat => {
                                     self.advance(1);
@@ -174,7 +168,6 @@ impl<'a> Lexer<'a> {
                                 }
                                 _ => (),
                             };
-
                             token
                         }
                     });
@@ -189,6 +182,7 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// Lex all form of number in lua.
     fn lex_number(&mut self) -> Result<Token, LexicalErr> {
         let hex = match (self.scan.first(), self.scan.second()) {
             ('0', 'X') | ('0', 'x') => true,
@@ -216,7 +210,7 @@ impl<'a> Lexer<'a> {
         match (hex, dot) {
             // 0xA.1
             (true, true) |
-            // 0xABCp-1
+            // 0xABCp-1 | 0xABC
             (true, false) => {
                 let src = &base[2..base.len()];
 
@@ -279,7 +273,7 @@ impl<'a> Lexer<'a> {
                         Ok(Token::Float(float + 2u32.pow(exp) as f64 * if is_positive { 1.0} else { -1.0 }))
                     }
                 } else {
-                    Ok(Token::Float(float))
+                    Ok(Token::Integer(float as i64))
                 }
 
             }
@@ -298,7 +292,7 @@ impl<'a> Lexer<'a> {
                         Ok(Token::Float(f))
                     } else {
                         Err(LexicalErr {
-                            reason: format!("broken E-float nonation: {}", copy),
+                            reason: format!("invalid float E nonation: {}", copy),
                         })
                     }
                 } else {
@@ -307,7 +301,7 @@ impl<'a> Lexer<'a> {
                         Ok(Token::Float(f))
                     } else {
                         Err(LexicalErr {
-                            reason: format!("broken float representation: {}", base),
+                            reason: format!("invalid float representation: {}", base),
                         })
                     }
                 }
@@ -328,7 +322,7 @@ impl<'a> Lexer<'a> {
                         Ok(Token::Float(f))
                     } else {
                         Err(LexicalErr {
-                            reason: format!("broken E-float nonation: {}", copy),
+                            reason: format!("invalid E-float nonation: {}", copy),
                         })
                     }
                 }else {
@@ -343,23 +337,24 @@ impl<'a> Lexer<'a> {
                                 return i128::from_str(base)
                                             .map(|i| Token::Float(i as f64))
                                             .map_err(|_| LexicalErr {
-                                                reason: format!("broken interger representation: {}", base),
+                                                reason: format!("invalid interger representation: {}", base),
                                             })
                             },
                             _ => return Err(LexicalErr {
-                                reason: format!("broken interger representation: {}", base),
+                                reason: format!("invalid interger representation: {}", base),
                             }),
                         }
                     };  
 
                     ret.map_err(|_| LexicalErr {
-                        reason: format!("broken interger representation: {}", base),
+                        reason: format!("invalid interger representation: {}", base),
                     })
                 }
             }
         }
     }
 
+    /// Lex sequence bounded with '\'' / '\"'.
     fn lex_literal(&mut self) -> Result<Token, LexicalErr> {
         let quote = self.scan.eat().unwrap();
 
@@ -441,9 +436,27 @@ impl<'a> Lexer<'a> {
                                 }
 
                                 'u' => {
-                                    let s = self.scan.eat_while(|c| c == '}');
-                                    self.scan.eat();
-                                    lit.push_str("@");
+                                    self.scan.eat(); // '{'
+                                    let unicode = self.scan.eat_while(|c| c != '}');
+                                    self.scan.eat(); // '}'
+                                    self.advance(2);
+
+                                    let codepoint = u32::from_str_radix(unicode, 16)
+                                        .map(char::from_u32)
+                                        .unwrap_or(None);
+                                        
+                                        if let Some( c) = codepoint {
+                                            lit.push(c);
+                                        } else {
+                                            return Err(LexicalErr {
+                                                reason: format!(
+                                                    r##"invalid escape sequence: \u{{{}}}"##,
+                                                    unicode
+                                                ),
+                                            });
+                                        }
+                                    
+                                    
                                 }
 
                                 bad => {
@@ -472,21 +485,23 @@ impl<'a> Lexer<'a> {
         Ok(Token::Literial(lit))
     }
 
+    /// Lex both single or multi line comment.
     fn lex_comment(&mut self) {
-        match self.scan.first() {
+        match (self.scan.first(), self.scan.second()) {
             // multiline comment
-            '[' => {
+            ('[', '[') => {
                 self.lex_multiline();
             }
 
             // single line comment
             _ => {
-                let count = self.scan.eat_while(|x| x != '\n' && x != '\r').len();
+                let count = self.scan.eat_while(|x| x != '\n').len();
                 self.advance(count);
             }
         }
     }
 
+    /// Lex sequence like "[[ hello ]]" / "[==[ hello ]==]".
     fn lex_multiline(&mut self) -> String {
         // deal with "[==["
         let mut pattern = String::with_capacity(16);
@@ -502,47 +517,45 @@ impl<'a> Lexer<'a> {
 
         // deal with content 
         let mut content = String::with_capacity(256);
-        self.scan.eat_while(|c| {
+        loop {
+            let c = self.scan.eat().unwrap();
             content.push(c);
-            !content.ends_with(pattern.as_str())
+            if c == '\n' {
+                self.new_line();
+            }
+            if content.ends_with(pattern.as_str()) {
+                for _ in 0..pattern.len() {
+                    content.pop();
+                }
+                break;
+            }
+        }
+
+        // fix column at last line 
+        self.advance(
+            pattern.len() + 
+        if content.ends_with('\n') {
+            0
+        } else {
+            content.split_terminator('\n').last().unwrap().len()
         });
-        self.scan.eat();
-
-        for _ in 0..pattern.len() {
-            content.pop();
-        }
-
-        // count new line
-        let lines = content.lines();
-        for _ in 0..lines.clone().count() {
-            self.new_line();
-        }
-
-        self.advance(lines.last().unwrap().len() + 1);
 
         content.shrink_to_fit();
         content
     }
 
+    /// Lex sequence like "\x06".
     fn lex_hex_escape(&mut self) -> Result<char, LexicalErr> {
-        let mut i = 0;
-        let hex = self.scan.eat_while(|_| {
-            i += 1;
-            i < 2
-        });
-
-        if let Ok(r) = u8::from_str_radix(hex, 16) {
-            debug_assert!(r < u8::MAX);
-            self.advance(2);
-            Ok(r as char)
-        } else {
-            Err(LexicalErr {
-                reason: format!("invalid hexadecimal espace sequence: {}", hex),
+        let hex = self.scan.eat_n(2);
+        u8::from_str_radix(hex, 16)
+            .map(|u| { self.advance(2); u as char} )
+            .map_err(|_| LexicalErr {
+                reason: format!("invalid hexadecimal espace sequence: \\x{{{}}}", hex),
             })
-        }
     }
 
-    fn reserve_or_ident(name: &'a str) -> Token {
+    /// specify a string is ident or keyword.
+    fn keyword_or_ident(name: &'a str) -> Token {
         use Token::*;
         match name {
             "and" => And,
@@ -577,7 +590,8 @@ pub struct LexicalErr {
 }
 
 impl LexicalErr {
-    // pub fn new(r: String) -> Self {
-    //     LexicalErr { reason: r }
-    // }
+    pub fn reason(&self) -> &str {
+        self.reason.as_str()
+    }
 }
+
