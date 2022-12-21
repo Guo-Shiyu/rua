@@ -64,15 +64,16 @@ assert("\u{80}\u{7FF}" == "\xC2\x80\xDF\xBF")
 -- limits for 3-byte sequences
 assert("\u{800}\u{FFFF}" ==   "\xE0\xA0\x80\xEF\xBF\xBF")
 
--- limits for 4-byte sequences
-assert("\u{10000}\u{1FFFFF}" == "\xF0\x90\x80\x80\xF7\xBF\xBF\xBF")
+-- NOTICE:
+-- -- limits for 4-byte sequences
+-- assert("\u{10000}\u{1FFFFF}" == "\xF0\x90\x80\x80\xF7\xBF\xBF\xBF")
 
--- limits for 5-byte sequences
-assert("\u{200000}\u{3FFFFFF}" == "\xF8\x88\x80\x80\x80\xFB\xBF\xBF\xBF\xBF")
+-- -- limits for 5-byte sequences
+-- assert("\u{200000}\u{3FFFFFF}" == "\xF8\x88\x80\x80\x80\xFB\xBF\xBF\xBF\xBF")
 
--- limits for 6-byte sequences
-assert("\u{4000000}\u{7FFFFFFF}" ==
-       "\xFC\x84\x80\x80\x80\x80\xFD\xBF\xBF\xBF\xBF\xBF")
+-- -- limits for 6-byte sequences
+-- assert("\u{4000000}\u{7FFFFFFF}" ==
+--        "\xFC\x84\x80\x80\x80\x80\xFD\xBF\xBF\xBF\xBF\xBF")
 
 
 -- Error in escape sequences
