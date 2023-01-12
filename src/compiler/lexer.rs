@@ -1,17 +1,16 @@
 use std::num::IntErrorKind;
 use std::str::FromStr;
 
-use super::scanner::Scanner;
-use super::token::Token;
+use super::{scanner::Scanner, token::Token};
 
 pub struct Lexer<'a> {
     scan: Scanner<'a>,
-    line: usize,
-    colume: usize,
+    line: u32,
+    colume: u32,
 }
 
-impl<'a> Lexer<'a> {
-    pub fn new(input: &'a str) -> Lexer<'a> {
+impl Lexer<'_> {
+    pub fn new(input: &str) -> Lexer {
         Lexer {
             scan: Scanner::new(input),
             line: 1,
@@ -19,18 +18,22 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    pub fn line(&self) -> usize {
+    pub fn line(&self) -> u32 {
         self.line
     }
 
-    pub fn column(&self) -> usize {
+    pub fn column(&self) -> u32 {
         self.colume
+    }
+
+    pub fn is_eof(&self) -> bool {
+        self.scan.is_eof()
     }
 }
 
 impl<'a> Lexer<'a> {
     fn advance(&mut self, n: usize) -> &mut Self {
-        self.colume += n;
+        self.colume += n as u32;
         self
     }
 
@@ -65,7 +68,7 @@ impl<'a> Lexer<'a> {
                 }
 
                 '[' => match self.scan.second() {
-                    '=' | '[' => return Ok(Token::Literial(self.lex_multiline())),
+                    '=' | '[' => return Ok(Token::Literal(self.lex_multiline())),
                     _ => {
                         self.scan.eat();
                         return Ok(Token::LS);
@@ -184,10 +187,7 @@ impl<'a> Lexer<'a> {
 
     /// Lex all form of number in lua.
     fn lex_number(&mut self) -> Result<Token, LexicalErr> {
-        let hex = match (self.scan.first(), self.scan.second()) {
-            ('0', 'X') | ('0', 'x') => true,
-            _ => false,
-        };
+        let hex = matches!((self.scan.first(), self.scan.second()), ('0', 'X') | ('0', 'x'));
 
         let base = if hex {
             self.scan
@@ -200,11 +200,7 @@ impl<'a> Lexer<'a> {
 
         let e_notation = {
             let peek = self.scan.first();
-            if peek == 'e' || peek == 'E' {
-                true
-            } else {
-                false
-            }
+            peek == 'e' || peek == 'E' 
         };
 
         match (hex, dot) {
@@ -221,26 +217,26 @@ impl<'a> Lexer<'a> {
                     for dig in src.chars() {
                         let mut dvalue = dig as u32;
                         match dig {
-                            _ if '0' <= dig && dig <= '9' => dvalue = dvalue - ('0' as u32),
-                            _ if 'a' <= dig && dig <= 'z' => dvalue = dvalue - ('a' as u32) + 10,
-                            _ if 'A' <= dig && dig <= 'z' => dvalue = dvalue - ('A' as u32) + 10,
+                            _ if ('0'..='9').contains(&dig) => dvalue = dvalue - ('0' as u32),
+                            _ if ('a'..='f').contains(&dig) => dvalue = dvalue - ('a' as u32) + 10,
+                            _ if ('A'..='F').contains(&dig) => dvalue = dvalue - ('A' as u32) + 10,
                             '.' => {
                                 dot = true;
                                 dvalue = 0
                             }
-                            _ => unreachable!(),
+                            _ => {
+                                let _ = 123; 
+                                unreachable!()},
                         }
                         n += dvalue as f64 * if dot { 1.0 / 16.0 } else { 16.0 };}  
                     n
                 };
                 self.advance(src.len());
 
-                let exponent_notation = {let peek = self.scan.first();
-                if peek == 'p' || peek == 'P' {
-                    true
-                } else {
-                    false
-                }};
+                let exponent_notation = {
+                    let peek = self.scan.first();
+                    peek == 'p' || peek == 'P' 
+                };
 
                 if exponent_notation {
                     self.scan.eat(); // 'p'
@@ -260,7 +256,7 @@ impl<'a> Lexer<'a> {
                     };
                     
                     let exp_str = self.scan.eat_while(|c| c.is_ascii_digit());
-                    if exp_str.len() == 0 {
+                    if exp_str.is_empty() {
                         Err(LexicalErr {
                             reason: format!(
                                 "invalid float exponent nonation: 0x{}p{}",
@@ -295,8 +291,7 @@ impl<'a> Lexer<'a> {
                             reason: format!("invalid float E nonation: {}", copy),
                         })
                     }
-                } else {
-                    if let Ok(f) = f64::from_str(base) {
+                } else if let Ok(f) = f64::from_str(base) {
                         self.advance(base.len());
                         Ok(Token::Float(f))
                     } else {
@@ -304,7 +299,7 @@ impl<'a> Lexer<'a> {
                             reason: format!("invalid float representation: {}", base),
                         })
                     }
-                }
+                
             },
 
 
@@ -328,7 +323,7 @@ impl<'a> Lexer<'a> {
                 }else {
                     self.advance(base.len());
                     let ret = i64::from_str(base)
-                        .map(|i| Token::Integer(i));
+                        .map(Token::Integer);
 
                     
                     if let Err(ref e) = ret {
@@ -383,7 +378,6 @@ impl<'a> Lexer<'a> {
 
                             self.advance(dec.len());
                             if let Ok(int) = u8::from_str(dec) {
-                                debug_assert!(int <= u8::MAX);
                                 lit.push(int as char);
                             } else {
                                 return Err(LexicalErr {
@@ -482,7 +476,7 @@ impl<'a> Lexer<'a> {
         }
         self.advance(lit.len() + 2);
         lit.shrink_to(lit.len());
-        Ok(Token::Literial(lit))
+        Ok(Token::Literal(lit))
     }
 
     /// Lex both single or multi line comment.
@@ -512,7 +506,7 @@ impl<'a> Lexer<'a> {
         }
         pattern.push('[');
         self.scan.eat();
-        pattern = pattern.replace("[", "]");
+        pattern = pattern.replace('[', "]");
         self.advance(pattern.len());
 
         // deal with content 
@@ -586,12 +580,5 @@ impl<'a> Lexer<'a> {
 
 #[derive(Debug)]
 pub struct LexicalErr {
-    reason: String,
+    pub reason: String,
 }
-
-impl LexicalErr {
-    pub fn reason(&self) -> &str {
-        self.reason.as_str()
-    }
-}
-

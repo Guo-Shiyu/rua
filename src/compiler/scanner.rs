@@ -1,4 +1,4 @@
-use std::{str::Chars, cmp::min_by};
+use std::str::Chars;
 
 pub struct Scanner<'a> {
     chars: Chars<'a>,

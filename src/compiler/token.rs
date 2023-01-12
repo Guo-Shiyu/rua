@@ -1,6 +1,6 @@
 /// Defined in [Lua 5.4 manual / 3.1 ](https://www.lua.org/manual/5.4/manual.html) 
 #[rustfmt::skip]
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum Token {
 
     // keywords
@@ -28,7 +28,7 @@ pub enum Token {
     Integer(i64),
     Float(f64),
     Ident(String),
-    Literial(String),
+    Literal(String),
 
     // end 
     Eof,
@@ -36,18 +36,11 @@ pub enum Token {
 
 impl Token {
     pub fn is_ident(&self) -> bool {
-        if let Token::Ident(_) = &self {
-            true
-        } else {
-            false
-        }
+        matches!(self, Token::Ident(_))
     }
 
     pub fn is_number(&self) -> bool {
-        match self {
-            Token::Integer(_) | Token::Float(_) => true,
-            _ => false,
-        }
+        matches!(self, Token::Integer(_) | Token::Float(_))
     }
 
     // pub fn is_operator(&self) -> bool {
@@ -115,10 +108,6 @@ impl Token {
     }
 
     pub fn is_eof(&self) -> bool {
-        if let Token::Eof = self {
-            true
-        } else {
-            false
-        }
+        matches!(self, Token::Eof)
     }
 }

@@ -7,6 +7,10 @@ use crate::compiler::token::Token;
 pub mod compiler;
 
 fn main() {
+    lexer_perf();
+}
+
+fn lexer_perf() {
     let dir = fs::read_dir("./testes/").expect("unable to find testes firectory!");
     let mut paths = dir
         .map(|e| e.map(|e| e.path()))
@@ -15,50 +19,66 @@ fn main() {
 
     paths.sort();
 
-    paths.iter().for_each(|p| {
-        if let Some("lua") = p.extension().map(|ex| ex.to_str().unwrap_or_default()) {
-            luac_load(&p)
+    let srcs = paths
+        .into_iter()
+        // file name end with '.lua'
+        .filter(
+            |p| matches! { p.extension().map(|ex| ex.to_str().unwrap_or_default()), Some("lua")},
+        )
+        // read to string
+        .filter_map(|p| std::fs::read_to_string(p).ok())
+        .collect::<Vec<_>>();
+
+    let total_bytes = srcs.iter().map(|s| s.len()).sum::<usize>();
+
+    let repeat = 100;
+
+    let total_ms = cost_ms(|| {
+        for _ in 0..repeat {
+            for s in srcs.iter() {
+                let _ = luac_lexer_test(s);
+            }
         }
     });
+
+    let mb = (repeat * total_bytes / 3) as f64 / (1024 * 1024) as f64;
+    let sec = total_ms as f64 / 1000_000.0;
+
+    println!(
+        "{} mb, {} ms, \naverage : {} mb / s",
+        mb,
+        total_ms,
+        mb / sec
+    );
 }
 
-fn luac_load(path: &std::path::PathBuf) {
-    let _ = std::fs::read_to_string(path)
-        .map_err(|e| {
-            println!(
-                "Load test file error: {} while reading from : {:?}",
-                e, path
-            );
-            CompileErr::internal()
-        })
-        .and_then(|src| luac_test(src))
-        .map_err(|e| {
-            println!("luc compile error: {:?}", e);
-            panic!()
-        });
+fn cost_ms(f: impl Fn()) -> usize {
+    let begin = std::time::Instant::now();
+    f();
+    let end = std::time::Instant::now();
+    (end - begin).as_millis() as usize
 }
 
-fn luac_test(src: String) -> Result<(), CompileErr> {
+fn luac_lexer_test(src: &str) -> Result<(), CompileErr> {
     let mut lex = compiler::lexer::Lexer::new(&src);
     loop {
-        let some = lex
-            .next()
-            .map(|tk| {
-                // println!("{:<16?} line: {}, column:{}", tk, lex.line(), lex.column());
-                tk
-            })
-            .map_err(|e| {
-                println!(
-                    "tokenize error: {:?} line: {} column: {}",
-                    e.reason(),
-                    lex.line(),
-                    lex.column(),
-                );
-                e
-            });
-            
-        if let Ok(Token::Eof) = some {
-            break Ok(());
-        };
+        match lex.next() {
+            Ok(Token::Eof) => break,
+            Err(_) => panic!("error"),
+            _ => continue,
+        }
+    }
+    Ok(())
+}
+
+enum Test {
+    S(String),
+    N,
+}
+
+fn f() {
+    let has_string = Test::S(String::new());
+    if let Test::S(s) = has_string {
+        // do something
     }
 }
