@@ -1,9 +1,15 @@
 use std::str::Chars;
 
+/// A low-level peekable scannner iterate the input character sequence.
+///
+/// Next 'n' th character can be peeked via `first` and `second` method.
+/// Position can be shifted forward via `eat` and `eat_n` method.   
+///
+/// ref: https://github.com/rust-lang/rust/blob/master/compiler/rustc_lexer/src/cursor.rs
 pub struct Scanner<'a> {
     chars: Chars<'a>,
 }
-
+// 
 impl<'a> Scanner<'a> {
     pub fn new(input: &'a str) -> Scanner<'a> {
         Scanner {
@@ -58,6 +64,6 @@ impl<'a> Scanner<'a> {
             self.eat();
             i += 1;
         }
-        &record[0.. n.min(record.len())]
+        &record[0..n.min(record.len())]
     }
 }

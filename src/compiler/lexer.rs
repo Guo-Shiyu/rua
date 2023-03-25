@@ -3,6 +3,12 @@ use std::str::FromStr;
 
 use super::{scanner::Scanner, token::Token};
 
+/// Lex input sequence to token stream. 
+/// 
+/// Get next token or an lexical error via `next` method. 
+/// Get source loaction info via `column`, `line` method. 
+/// 
+/// The lua language refrence: https://www.lua.org/manual/5.4/manual.html#3 
 pub struct Lexer<'a> {
     scan: Scanner<'a>,
     line: u32,
@@ -32,152 +38,89 @@ impl Lexer<'_> {
 }
 
 impl<'a> Lexer<'a> {
-    fn advance(&mut self, n: usize) -> &mut Self {
+    /// Record n columns.
+    fn col_n(&mut self, n: usize) -> &mut Self {
         self.colume += n as u32;
         self
     }
 
+    /// Record single column and eat a character.
+    fn bump(&mut self ) -> &mut Self {
+        self.scan.eat();
+        self.col_n(1)
+    }
+
+    /// Record new line, reset column to 1.
     fn new_line(&mut self) {
         self.line += 1;
         self.colume = 1;
     }
 
-    /// Get next token or an error
+    /// Get next token or an lexical error.
     pub fn next(&mut self) -> Result<Token, LexicalErr> {
-        use Token::*;
-        let whitespaces = [' ', '\t', '\u{013}', '\u{014}'];
+        
+        const WHITESPACES: [char; 4] = [' ', '\t', '\u{013}', '\u{014}'];
+        
         loop {
             if self.scan.is_eof() {
-                return Ok(Token::Eof);
+                break Ok(Token::Eof)
             }
-            match self.scan.first() {
-                wp if whitespaces.contains(&wp) => {
-                    let count = self.scan.eat_while(|x| whitespaces.contains(&x)).len();
-                    self.advance(count);
-                    if self.scan.is_eof() {
-                        return Ok(Token::Eof);
-                    }
-                }
 
-                '\n' => {
-                    self.scan.eat();
-                    self.advance(1).new_line();
+            match self.scan.first() {
+                '\0' => { self.scan.eat(); }
+
+                wp if WHITESPACES.contains(&wp) => {
+                    let whites = self.scan.eat_while(|x| WHITESPACES.contains(&x)).len();
+                    self.col_n(whites);
                 }
+    
+                '\n' => {
+                    self.bump().new_line();
+                }
+    
                 '\r' => {
                     self.scan.eat();
                 }
-
-                '[' => match self.scan.second() {
-                    '=' | '[' => return Ok(Token::Literal(self.lex_multiline())),
+                
+                '[' => break match self.scan.second() {
+                    '=' | '[' =>  Ok(Token::Literal(self.lex_multiline())),
                     _ => {
                         self.scan.eat();
-                        return Ok(Token::LS);
+                        Ok(Token::LS)
                     }
                 },
-
-                '\'' | '\"' => return self.lex_literal(),
-
-                num if num.is_ascii_digit() => return self.lex_number(),
-
-                // UTF8 identity support :)
-                id if id.is_alphabetic() || id == '_' => {
-                    return Ok(self.scan.eat_while(|ch| ch == '_' || ch.is_alphabetic() || ch.is_ascii_digit()))
-                        .map(|id| {self.advance(id.len()); id})
-                        .map(Self::keyword_or_ident);
-                }
-
-                punc if punc.is_ascii_punctuation() => {
-                    if ['@', '`'].contains(&punc) {
-                        return Err(LexicalErr {
-                            reason: format!("invalid character: {}", punc),
-                        });
-                    }
-
-                    self.scan.eat();
-                    self.advance(1);
-                    return Ok(match punc {
-                        '+' => Add,
-                        '*' => Mul,
-                        '%' => Mod,
-                        '^' => Pow,
-                        '#' => Len,
-                        '&' => BitAnd,
-                        '|' => BitOr,
-                        '(' => LP,
-                        ')' => RP,
-                        '{' => LB,
-                        '}' => RB,
-                        ']' => RS,
-                        ';' => Semi,
-                        ',' => Comma,
-                        _ => {
-                            let peek = self.scan.first();
-                            let token = match punc {
-                                '-' => match peek {
-                                    '-' => {
-                                        // eat "--"
-                                        self.scan.eat();
-                                        self.advance(1); 
-                                        self.lex_comment();
-                                        continue;
-                                    }
-                                    _ => Minus,
-                                },
-                                '.' => match (self.scan.first(), self.scan.second()) {
-                                    ('.', '.') => Dots,
-                                    ('.', _) => Concat,
-                                    (_, _) => Dot,
-                                },
-                                '~' => match peek {
-                                    '=' => Neq,
-                                    _ => BitXor,
-                                },
-                                '<' => match peek {
-                                    '<' => Shl,
-                                    '=' => LE,
-                                    _ => Less,
-                                },
-                                '>' => match peek {
-                                    '>' => Shr,
-                                    '=' => GE,
-                                    _ => Great,
-                                },
-                                '=' => match peek {
-                                    '=' => Eq,
-                                    _ => Assign,
-                                },
-                                ':' => match peek {
-                                    ':' => Follow,
-                                    _ => Colon,
-                                },
-                                '/' => match peek {
-                                    '/' => IDiv,
-                                    _ => Div,
-                                },
-
-                                _ => unreachable!(),
-                            };
-
-                            // eat follows character
-                            match token {
-                                IDiv | Follow | GE | Shr | LE | Shl | Neq | Concat => {
-                                    self.advance(1);
-                                    self.scan.eat();
-                                }
-                                Dots => {
-                                    self.advance(2);
-                                    self.scan.eat();
-                                    self.scan.eat();
-                                }
-                                _ => (),
-                            };
-                            token
+    
+                '\'' | '\"' => break self.lex_literal(),
+    
+                num if num.is_ascii_digit() => break self.lex_number(),
+                    '-' => {
+                    self.bump();
+                        if self.scan.first() == '-' {
+                            self.bump().lex_comment();
+                        } else {
+                            break Ok(Token::Minus)
                         }
-                    });
                 }
-
+    
+                // UTF8 identity support :)
+                ident if ident.is_alphabetic() || ident == '_' => {
+                    let id = self.scan.eat_while(|ch| ch == '_' || ch.is_alphabetic() || ch.is_ascii_digit());
+                    self.col_n(id.len());
+                    break Ok(Self::keyword_or_ident(id))
+                }
+                
+                punc if punc.is_ascii_punctuation() => {
+                    break if punc == '@' || punc == '`'{
+                        Err(LexicalErr {
+                            reason: format!("invalid punctuatuion character: {}", punc),
+                        })
+                    } else {
+                        self.lex_punctuation(punc)
+                    }
+                }
+    
                 invalid => {
-                    return Err(LexicalErr {
+                    break Err(LexicalErr {
                         reason: format!("invalid character: {}", invalid),
                     })
                 }
@@ -231,7 +174,7 @@ impl<'a> Lexer<'a> {
                         n += dvalue as f64 * if dot { 1.0 / 16.0 } else { 16.0 };}  
                     n
                 };
-                self.advance(src.len());
+                self.col_n(src.len());
 
                 let exponent_notation = {
                     let peek = self.scan.first();
@@ -239,11 +182,11 @@ impl<'a> Lexer<'a> {
                 };
 
                 if exponent_notation {
-                    self.scan.eat(); // 'p'
-                    self.advance(1);
+                    // 'p'
+                    self.bump();
                     let is_positive = match self.scan.first() {
-                        '+' => {self.scan.eat(); self.advance(1); true},
-                        '-' => {self.scan.eat(); self.advance(1); false},
+                        '+' => {self.bump(); true},
+                        '-' => {self.bump(); false},
                         dig if dig.is_ascii_digit() => true,
                         other => {
                             return Err(LexicalErr {
@@ -265,7 +208,7 @@ impl<'a> Lexer<'a> {
                         })
                     } else {
                         let exp = u32::from_str(exp_str).unwrap();
-                        self.advance(exp_str.len());
+                        self.col_n(exp_str.len());
                         Ok(Token::Float(float + 2u32.pow(exp) as f64 * if is_positive { 1.0} else { -1.0 }))
                     }
                 } else {
@@ -284,7 +227,7 @@ impl<'a> Lexer<'a> {
                     copy.push_str(exp_str);
 
                     if let Ok(f) = copy.parse::<f64>() {
-                        self.advance(copy.len());
+                        self.col_n(copy.len());
                         Ok(Token::Float(f))
                     } else {
                         Err(LexicalErr {
@@ -292,7 +235,7 @@ impl<'a> Lexer<'a> {
                         })
                     }
                 } else if let Ok(f) = f64::from_str(base) {
-                        self.advance(base.len());
+                        self.col_n(base.len());
                         Ok(Token::Float(f))
                     } else {
                         Err(LexicalErr {
@@ -313,7 +256,7 @@ impl<'a> Lexer<'a> {
                     copy.push_str(exp_str);
 
                     if let Ok(f) = copy.parse::<f64>() {
-                        self.advance(copy.len());
+                        self.col_n(copy.len());
                         Ok(Token::Float(f))
                     } else {
                         Err(LexicalErr {
@@ -321,7 +264,7 @@ impl<'a> Lexer<'a> {
                         })
                     }
                 }else {
-                    self.advance(base.len());
+                    self.col_n(base.len());
                     let ret = i64::from_str(base)
                         .map(Token::Integer);
 
@@ -351,24 +294,32 @@ impl<'a> Lexer<'a> {
 
     /// Lex sequence bounded with '\'' / '\"'.
     fn lex_literal(&mut self) -> Result<Token, LexicalErr> {
-        let quote = self.scan.eat().unwrap();
+        // ' or "
+        let quote = self.scan.first();
+        self.bump();
 
+        // reserve space for short string 
         let mut lit = String::with_capacity(32);
         loop {
+            if self.scan.is_eof() {
+                break;
+            }
+
             match self.scan.first() {
+                q if q == quote => {self.bump(); break},
+
                 '\x00' | '\n' | '\r' => {
                     return Err(LexicalErr {
-                        reason: "unfinished literal".to_string(),
+                        reason: format!("unfinished literal near: {quote}{lit}"),
                     })
                 }
+
                 '\\' => {
-                    self.scan.eat();
-                    self.advance(1);
+                    self.bump();
                     let cur = self.scan.first();
                     match cur {
-                        '\x00' => {}
+                        // decimal escape seq like \012, \987
                         decimal if decimal.is_ascii_digit() => {
-
                             // read max 3 digis 
                             let mut digit = 0;
                             let dec = self.scan.eat_while(|c| {
@@ -376,7 +327,7 @@ impl<'a> Lexer<'a> {
                                 digit < 3 && c.is_ascii_digit()
                             });
 
-                            self.advance(dec.len());
+                            self.col_n(dec.len());
                             if let Ok(int) = u8::from_str(dec) {
                                 lit.push(int as char);
                             } else {
@@ -398,6 +349,9 @@ impl<'a> Lexer<'a> {
                                 '\\' => lit.push('\u{005c}'),
                                 '\'' => lit.push('\u{0027}'),
                                 '"' => lit.push('\u{0022}'),
+                                
+                                // "abcd\
+                                //   efgh"
                                 '\n' => {
                                     self.new_line();
                                 }
@@ -407,9 +361,12 @@ impl<'a> Lexer<'a> {
                                     }
                                     self.new_line();
                                 }
+                                
+                                // hex escape like \x789
                                 'x' => {
                                     lit.push(self.lex_hex_escape()?);
                                 }
+                                // '\z' skips the following span of whitespace characters, including line breaks
                                 'z' => {
                                     loop {
                                         match self.scan.first() {
@@ -433,7 +390,7 @@ impl<'a> Lexer<'a> {
                                     self.scan.eat(); // '{'
                                     let unicode = self.scan.eat_while(|c| c != '}');
                                     self.scan.eat(); // '}'
-                                    self.advance(2);
+                                    self.col_n(2);
 
                                     let codepoint = u32::from_str_radix(unicode, 16)
                                         .map(char::from_u32)
@@ -466,15 +423,11 @@ impl<'a> Lexer<'a> {
                     }
                 }
                 _ => {
-                    let cur = self.scan.eat().unwrap();
-                    if cur == quote {
-                        break;
-                    }
-                    lit.push(cur);
+                    lit.push(self.scan.eat().unwrap());
                 }
             }
         }
-        self.advance(lit.len() + 2);
+        self.col_n(lit.len() + 2);
         lit.shrink_to(lit.len());
         Ok(Token::Literal(lit))
     }
@@ -486,53 +439,59 @@ impl<'a> Lexer<'a> {
             ('[', '[') => {
                 self.lex_multiline();
             }
-
             // single line comment
             _ => {
-                let count = self.scan.eat_while(|x| x != '\n').len();
-                self.advance(count);
+                // Because the next character is '\n' so there is no necessary to record column.
+                // This will be slightly faster during parse, but ignore a signle line comment 
+                // if it is on the end of input string.  
+
+                /* let n = */ self.scan.eat_while(|x| x != '\n'); /* .len() */
+                /* self.col_n(n) */ 
             }
-        }
+            
+        };
     }
 
-    /// Lex sequence like "[[ hello ]]" / "[==[ hello ]==]".
+    /// Lex sequence like "\[\[ ... ]]" / "\[==\[ ... ]==]".
     fn lex_multiline(&mut self) -> String {
-        // deal with "[==["
         let mut pattern = String::with_capacity(16);
+  
+        // deal with pattern: "[==["
         pattern.push('[');
         self.scan.eat();
-        for _ in 0..self.scan.eat_while(|c| c == '=').len() {
-            pattern.push('=');
-        }
+        pattern.push_str(self.scan.eat_while(|c| c == '='));
         pattern.push('[');
         self.scan.eat();
+
         pattern = pattern.replace('[', "]");
-        self.advance(pattern.len());
+        self.col_n(pattern.len());
 
         // deal with content 
         let mut content = String::with_capacity(256);
+
+        let mut de_pattern = false;
         loop {
             let c = self.scan.eat().unwrap();
             content.push(c);
             if c == '\n' {
                 self.new_line();
+            } else {
+                self.col_n(1);
             }
-            if content.ends_with(pattern.as_str()) {
-                for _ in 0..pattern.len() {
-                    content.pop();
-                }
+
+            if c == ']' {
+                de_pattern = true;
+            }
+
+            if self.scan.is_eof() {
+                break;
+            }
+
+            if de_pattern && content.ends_with(pattern.as_str()) {
+                content.truncate(content.len() - pattern.len());
                 break;
             }
         }
-
-        // fix column at last line 
-        self.advance(
-            pattern.len() + 
-        if content.ends_with('\n') {
-            0
-        } else {
-            content.split_terminator('\n').last().unwrap().len()
-        });
 
         content.shrink_to_fit();
         content
@@ -541,11 +500,84 @@ impl<'a> Lexer<'a> {
     /// Lex sequence like "\x06".
     fn lex_hex_escape(&mut self) -> Result<char, LexicalErr> {
         let hex = self.scan.eat_n(2);
+        self.col_n(2);
         u8::from_str_radix(hex, 16)
-            .map(|u| { self.advance(2); u as char} )
+            .map(|u| u as char )
             .map_err(|_| LexicalErr {
                 reason: format!("invalid hexadecimal espace sequence: \\x{{{}}}", hex),
             })
+    }
+
+    /// Lex operator and delimters 
+    fn lex_punctuation(&mut self, start:char) -> Result<Token, LexicalErr> {
+        if start == '.' {
+            let token = match (self.scan.first(), self.scan.second()) {
+                ('.', '.') => {self.col_n(2).scan.eat_n(2); Token::Dots},
+                ('.', _) => {self.bump(); Token::Concat},
+                (_, _) => Token::Dot,
+            };
+            return Ok(token)
+        }
+        
+        use Token::*;
+        self.bump();
+        let token = match start {
+            // single character operator 
+            '+' => Add,
+            '*' => Mul,
+            '%' => Mod,
+            '^' => Pow,
+            '#' => Len,
+            '&' => BitAnd,
+            '|' => BitOr,
+            '(' => LP,
+            ')' => RP,
+            '{' => LB,
+            '}' => RB,
+            ']' => RS,
+            ';' => Semi,
+            ',' => Comma,
+            _ => {
+                let tk = match (start, self.scan.first()) {
+                    ('~', '=') => Neq,
+                    ('~', _) => BitOr,
+
+                    ('<', '<') => Shl,
+                    ('<', '=') => LE,
+                    ('<', _) => Less,
+                    
+                    ('>', '>') => Shr,
+                    ('>', '=') => GE,
+                    ('>', _) => Great,
+                    
+                    ('=', '=') => Eq,
+                    ('=',_ ) => Assign,
+                    
+                    (':', ':') => Follow,
+                    (':', _) => Colon,
+                    
+                    ('/', '/') => IDiv,
+                    ('/', _) => Div,
+                    _ => unreachable!()
+                };
+                
+                // eat following characters
+                match tk {
+                    IDiv | Follow | GE | Shr | LE | Shl | Neq | Concat => {
+                        self.bump();
+                    }
+                    Dots => {
+                        self.col_n(2);
+                        self.scan.eat_n(2);
+                    }
+
+                    // do nothing
+                    _ => (),
+                };
+                tk
+            }
+        };
+        Ok(token)
     }
 
     /// specify a string is ident or keyword.
