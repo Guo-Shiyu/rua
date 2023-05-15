@@ -18,7 +18,7 @@ impl<'a> Scanner<'a> {
     }
 
     /// Peek the next `nth(n)` char without consuming any input.
-    fn peek(&self, n: usize) -> Option<char> {
+    pub fn peek(&self, n: usize) -> Option<char> {
         let mut it = self.chars.clone();
         let mut ch = None;
         (0..n).for_each(|_| ch = it.next());

@@ -1,16 +1,17 @@
-use std::fs;
+use std::{collections::HashMap, fs};
 
-use compiler::CompileErr;
+use compiler::{parser, CompileErr};
 
 use crate::compiler::token::Token;
 
 pub mod compiler;
 
 fn main() {
-    lexer_perf();
+    // parser::Parser::parse("123").unwrap();
+    perf();
 }
 
-fn lexer_perf() {
+fn perf() {
     let dir = fs::read_dir("./testes/").expect("unable to find testes firectory!");
     let mut paths = dir
         .map(|e| e.map(|e| e.path()))
@@ -31,7 +32,7 @@ fn lexer_perf() {
 
     let total_bytes = srcs.iter().map(|s| s.len()).sum::<usize>();
 
-    let repeat = 100;
+    let repeat = 1;
 
     let total_ms = cost_ms(|| {
         for _ in 0..repeat {
@@ -42,7 +43,7 @@ fn lexer_perf() {
     });
 
     let mb = (repeat * total_bytes / 3) as f64 / (1024 * 1024) as f64;
-    let sec = total_ms as f64 / 1000_000.0;
+    let sec = total_ms as f64 / 1000.0;
 
     println!(
         "{} mb, {} ms, \naverage : {} mb / s",
@@ -61,24 +62,23 @@ fn cost_ms(f: impl Fn()) -> usize {
 
 fn luac_lexer_test(src: &str) -> Result<(), CompileErr> {
     let mut lex = compiler::lexer::Lexer::new(&src);
+    let mut vec = Vec::with_capacity(1024 * 1024);
     loop {
         match lex.next() {
             Ok(Token::Eof) => break,
-            Err(_) => panic!("error"),
-            _ => continue,
+            Ok(tk) => vec.push(tk),
+            Err(e) => println!("error: {:?}, line: {}, col:{}", e, lex.line(), lex.column()),
         }
     }
     Ok(())
 }
 
-enum Test {
-    S(String),
-    N,
-}
 
-fn f() {
-    let has_string = Test::S(String::new());
-    if let Test::S(s) = has_string {
-        // do something
+mod test {
+    #[test]
+    fn t() {
+        let s = "128";
+        let u = u8::from_str_radix(s, 10);
+        assert!(u.is_ok());
     }
 }

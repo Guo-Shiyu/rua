@@ -7,4 +7,7 @@ edition = "2021"
 name = "luac"
 path = "src/main.rs" 
 
+[profile.release]
+debug = true
+
 [dependencies]

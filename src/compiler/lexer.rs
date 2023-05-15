@@ -58,7 +58,6 @@ impl<'a> Lexer<'a> {
 
     /// Get next token or an lexical error.
     pub fn next(&mut self) -> Result<Token, LexicalErr> {
-        
         const WHITESPACES: [char; 4] = [' ', '\t', '\u{013}', '\u{014}'];
         
         loop {
@@ -67,8 +66,6 @@ impl<'a> Lexer<'a> {
             }
 
             match self.scan.first() {
-                '\0' => { self.scan.eat(); }
-
                 wp if WHITESPACES.contains(&wp) => {
                     let whites = self.scan.eat_while(|x| WHITESPACES.contains(&x)).len();
                     self.col_n(whites);
@@ -317,118 +314,114 @@ impl<'a> Lexer<'a> {
                 '\\' => {
                     self.bump();
                     let cur = self.scan.first();
-                    match cur {
-                        // decimal escape seq like \012, \987
-                        decimal if decimal.is_ascii_digit() => {
-                            // read max 3 digis 
-                            let mut digit = 0;
-                            let dec = self.scan.eat_while(|c| {
-                                digit += 1;
-                                digit < 3 && c.is_ascii_digit()
-                            });
+                    self.bump();
 
-                            self.col_n(dec.len());
-                            if let Ok(int) = u8::from_str(dec) {
-                                lit.push(int as char);
+                    if let Some(escape) = match cur {
+                        'a' => Some('\u{0007}'),
+                        'b' => Some('\u{0008}'),
+                        'f' => Some('\u{000C}'),
+                        'n' => Some('\u{000A}'),
+                        'r' => Some('\u{000D}'),
+                        't' => Some('\u{0009}'),
+                        'v' => Some('\u{000b}'),
+                        '\\' =>Some( '\u{005c}'),
+                        '\'' =>Some( '\u{0027}'),
+                        '"' => Some('\u{0022}'),
+                        _ => None,
+                    } {
+                        lit.push(escape);
+                        continue;
+                    }
+
+                    match (cur, self.scan.first(), self.scan.second()) {
+                        // \xXX, XX is 2 hex digits escape seq
+                        ('x', x, y) if x.is_ascii_hexdigit() && y.is_ascii_hexdigit() => {
+                            let escape = u8::from_str_radix(self.scan.eat_n(2), 16)
+                                .map_err(|_| LexicalErr{reason : format!("invalid hex escape seq: \\x{x}{y}")})?;
+                            lit.push(escape as char);
+                            self.col_n(2);
+                        },
+
+                        // \ddd, where ddd is a sequence of up to three decimal digits. 
+                        // if a decimal escape sequence is to be followed by a digit, it must be expressed using exactly three digits.
+                        (decimal, _, _) if decimal.is_ascii_digit() => {
+                            let subseq = self.scan.eat_while(|c| c.is_ascii_digit());
+                            if subseq.len() == 0 {
+                                lit.push((decimal as u8 - ('0' as u8)) as char);
                             } else {
-                                return Err(LexicalErr {
-                                    reason: format!("invalid decimal escape sequence: \\{}", dec),
-                                });
+                                let escape_len = subseq.len().min(2);
+                                let s = &subseq[0..escape_len];
+                                let escape = u8::from_str_radix(s, 10)
+                                    .map_err(|_| 
+                                        LexicalErr { reason : format!("invalid decimal escape seq: \\{s}")}
+                                    )?;
+
+                                lit.push(escape as char);
+    
+                                if escape_len > 3 {
+                                    lit.push_str(&subseq[3..]);
+                                }
                             }
-                        }
-                        _ => {
-                            self.scan.eat();
-                            match cur {
-                                'a' => lit.push('\u{0007}'),
-                                'b' => lit.push('\u{0008}'),
-                                'f' => lit.push('\u{000C}'),
-                                'n' => lit.push('\u{000A}'),
-                                'r' => lit.push('\u{000D}'),
-                                't' => lit.push('\u{0009}'),
-                                'v' => lit.push('\u{000b}'),
-                                '\\' => lit.push('\u{005c}'),
-                                '\'' => lit.push('\u{0027}'),
-                                '"' => lit.push('\u{0022}'),
-                                
-                                // "abcd\
-                                //   efgh"
-                                '\n' => {
-                                    self.new_line();
-                                }
-                                '\r' => {
-                                    if self.scan.first() == '\n' {
-                                        self.scan.eat();
+                            self.col_n(subseq.len());
+                        },
+
+                        // '\z' skips the following span of whitespace characters, including line breaks
+                        ('z', _, _) => {
+                            loop {
+                                match self.scan.first() {
+                                    '\n' => {
+                                        self.new_line();
                                     }
-                                    self.new_line();
-                                }
-                                
-                                // hex escape like \x789
-                                'x' => {
-                                    lit.push(self.lex_hex_escape()?);
-                                }
-                                // '\z' skips the following span of whitespace characters, including line breaks
-                                'z' => {
-                                    loop {
-                                        match self.scan.first() {
-                                            '\n' => {
-                                                self.new_line();
-                                            }
-                                            '\r' => {
-                                                if self.scan.first() == '\n' {
-                                                    self.scan.eat();
-                                                }
-                                                self.new_line();
-                                            },
-                                            '\t' | ' ' => {}
-                                            _ => break
+                                    '\r' => {
+                                        if self.scan.first() == '\n' {
+                                            self.scan.eat();
                                         }
-                                        self.scan.eat();
-                                    }
+                                        self.new_line();
+                                    },
+                                    '\t' | ' ' => {}
+                                    _ => break
                                 }
+                                self.bump();
+                            }
+                        },
 
-                                'u' => {
-                                    self.scan.eat(); // '{'
-                                    let unicode = self.scan.eat_while(|c| c != '}');
-                                    self.scan.eat(); // '}'
-                                    self.col_n(2);
-
-                                    let codepoint = u32::from_str_radix(unicode, 16)
-                                        .map(char::from_u32)
-                                        .unwrap_or(None);
-                                        
-                                        if let Some( c) = codepoint {
-                                            lit.push(c);
-                                        } else {
-                                            return Err(LexicalErr {
-                                                reason: format!(
-                                                    r##"invalid escape sequence: \u{{{}}}"##,
-                                                    unicode
-                                                ),
-                                            });
-                                        }
-                                    
-                                    
-                                }
-
-                                bad => {
+                        ('u', _, _) => {
+                            self.scan.eat(); // '{'
+                            let unicode = self.scan.eat_while(|c| c != '}');
+                            self.scan.eat(); // '}'
+                            self.col_n(2);
+                
+                            let codepoint = u32::from_str_radix(unicode, 16)
+                                .map(char::from_u32)
+                                .unwrap_or(None);
+                
+                                if let Some( c) = codepoint {
+                                    lit.push(c);
+                                    self.col_n(unicode.len());
+                                } else {
                                     return Err(LexicalErr {
                                         reason: format!(
-                                            "invalid escape sequence: \\{}",
-                                            bad as u32
+                                            r##"invalid escape sequence: \u{{{}}}"##,
+                                            unicode
                                         ),
-                                    })
+                                    });
                                 }
-                            }
                         }
-                    }
-                }
+                        
+                        ('\r', _, _) => {
+                            self.bump();
+                            self.new_line();
+                        }
+
+                        _ => unreachable!(),
+                    };
+                },
+
                 _ => {
                     lit.push(self.scan.eat().unwrap());
                 }
             }
         }
-        self.col_n(lit.len() + 2);
-        lit.shrink_to(lit.len());
         Ok(Token::Literal(lit))
     }
 
@@ -492,8 +485,6 @@ impl<'a> Lexer<'a> {
                 break;
             }
         }
-
-        content.shrink_to_fit();
         content
     }
 
