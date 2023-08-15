@@ -15,4 +15,7 @@ Cargo.lock
 
 # test file 
 /testes/_.lua 
+/out
+**/*.out
+
 /.vscode
