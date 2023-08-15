@@ -7,8 +7,9 @@ pub mod token;
 
 #[derive(Debug)]
 pub enum CompileErr {
+    IOErr(std::io::Error),
     InternalErr,
-    LexicalErr(lexer::LexicalErr)
+    SyntaxErr(parser::SyntaxError),
 }
 
 impl CompileErr {

@@ -43,42 +43,6 @@ impl Token {
         matches!(self, Token::Integer(_) | Token::Float(_))
     }
 
-    // pub fn is_operator(&self) -> bool {
-    // Token::Add => todo!(),
-    //     Token::Minus => todo!(),
-    //     Token::Mul => todo!(),
-    //     Token::Div => todo!(),
-    //     Token::Mod => todo!(),
-    //     Token::Pow => todo!(),
-    //     Token::Len => todo!(),
-    //     Token::BitAnd => todo!(),
-    //     Token::BitXor => todo!(),
-    //     Token::BitOr => todo!(),
-    //     Token::Shl => todo!(),
-    //     Token::Shr => todo!(),
-    //     Token::IDiv => todo!(),
-    //     Token::Eq => todo!(),
-    //     Token::Neq => todo!(),
-    //     Token::LE => todo!(),
-    //     Token::GE => todo!(),
-    //     Token::Less => todo!(),
-    //     Token::Great => todo!(),
-    //     Token::Assign => todo!(),
-    //     Token::LP => todo!(),
-    //     Token::RP => todo!(),
-    //     Token::LB => todo!(),
-    //     Token::RB => todo!(),
-    //     Token::LS => todo!(),
-    //     Token::RS => todo!(),
-    //     Token::Follow => todo!(),
-    //     Token::Semi => todo!(),
-    //     Token::Colon => todo!(),
-    //     Token::Comma => todo!(),
-    //     Token::Dot => todo!(),
-    //     Token::Concat => todo!(),
-    //     Token::Dots => todo!(),
-    // }
-
     pub fn is_keyword(&self) -> bool {
         match self {
             Token::And
