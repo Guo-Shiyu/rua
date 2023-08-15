@@ -1,8 +1,8 @@
 /// Warpper for an ast-node to attach source location info
 pub struct WithSrcLoc<T> {
+    node: T,
     // lineinfo: (begin, end)
     lineinfo: (u32, u32),
-    node: T,
 }
 
 impl<T> WithSrcLoc<T> {
@@ -15,6 +15,10 @@ impl<T> WithSrcLoc<T> {
 
     pub fn inner(self) -> T {
         self.node
+    }
+
+    pub fn lineinfo(&self) -> (u32, u32) {
+        self.lineinfo
     }
 }
 
@@ -45,18 +49,7 @@ impl Block {
 ///        function funcname funcbody |
 ///        local function Name funcbody |
 ///        local attnamelist [`=` explist]
-///
-/// var ::=  Name | prefixexp `[` exp `]` | prefixexp `.` Name
-///
-/// varlist ::= var {`,` var}
-///
-/// prefixexp ::= var | functioncall | `(` exp `)`
-///
-/// label ::= `::` Name `::`
-///
-/// namelist ::= Name {`,` Name}
-///
-/// attr ::= [`<` Name `>`]
+
 pub enum Stmt {
     // global assignment
     Assign {
@@ -64,7 +57,7 @@ pub enum Stmt {
         exprs: Vec<ExprNode>,
     },
 
-    FuncCall(Box<FuncCall>),
+    FuncCall(FuncCall),
 
     // Lable{ tag: String }
     Lable(String),
@@ -113,9 +106,11 @@ pub enum Stmt {
     },
 
     LocalVarDecl {
-        names: Vec<String>,
+        names: Vec<(String, Option<Attribute>)>,
         exprs: Vec<ExprNode>,
     },
+
+    Expr(Box<Expr>),
 }
 
 /// funcname ::= Name {`.` Name} [`:` Name]
@@ -141,20 +136,20 @@ pub enum FuncCall {
     // i.e: func(1, 2, 3, ...)
     FreeFnCall {
         prefix: Box<ExprNode>,
-        args: Vec<ExprNode>,
+        args: ParaList,
     },
 
     // i.e: class:func(1, 2, 3, ...)
     MethodCall {
         prefix: Box<ExprNode>,
-        method_name: String,
-        args: Vec<ExprNode>,
+        method: String,
+        args: ParaList,
     },
 }
 
 /// functiondef ::= function funcbody
-///
 /// funcbody ::= `(` [parlist] `)` block end
+/// paralist ::= namelist [`,` `...`] | `...`
 pub struct FuncBody {
     params: ParaList,
     body: Box<Block>,
@@ -180,19 +175,15 @@ pub enum Expr {
     Literal(String),
     Dots,
 
-    // function funcbody
+    Ident(String),
+
+    // global function defination
     FuncDefine(FuncBody),
 
-    // i.e:  table[key]
-    OffsetIndex {
+    // table.key | table[key]
+    Index {
         prefix: Box<ExprNode>,
-        exp: Box<ExprNode>,
-    },
-
-    // i.e:  table.key | key
-    NameIndex {
-        prefix: Option<Box<ExprNode>>,
-        exp: Box<ExprNode>,
+        key: Box<Expr>,
     },
 
     // functioncall ::=  prefixexp args | prefixexp `:` Name args
@@ -213,13 +204,18 @@ pub enum Expr {
     },
 }
 
+pub enum Attribute {
+    Const,
+    Close,
+}
+
 pub struct ParaList {
     vargs: bool,
-    namelist: Vec<String>,
+    namelist: Vec<Expr>,
 }
 
 impl ParaList {
-    pub fn new(vargs: bool, namelist: Vec<String>) -> Self {
+    pub fn new(vargs: bool, namelist: Vec<Expr>) -> Self {
         ParaList { vargs, namelist }
     }
 }
@@ -236,14 +232,23 @@ impl Field {
     }
 }
 
-/// binop ::=  `+` | `-` | `*` | `/` | `//` | `^` | `%` | 
-///     `&` | `~` | `|` | `>>` | `<<` | `..` | 
-///     `<` | `<=` | `>` | `>=` | `==` | `~=` | 
 #[rustfmt::skip]
+#[derive(Clone, Copy)]
 pub enum BinOp {
-    Add,     Minus,   Mul,    Div,   IDiv,  Pow,    Mod,   
-    BitAnd,  BitXor,  BitOr,  Shr,   Shl,   Concat,
-    Less,    LE,      Great,  GE,    Eq,    Neq 
+    /* arithmetic operators */
+    Add, Minus, Mul, Mod, Pow, Div, IDiv,
+
+    /* bitwise operators */   
+    BitAnd, BitOr, BitXor, Shl, Shr,   
+    
+    /* string operator */
+    Concat,
+
+    /* comparison operators */
+    Eq, Less, LE, Neq, Great, GE, 
+
+    /* logical operators */
+    And, Or,
 }
 
 /// unop ::= `-` | not | `#` | `~`
@@ -256,3 +261,20 @@ pub enum UnOp {
 
 pub type ExprNode = WithSrcLoc<Expr>;
 pub type StmtNode = WithSrcLoc<Stmt>;
+
+mod test {
+    #[test]
+    fn struct_size_check() {
+        use crate::compiler::ast::*;
+        use std::mem::size_of;
+
+        const _B_SIZE: usize = size_of::<Block>();
+        const _N_SIZE: usize = size_of::<FuncName>();
+        const _P_SIZE: usize = size_of::<ParaList>();
+        const _D_SIZE: usize = size_of::<FuncBody>();
+        const _C_SIZE: usize = size_of::<FuncCall>();
+
+        assert!(size_of::<Expr>() <= 64);
+        assert!(size_of::<Stmt>() <= 64);
+    }
+}
