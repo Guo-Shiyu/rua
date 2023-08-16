@@ -140,7 +140,7 @@ impl Parser<'_> {
     /// single expr as statememt|
     fn expr_stat(&mut self) -> Result<Stmt, SyntaxError> {
         let expr = self.expr()?;
-        let (lineinfo, inner) = (expr.lineinfo(), expr.inner());
+        let (lineinfo, inner) = (expr.lineinfo(), expr.into_inner());
 
         let stmt = if let Expr::FuncCall(call) = inner {
             Stmt::FuncCall(call)
@@ -164,7 +164,7 @@ impl Parser<'_> {
                 }
             } else {
                 // single expr as statememt
-                Stmt::Expr(Box::new(first.inner()))
+                Stmt::Expr(Box::new(first.into_inner()))
             }
         };
         Ok(stmt)
@@ -202,7 +202,7 @@ impl Parser<'_> {
         self.next()?; // skip 'do'
         let block = self.block()?;
         self.test_and_next(Token::End)?;
-        Ok(Stmt::DoEnd(block))
+        Ok(Stmt::DoEnd(Box::new(block)))
     }
 
     /// while ::= `while` exp `do` block `end`
@@ -229,7 +229,7 @@ impl Parser<'_> {
         let exp = self.expr()?;
 
         Ok(Stmt::Repeat {
-            block,
+            block: Box::new(block),
             exp: Box::new(exp),
         })
     }
@@ -316,14 +316,14 @@ impl Parser<'_> {
             match &self.current {
                 Token::Comma => self.next()?,
                 Token::Do => break,
-                _ => exprs.push(self.expr()?.inner()),
+                _ => exprs.push(self.expr()?.into_inner()),
             }
         }
         self.check_and_next(Token::Do)?;
         let body = self.block()?;
         self.check_and_next(Token::End)?;
         Ok(Stmt::GenericFor {
-            names,
+            iters: names,
             exprs,
             body: Box::new(body),
         })
@@ -332,13 +332,13 @@ impl Parser<'_> {
     /// numerical_for ::= `for` Name `=` exp `,` exp [`,` exp] `do` block `end`
     fn numeric_for(&mut self, var: String) -> Result<Stmt, SyntaxError> {
         self.next()?;
-        let init = self.expr()?.inner();
+        let init = self.expr()?.into_inner();
         self.check_and_next(Token::Comma)?;
-        let limit = self.expr()?.inner();
+        let limit = self.expr()?.into_inner();
         let step = match &self.current {
             Token::Comma => {
                 self.next()?;
-                self.expr()?.inner()
+                self.expr()?.into_inner()
             }
             _ => Expr::Int(1),
         };
@@ -346,7 +346,7 @@ impl Parser<'_> {
         let body = self.block()?;
         self.check_and_next(Token::End)?;
         Ok(Stmt::NumericFor {
-            name: var,
+            iter: var,
             init: Box::new(init),
             limit: Box::new(limit),
             step: Box::new(step),
@@ -355,13 +355,15 @@ impl Parser<'_> {
     }
 
     /// function ::= `function` funcname funcbody
+    /// funcname ::= Name {`.` Name} [`:` Name]
     fn global_fndef(&mut self) -> Result<Stmt, SyntaxError> {
         self.next()?; // skip `function`
-        let namelist = self.func_name()?;
-        let def = self.func_body()?;
+        let (pres, method) = self.func_name()?;
+        let body = self.func_body()?;
         Ok(Stmt::FnDef {
-            namelist,
-            def: Box::new(def),
+            pres,
+            method,
+            body: Box::new(body),
         })
     }
 
@@ -430,7 +432,7 @@ impl Parser<'_> {
     }
 
     /// funcname ::= Name {`.` Name} [`:` Name]
-    fn func_name(&mut self) -> Result<FuncName, SyntaxError> {
+    fn func_name(&mut self) -> Result<(Vec<String>, Option<String>), SyntaxError> {
         const DOT: bool = true;
         const COLON: bool = false;
         let mut pres = Vec::with_capacity(4);
@@ -461,7 +463,7 @@ impl Parser<'_> {
             }
         }
 
-        Ok(FuncName::new(pres, method))
+        Ok((pres, method))
     }
 
     /// funcbody ::= `(` [parlist] `)` block `end`
@@ -502,7 +504,7 @@ impl Parser<'_> {
             }
         };
 
-        let paras = paras.into_iter().map(|node| node.inner()).collect();
+        let paras = paras.into_iter().map(|node| node.into_inner()).collect();
         Ok(ParaList::new(vargs, paras))
     }
 
@@ -784,7 +786,7 @@ impl Parser<'_> {
                     ExprNode::new(
                         Expr::Index {
                             prefix: Box::new(prefix),
-                            key: Box::new(key.inner()),
+                            key: Box::new(key.into_inner()),
                         },
                         (begin, self.lex.line()),
                     )
@@ -898,7 +900,7 @@ impl Parser<'_> {
 }
 
 impl Parser<'_> {
-    pub fn parse(src: &str) -> Result<Block, SyntaxError> {
+    pub fn parse(src: &str, chunkname: String) -> Result<Block, SyntaxError> {
         let mut parser = Parser {
             lex: Lexer::new(src),
             current: Token::Eof,
@@ -908,6 +910,13 @@ impl Parser<'_> {
         // init parser state to first token
         parser.next()?;
 
-        parser.block()
+        // parse statements
+        let block = parser.block()?;
+
+        debug_assert!(block.chunk.as_str() == Block::NAMELESS_CHUNK);
+        debug_assert!(parser.current.is_eof());
+        debug_assert!(parser.ahead.is_eof());
+
+        Ok(Block::chunk(chunkname, block.stats, block.ret))
     }
 }
