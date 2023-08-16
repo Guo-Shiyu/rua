@@ -307,7 +307,10 @@ impl Parser<'_> {
 
     /// generic_for ::= `for` namelist `in` explist `do` block `end`    
     fn generic_for(&mut self, first: String) -> Result<Stmt, SyntaxError> {
-        let mut names = vec![first];
+        // "for k, v in ..." is most common senario
+        let mut names = Vec::with_capacity(2);
+        names.push(first);
+        
         loop {
             match &mut self.current {
                 Token::Ident(id) => {
@@ -720,7 +723,7 @@ impl Parser<'_> {
     fn table_constructor(&mut self) -> Result<Vec<Field>, SyntaxError> {
         self.next()?; // skip '{'
 
-        let mut fieldlist = Vec::with_capacity(8);
+        let mut fieldlist = Vec::with_capacity(4);
         loop {
             match &self.current {
                 Token::Comma | Token::Semi => self.next()?,
