@@ -174,8 +174,11 @@ impl Parser<'_> {
     fn lable(&mut self) -> Result<Stmt, SyntaxError> {
         self.next()?;
 
-        let ret = match &self.current {
-            Token::Ident(id) => Ok(Stmt::Lable(id.clone())),
+        let ret = match &mut self.current {
+            Token::Ident(id) => {
+                let inner = std::mem::replace(id, String::new());
+                Ok(Stmt::Lable(inner))
+            }
             _ => Err(self.unexpected("::")),
         };
         if ret.is_ok() {
@@ -189,12 +192,14 @@ impl Parser<'_> {
     fn goto(&mut self) -> Result<Stmt, SyntaxError> {
         self.next()?; // skip `goto`
 
-        if let Token::Ident(lable) = self.current.clone() {
-            self.next()?;
-            Ok(Stmt::Goto(lable))
+        let mut holder = String::new();
+        if let Token::Ident(lable) = &mut self.current {
+            std::mem::swap(&mut holder, lable);
         } else {
-            Err(self.unexpected("identifier"))
-        }
+            return Err(self.unexpected("identifier"));
+        };
+
+        Ok(Stmt::Goto(holder))
     }
 
     /// do ::= `do` block `end`
@@ -283,26 +288,30 @@ impl Parser<'_> {
     fn for_stmt(&mut self) -> Result<Stmt, SyntaxError> {
         self.next()?; // skip `for`
 
-        if let Token::Ident(first) = self.current.clone() {
-            self.next()?;
-            let stmt = match &self.current {
-                Token::Comma | Token::In => self.generic_for(first)?,
-                Token::Assign => self.numeric_for(first)?,
-                _ => return Err(self.unexpected("'=' or ','")),
-            };
-            Ok(stmt)
+        let mut holder = String::new();
+        if let Token::Ident(first) = &mut self.current {
+            std::mem::swap(&mut holder, first);
         } else {
-            Err(self.unexpected("identifier"))
-        }
+            return Err(self.unexpected("identifier"));
+        };
+
+        self.next()?;
+        let stmt = match &self.current {
+            Token::Comma | Token::In => self.generic_for(holder)?,
+            Token::Assign => self.numeric_for(holder)?,
+            _ => return Err(self.unexpected("'=' or ','")),
+        };
+
+        Ok(stmt)
     }
 
     /// generic_for ::= `for` namelist `in` explist `do` block `end`    
     fn generic_for(&mut self, first: String) -> Result<Stmt, SyntaxError> {
         let mut names = vec![first];
         loop {
-            match &self.current {
+            match &mut self.current {
                 Token::Ident(id) => {
-                    names.push(id.clone());
+                    names.push(std::mem::replace(id, String::new()));
                     self.next()?;
                 }
                 Token::Comma => self.next()?,
@@ -369,20 +378,23 @@ impl Parser<'_> {
 
     /// local_function ::= `local` `function` Name funcbody
     fn local_fndef(&mut self) -> Result<Stmt, SyntaxError> {
-        if let Token::Ident(fnname) = self.current.clone() {
-            self.next()?; // eat fnname
-            let begin = self.lex.line();
-            let fndef = self.func_body()?;
-            let end = self.lex.line();
-            let node = ExprNode::new(Expr::FuncDefine(fndef), (begin, end));
-
-            Ok(Stmt::LocalVarDecl {
-                names: vec![(fnname, None)],
-                exprs: vec![node],
-            })
+        let mut func_name = String::new();
+        if let Token::Ident(name) = &mut self.current {
+            std::mem::swap(&mut func_name, name);
         } else {
-            Err(self.unexpected("identifier"))
-        }
+            return Err(self.unexpected("identifier"));
+        };
+
+        self.next()?; // eat func name
+        let begin = self.lex.line();
+        let fndef = self.func_body()?;
+        let end = self.lex.line();
+        let node = ExprNode::new(Expr::FuncDefine(fndef), (begin, end));
+
+        Ok(Stmt::LocalVarDecl {
+            names: vec![(func_name, None)],
+            exprs: vec![node],
+        })
     }
 
     /// local_assign ::= `local` attnamelist [`=` explist]
@@ -390,29 +402,40 @@ impl Parser<'_> {
     fn local_assign(&mut self) -> Result<Stmt, SyntaxError> {
         let mut names = Vec::with_capacity(4);
         loop {
-            if let Token::Ident(id) = self.current.clone() {
+            let (mut decl_holder, mut is_id) = (String::new(), false);
+            if let Token::Ident(id) = &mut self.current {
+                std::mem::swap(id, &mut decl_holder);
+                is_id = true;
+            };
+
+            if is_id {
                 self.next()?;
 
                 // optional attribute
                 let attribute = if self.test_and_next(Token::Less)? {
-                    if let Token::Ident(id) = self.current.clone() {
-                        let attr = match id.as_str() {
-                            "const" => Some(Attribute::Const),
-                            "close" => Some(Attribute::Close),
-                            _ => return Err(self.error(format!("invalid attribute '{}'", id))),
-                        };
-                        self.next()?; // skip attribute
-                        self.check_and_next(Token::Great)?;
-                        attr
+                    let mut attr_holder = String::new();
+                    if let Token::Ident(id) = &mut self.current {
+                        std::mem::swap(id, &mut attr_holder);
                     } else {
                         return Err(self.unexpected("attribute"));
-                    }
+                    };
+
+                    let attr = match attr_holder.as_str() {
+                        "const" => Some(Attribute::Const),
+                        "close" => Some(Attribute::Close),
+                        other => return Err(self.error(format!("invalid attribute '{}'", other))),
+                    };
+
+                    self.next()?; // skip attribute
+                    self.check_and_next(Token::Great)?;
+
+                    attr
                 } else {
                     None
                 };
 
-                names.push((id.clone(), attribute));
-            };
+                names.push((decl_holder, attribute));
+            }
 
             if let Token::Comma = self.current {
                 self.next()?;
@@ -440,26 +463,31 @@ impl Parser<'_> {
 
         let mut dot_or_colon = DOT;
         loop {
-            match &self.current {
+            let mut is_id = false;
+            match &mut self.current {
                 Token::Ident(id) => {
                     if dot_or_colon == COLON {
-                        method = Some(id.clone());
-                        self.next()?;
-                        break;
+                        method = Some(std::mem::replace(id, String::new()));
+                        is_id = true;
                     } else {
-                        pres.push(id.clone());
-                        self.next()?;
+                        pres.push(std::mem::replace(id, String::new()));
                     }
                 }
+
                 Token::Dot => {
                     dot_or_colon = DOT;
-                    self.next()?
                 }
+
                 Token::Colon => {
                     dot_or_colon = COLON;
-                    self.next()?
                 }
                 _ => break,
+            };
+
+            self.next()?;
+
+            if is_id {
+                break;
             }
         }
 
@@ -488,7 +516,7 @@ impl Parser<'_> {
 
         let paras = self.exprlist(None)?;
 
-        match self.current.clone() {
+        match &self.current {
             Token::Dots => {
                 vargs = true;
                 self.next()?;
@@ -595,14 +623,17 @@ impl Parser<'_> {
     /// simpleexp -> Float | Int | String | Nil | `true` | `false` | `...` |
     ///             Constructor | `function` funcbody | suffixedexp
     fn simple_expr(&mut self) -> Result<ExprNode, SyntaxError> {
-        if let Some(exp) = match &self.current {
+        if let Some(exp) = match &mut self.current {
             Token::Nil => Some(Expr::Nil),
             Token::False => Some(Expr::False),
             Token::True => Some(Expr::True),
             Token::Dots => Some(Expr::Dots),
             Token::Integer(i) => Some(Expr::Int(*i)),
             Token::Float(f) => Some(Expr::Float(*f)),
-            Token::Literal(s) => Some(Expr::Literal(s.clone())),
+            Token::Literal(lit) => {
+                let holder = std::mem::replace(lit, String::new());
+                Some(Expr::Literal(holder))
+            }
             _ => None,
         } {
             let line_info = (self.lex.line(), self.lex.line());
@@ -704,53 +735,60 @@ impl Parser<'_> {
 
     /// field ::= `[` exp `]` `=` exp | Name `=` exp | exp
     fn field(&mut self) -> Result<Field, SyntaxError> {
-        let field = match self.current.clone() {
+        let mut holder = String::new();
+        match &mut self.current {
             // `[` expr `]` `=` expr
             Token::LS => {
                 self.next()?; // skip '['
                 let key = self.expr()?;
                 self.check_and_next(Token::RS)?;
                 self.check_and_next(Token::Assign)?;
-                Field::new(Some(Box::new(key)), Box::new(self.expr()?))
+                return Ok(Field::new(Some(Box::new(key)), Box::new(self.expr()?)));
             }
 
             Token::Ident(key) => {
-                self.look_ahead()?;
-                if let Token::Assign = self.ahead {
-                    // Name `=` expr
-                    self.next()?; // skip name
-                    self.next()?; // skip '='
-                    let line = self.lex.line();
-                    let expr = ExprNode::new(Expr::Ident(key), (line, line));
-                    Field::new(Some(Box::new(expr)), Box::new(self.expr()?))
-                } else {
-                    // expr
-                    Field::new(None, Box::new(self.expr()?))
-                }
+                std::mem::swap(&mut holder, key);
             }
 
             // expr
-            _ => Field::new(None, Box::new(self.expr()?)),
+            _ => return Ok(Field::new(None, Box::new(self.expr()?))),
         };
-        Ok(field)
+
+        self.look_ahead()?;
+        if let Token::Assign = self.ahead {
+            // Name `=` expr
+            self.next()?; // skip name
+            self.next()?; // skip '='
+            let line = self.lex.line();
+            let expr = ExprNode::new(Expr::Ident(holder), (line, line));
+            Ok(Field::new(Some(Box::new(expr)), Box::new(self.expr()?)))
+        } else {
+            // expr
+            Ok(Field::new(None, Box::new(self.expr()?)))
+        }
     }
 
     /// primaryexp ::= NAME | '(' expr ')'
     fn primary_expr(&mut self) -> Result<ExprNode, SyntaxError> {
-        match self.current.clone() {
+        let mut holder = String::new();
+        match &mut self.current {
             Token::Ident(name) => {
-                let begin = self.lex.line();
-                self.next()?;
-                Ok(ExprNode::new(Expr::Ident(name), (begin, self.lex.line())))
+                std::mem::swap(name, &mut holder);
             }
+
             Token::LP => {
                 self.next()?;
                 let exp = self.expr()?;
                 self.check_and_next(Token::RP)?;
-                Ok(exp)
+                return Ok(exp);
             }
-            _ => Err(self.unexpected("identifier or '('")),
-        }
+
+            _ => return Err(self.unexpected("identifier or '('")),
+        };
+
+        let begin = self.lex.line();
+        self.next()?;
+        Ok(ExprNode::new(Expr::Ident(holder), (begin, self.lex.line())))
     }
 
     /// suffixedexp ->
@@ -763,19 +801,22 @@ impl Parser<'_> {
             let expr_node = match &self.current {
                 Token::Dot => {
                     self.next()?;
-                    if let Token::Ident(id) = &self.current {
-                        let attr = Expr::Literal(id.clone());
-                        self.next()?;
-                        ExprNode::new(
-                            Expr::Index {
-                                prefix: Box::new(prefix),
-                                key: Box::new(attr),
-                            },
-                            (begin, self.lex.line()),
-                        )
+                    let mut holder = String::new();
+                    if let Token::Ident(id) = &mut self.current {
+                        std::mem::swap(id, &mut holder);
                     } else {
                         return Err(self.unexpected("identifier"));
-                    }
+                    };
+
+                    let attr = Expr::Literal(holder);
+                    self.next()?;
+                    ExprNode::new(
+                        Expr::Index {
+                            prefix: Box::new(prefix),
+                            key: Box::new(attr),
+                        },
+                        (begin, self.lex.line()),
+                    )
                 }
 
                 Token::LS => {
@@ -795,21 +836,24 @@ impl Parser<'_> {
                 // method call
                 Token::Colon => {
                     self.next()?;
-                    if let Token::Ident(method) = self.current.clone() {
-                        self.next()?; // skip name
-
-                        let args = self.func_args()?;
-                        ExprNode::new(
-                            Expr::FuncCall(FuncCall::MethodCall {
-                                prefix: Box::new(prefix),
-                                method,
-                                args,
-                            }),
-                            (begin, self.lex.line()),
-                        )
+                    let mut holder = String::new();
+                    if let Token::Ident(method) = &mut self.current {
+                        std::mem::swap(method, &mut holder);
                     } else {
                         return Err(self.unexpected("identifier"));
-                    }
+                    };
+
+                    self.next()?; // skip name
+
+                    let args = self.func_args()?;
+                    ExprNode::new(
+                        Expr::FuncCall(FuncCall::MethodCall {
+                            prefix: Box::new(prefix),
+                            method: holder,
+                            args,
+                        }),
+                        (begin, self.lex.line()),
+                    )
                 }
 
                 Token::Literal(_) | Token::LB | Token::LP => ExprNode::new(
@@ -829,28 +873,29 @@ impl Parser<'_> {
 
     /// args ::=  `(` [explist] `)` | tablector | LiteralString
     fn func_args(&mut self) -> Result<ParaList, SyntaxError> {
-        let args = match self.current.clone() {
+        let mut holder = String::new();
+        match &mut self.current {
             Token::LP => {
                 self.next()?; // skip '('
                 let args = self.param_list()?;
                 self.check_and_next(Token::RP)?;
-                args
+                return Ok(args);
             }
 
             Token::LB => {
                 let table = self.table_constructor()?;
-                ParaList::new(false, vec![Expr::TableCtor(table)])
+                return Ok(ParaList::new(false, vec![Expr::TableCtor(table)]));
             }
 
             Token::Literal(s) => {
-                self.next()?; // skip string literal
-                ParaList::new(false, vec![Expr::Literal(s)])
+                std::mem::swap(s, &mut holder);
             }
 
             _ => return Err(self.unexpected("function arguments")),
         };
+        self.next()?; // skip string literal
 
-        Ok(args)
+        Ok(ParaList::new(false, vec![Expr::Literal(holder)]))
     }
 
     fn test(&self, expect: Token) -> bool {
@@ -858,6 +903,7 @@ impl Parser<'_> {
     }
 
     fn check(&self, expect: Token) -> Result<(), SyntaxError> {
+        // this `clone()` will never deep clone a String object, it's always cheap
         if self.test(expect.clone()) {
             Ok(())
         } else {
