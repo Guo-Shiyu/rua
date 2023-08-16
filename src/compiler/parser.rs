@@ -920,3 +920,46 @@ impl Parser<'_> {
         Ok(Block::chunk(chunkname, block.stats, block.ret))
     }
 }
+
+mod test {
+    #[test]
+    fn parser_all_testes() {
+        use crate::compiler::parser::Parser;
+
+        let emsg = format!(
+            "unable to find directory: \"testes\" with base dir:{}",
+            std::env::current_dir().unwrap().display()
+        );
+
+        let dir = std::fs::read_dir("./testes/").expect(&emsg);
+
+        let mut src_paths = dir
+            .map(|e| e.map(|e| e.path()))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        src_paths.sort();
+
+        src_paths
+            .into_iter()
+            .filter(|p| {
+                // filter filename ends with '.lua'
+                matches! { p.extension().map(|ex| ex.to_str().unwrap_or_default()), Some("lua")}
+            })
+            .map(|p| {
+                // take file name
+                let file_name = p
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
+                // read content to string
+                let content = std::fs::read_to_string(p).unwrap_or_default();
+                (file_name, content)
+            })
+            .for_each(|(file, content)| {
+                // execute parse
+                assert!(Parser::parse(&content, file).is_ok())
+            });
+    }
+}
