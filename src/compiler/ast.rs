@@ -1,6 +1,6 @@
 use std::{
     io::{BufWriter, Error, Write},
-    process::Output,
+    ops::{Deref, DerefMut},
 };
 
 /// Warpper for an ast-node to attach source location info
@@ -32,6 +32,19 @@ impl<T> WithSrcLoc<T> {
 
     pub fn mem_address(&self) -> usize {
         self as *const Self as usize
+    }
+}
+
+impl<T> Deref for WithSrcLoc<T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        &self.node
+    }
+}
+
+impl<T> DerefMut for WithSrcLoc<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.node
     }
 }
 
@@ -246,7 +259,7 @@ impl Field {
 }
 
 #[rustfmt::skip]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub enum BinOp {
     /* arithmetic operators */
     Add, Minus, Mul, Mod, Pow, Div, IDiv,
@@ -269,23 +282,18 @@ pub enum UnOp {
     Minus,
     Not,
     Length,
-    NoUnary,
+    BitNot,
 }
 
 pub type ExprNode = WithSrcLoc<Expr>;
 pub type StmtNode = WithSrcLoc<Stmt>;
 
-pub trait AstWalker {
-    type Output;
-    type Error;
-    fn walk(&mut self, root: &Block) -> Result<Self::Output, Self::Error>;
+pub trait AnalysisPass {
+    fn walk(&mut self, root: &Block) -> bool;
 }
 
-pub trait AstRewriter {
-    type Output;
-    type Error;
-    fn rewrite_stmt(&mut self, node: &mut StmtNode) -> Result<Output, Error>;
-    fn rewrite_expr(&mut self, node: &mut ExprNode) -> Result<Output, Error>;
+pub trait TransformPass {
+    fn walk(&mut self, root: &mut Block) -> bool;
 }
 
 pub enum DumpPrecison {
@@ -298,14 +306,32 @@ pub struct AstDumper {
     depth: usize,        // ident state
     colored: bool,       // whether dump with color
     level: DumpPrecison, // dump level
+    dump_buf: Vec<u8>,   // dumped string buffer
+}
+
+impl AnalysisPass for AstDumper {
+    fn walk(&mut self, block: &Block) -> bool {
+        const BUF_SIZE: usize = 8192; // equal with std::io::DEFAULT_BUF_SIZE
+        if self.dump_buf.len() < BUF_SIZE {
+            self.dump_buf.reserve(BUF_SIZE);
+        }
+
+        let inner_buf = std::mem::take(&mut self.dump_buf);
+        let mut bw = BufWriter::new(inner_buf);
+
+        self.dump_block(block, &mut bw)
+            .map(|_| std::mem::swap(&mut bw.into_inner().unwrap(), &mut self.dump_buf))
+            .is_ok()
+    }
 }
 
 impl AstDumper {
-    pub fn new(level: DumpPrecison, colored: bool) -> Self {
+    pub fn new(level: DumpPrecison, colored: bool, buf: Option<Vec<u8>>) -> Self {
         AstDumper {
             depth: 0,
             colored,
             level,
+            dump_buf: buf.unwrap_or_default(),
         }
     }
 
@@ -315,20 +341,8 @@ impl AstDumper {
         buf: &mut BufWriter<impl Write>,
         colored: bool,
     ) -> Result<(), Error> {
-        let mut dumper = AstDumper::new(precision, colored);
+        let mut dumper = AstDumper::new(precision, colored, None);
         dumper.dump_block(block, buf)
-    }
-}
-
-impl AstWalker for AstDumper {
-    type Output = Vec<u8>;
-    type Error = std::io::Error;
-    fn walk(&mut self, block: &Block) -> Result<Vec<u8>, Error> {
-        const BUF_SIZE: usize = 8192; // equal with std::io::DEFAULT_BUF_SIZE
-        let dest: Self::Output = Vec::with_capacity(BUF_SIZE);
-        let mut buf = BufWriter::new(dest);
-        self.dump_block(block, &mut buf)?;
-        Ok(buf.into_inner()?)
     }
 }
 
@@ -679,7 +693,7 @@ impl AstDumper {
             Expr::Ident(id) => id.clone(),
             Expr::FuncDefine(_) => "<FuncDef>".to_string(),
             Expr::Index { prefix, key } => {
-                let mut buf = String::with_capacity(64);
+                let mut buf = String::with_capacity(32);
                 buf.push_str(&Self::inspect(prefix.inner()));
                 buf.push_str(&Self::inspect(key));
                 buf
@@ -694,6 +708,301 @@ impl AstDumper {
             Expr::UnaryOp { op: _, expr: _ } => "<UnaryOp>".to_string(),
         }
     }
+}
+
+enum AfterFoldStatus {
+    StillConst,
+    NonConst,
+}
+
+#[cfg(flag = "trace_optimize")]
+enum FoldOperation {
+    BinaryOp { op: BinOp },
+    UnaryOp { op: UnOp },
+}
+
+#[cfg(flag = "trace_optimize")]
+pub struct FoldInfo {
+    srcloc: (u32, u32),      // source location
+    derive_n: usize,         //
+    status: AfterFoldStatus, //
+    // op: FoldOperation,       //
+    new: Expr, // updated node (must be a constant)
+}
+
+pub struct ConstantFoldPass {
+    #[cfg(flag = "trace_optimize")]
+    record: Vec<FoldInfo>,
+}
+
+impl TransformPass for ConstantFoldPass {
+    fn walk(&mut self, root: &mut Block) -> bool {
+        self.run_on_bolck(root);
+        true
+    }
+}
+
+impl ConstantFoldPass {
+    pub fn new() -> Self {
+        ConstantFoldPass {
+            #[cfg(flag = "trace_optimize")]
+            record: Vec::new(),
+        }
+    }
+
+    fn run_on_bolck(&mut self, root: &mut Block) {
+        for stmt in root.stats.iter_mut() {
+            match &mut stmt.node {
+                Stmt::Assign { vars: _, exprs } => {
+                    exprs.iter_mut().for_each(|e| {
+                        self.try_fold(e);
+                    });
+                }
+                Stmt::FuncCall(call) => match call {
+                    FuncCall::FreeFnCall { prefix: _, args } => {
+                        args.namelist.iter_mut().for_each(|e| {
+                            self.try_fold(e);
+                        });
+                    }
+                    FuncCall::MethodCall {
+                        prefix: _,
+                        method: _,
+                        args,
+                    } => {
+                        args.namelist.iter_mut().for_each(|e| {
+                            self.try_fold(e);
+                        });
+                    }
+                },
+                Stmt::DoEnd(block) => self.run_on_bolck(block),
+                Stmt::While { exp: _, block } => self.run_on_bolck(block),
+                Stmt::Repeat { block, exp: _ } => self.run_on_bolck(block),
+                Stmt::IfElse { exp: _, then, els } => {
+                    self.run_on_bolck(then);
+                    self.run_on_bolck(els);
+                }
+                Stmt::NumericFor {
+                    iter: _,
+                    init: _,
+                    limit: _,
+                    step: _,
+                    body,
+                } => self.run_on_bolck(body),
+                Stmt::GenericFor {
+                    iters: _,
+                    exprs: _,
+                    body,
+                } => self.run_on_bolck(body),
+                Stmt::FnDef {
+                    pres: _,
+                    method: _,
+                    body: func,
+                } => {
+                    func.params.namelist.iter_mut().for_each(|e| {
+                        self.try_fold(e);
+                    });
+                    self.run_on_bolck(&mut func.body);
+                }
+                Stmt::LocalVarDecl { names: _, exprs } => {
+                    exprs.iter_mut().for_each(|e| {
+                        self.try_fold(e);
+                    });
+                }
+                Stmt::Expr(e) => {
+                    self.try_fold(e);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn try_fold(&mut self, exp: &mut Expr) -> AfterFoldStatus {
+        use AfterFoldStatus::*;
+        match exp {
+            Expr::Nil
+            | Expr::False
+            | Expr::True
+            | Expr::Int(_)
+            | Expr::Float(_)
+            | Expr::Literal(_) => StillConst,
+
+            Expr::BinaryOp { lhs, op, rhs } => {
+                let ls = self.try_fold(lhs);
+                let rs = self.try_fold(rhs);
+                match (ls, rs) {
+                    (StillConst, StillConst) => {
+                        let (mut i1, mut i2) = (0, 0);
+                        // intergral promotion
+                        if let Some(promoted) = match (lhs.inner(), rhs.inner()) {
+                            (Expr::Int(l), Expr::Int(r)) => {
+                                i1 = *l;
+                                i2 = *r;
+                                None
+                            }
+                            (Expr::Int(to), Expr::Float(f)) => Some((*to as f64, *f)),
+                            (Expr::Float(f), Expr::Int(to)) => Some((*f, *to as f64)),
+                            (Expr::Float(f1), Expr::Float(f2)) => Some((*f1, *f2)),
+                            _ => None,
+                        } {
+                            if let Some(fop) = Self::gen_arithmetic_op_float(*op) {
+                                *exp = Self::apply_arithmetic_op_float(promoted.0, promoted.1, fop);
+
+                                // TODO:
+                                // record fold op
+                                // #[cfg(flag = "trace_optimize")]
+                                // self.record.push(FoldInfo {
+                                //     srcloc: expr.lineinfo(),
+                                //     derive_n: *derive,
+                                //     status: StillConst,
+                                //     new: new_exp,
+                                // });
+
+                                StillConst
+                            } else {
+                                NonConst
+                            }
+                        } else if let Some(iop) = Self::gen_arithmetic_op_int(*op) {
+                            if i2 == 0 && (*op == BinOp::Div || *op == BinOp::IDiv) {
+                                *exp = Expr::Float(match i1.cmp(&0) {
+                                    std::cmp::Ordering::Less => f64::NEG_INFINITY,
+                                    std::cmp::Ordering::Equal => f64::NAN,
+                                    std::cmp::Ordering::Greater => f64::INFINITY,
+                                });
+                            } else {
+                                *exp = Self::apply_arithmetic_op_int(i1, i2, iop);
+
+                                // TODO:
+                                // record fold op
+                                // #[cfg(flag = "trace_optimize")]
+                                // self.record.push(FoldInfo {
+                                //     srcloc: expr.lineinfo(),
+                                //     derive_n: *derive,
+                                //     status: StillConst,
+                                //     new: new_exp,
+                                // });
+                            }
+                            StillConst
+                        } else {
+                            match (op, lhs.inner(), rhs.inner()) {
+                                (BinOp::Concat, Expr::Literal(l1), Expr::Literal(l2)) => {
+                                    *exp = Expr::Int((l1.len() + l2.len()) as i64);
+                                    StillConst
+                                }
+                                _ => NonConst,
+                            }
+                        }
+                    }
+                    _ => NonConst,
+                }
+            }
+
+            Expr::UnaryOp { op, expr } => {
+                if let StillConst = self.try_fold(expr) {
+                    // execute fold operation
+                    if let Some(new_exp) = match (op, expr.inner()) {
+                        // not nil => true
+                        (UnOp::Not, Expr::Nil) => Some(Expr::True),
+
+                        // not literial => false
+                        (UnOp::Not, _) => Some(Expr::False),
+
+                        // # str => len(str)
+                        (UnOp::Length, Expr::Literal(lit)) => Some(Expr::Int(lit.len() as i64)),
+
+                        // - number => 0 - number
+                        (UnOp::Minus, Expr::Int(i)) => Some(Expr::Int(0 - i)),
+                        (UnOp::Minus, Expr::Float(f)) => Some(Expr::Float(0.0 - f)),
+
+                        // ~int
+                        (UnOp::BitNot, Expr::Int(i)) => Some(Expr::Int(!i)),
+
+                        _ => None,
+                    } {
+                        // update expr node
+                        *exp = new_exp;
+
+                        #[cfg(flag = "trace_optimize")]
+                        self.record.push(FoldInfo {
+                            srcloc: expr.lineinfo(),
+                            derive_n: *derive,
+                            status: StillConst,
+                            new: new_exp,
+                        });
+
+                        StillConst
+                    } else {
+                        NonConst
+                    }
+                } else {
+                    NonConst
+                }
+            }
+
+            _ => NonConst,
+        }
+    }
+
+    fn gen_arithmetic_op_int(op: BinOp) -> Option<fn(i64, i64) -> i64> {
+        match op {
+            BinOp::Add => Some(|l, r| l + r),
+            BinOp::Minus => Some(|l: i64, r: i64| l - r),
+            BinOp::Mul => Some(|l, r| l * r),
+            // BinOp::Mod => Some(|l, r| l % r),
+            BinOp::Pow => Some(|l, r| l ^ r),
+            BinOp::IDiv => Some(|l, r| l / r),
+
+            // 1 / 1 => 1.0
+            // BinOp::Div => Some(|l, r| l / r),
+            _ => None,
+        }
+    }
+
+    fn gen_arithmetic_op_float(op: BinOp) -> Option<fn(f64, f64) -> f64> {
+        match op {
+            BinOp::Add => Some(|l, r| l + r),
+            BinOp::Minus => Some(|l, r| l - r),
+            BinOp::Mul => Some(|l, r| l * r),
+            BinOp::Mod => Some(|l, r| l % r),
+            BinOp::Pow => Some(|l, r| l.powf(r)),
+            BinOp::IDiv => Some(|l, r| l / r),
+            BinOp::Div => Some(|l, r| l / r),
+            _ => None,
+        }
+    }
+
+    fn apply_arithmetic_op_int(lhs: i64, rhs: i64, arth: impl Fn(i64, i64) -> i64) -> Expr {
+        Expr::Int(arth(lhs, rhs))
+    }
+
+    fn apply_arithmetic_op_float(lhs: f64, rhs: f64, arth: impl Fn(f64, f64) -> f64) -> Expr {
+        Expr::Float(arth(lhs, rhs))
+    }
+
+    // fn try_fold_binary_op(&mut self, op: &BinOp, lhs: &mut Expr, rhs: &mut Expr) -> Option<Expr> {
+    //     match op {
+
+    //         // bitwise op
+    //         BinOp::BitAnd => todo!(),
+    //         BinOp::BitOr => todo!(),
+    //         BinOp::BitXor => todo!(),
+    //         BinOp::Shl => todo!(),
+    //         BinOp::Shr => todo!(),
+
+    //         // str1..str2
+    //         BinOp::Concat => todo!(),
+
+    //         // logic op
+    //         BinOp::And => todo!(),
+    //         BinOp::Or => todo!(),
+    //         // BinOp::Eq => todo!(),
+    //         // BinOp::Less => todo!(),
+    //         // BinOp::LE => todo!(),
+    //         // BinOp::Neq => todo!(),
+    //         // BinOp::Great => todo!(),
+    //         // BinOp::GE => todo!(),
+    //         _ => NonConst
+    //     }
+    // }
 }
 
 mod test {
@@ -732,5 +1041,51 @@ mod test {
         let result = AstDumper::dump(&block, DumpPrecison::Statement, &mut buf, false);
 
         assert!(result.is_ok())
+    }
+
+    #[test]
+    fn constant_fold_exec_test() {
+        use crate::compiler::ast::{ConstantFoldPass, TransformPass};
+        use crate::compiler::parser::Parser;
+
+        let emsg = format!(
+            "unable to find directory: \"testes\" with base dir:{}",
+            std::env::current_dir().unwrap().display()
+        );
+
+        let dir = std::fs::read_dir("./testes/").expect(&emsg);
+
+        let mut src_paths = dir
+            .map(|e| e.map(|e| e.path()))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        src_paths.sort();
+
+        src_paths
+            .into_iter()
+            .filter(|p| {
+                // filter filename ends with '.lua'
+                matches! { p.extension().map(|ex| ex.to_str().unwrap_or_default()), Some("lua")}
+            })
+            .map(|p| {
+                // take file name
+                let file_name = p
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
+                // read content to string
+                let content = std::fs::read_to_string(p).unwrap_or_default();
+                (file_name, content)
+            })
+            .flat_map(|(file, content)| {
+                // execute parse
+                Parser::parse(&content, file)
+            })
+            .for_each(|mut block| {
+                let mut cfp = ConstantFoldPass::new();
+                assert!(cfp.walk(&mut block))
+            });
     }
 }
