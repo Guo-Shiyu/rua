@@ -176,7 +176,7 @@ impl Parser<'_> {
 
         let ret = match &mut self.current {
             Token::Ident(id) => {
-                let inner = std::mem::replace(id, String::new());
+                let inner = std::mem::take(id);
                 Ok(Stmt::Lable(inner))
             }
             _ => Err(self.unexpected("::")),
@@ -310,11 +310,11 @@ impl Parser<'_> {
         // "for k, v in ..." is most common senario
         let mut names = Vec::with_capacity(2);
         names.push(first);
-        
+
         loop {
             match &mut self.current {
                 Token::Ident(id) => {
-                    names.push(std::mem::replace(id, String::new()));
+                    names.push(std::mem::take(id));
                     self.next()?;
                 }
                 Token::Comma => self.next()?,
@@ -470,10 +470,10 @@ impl Parser<'_> {
             match &mut self.current {
                 Token::Ident(id) => {
                     if dot_or_colon == COLON {
-                        method = Some(std::mem::replace(id, String::new()));
+                        method = Some(std::mem::take(id));
                         is_id = true;
                     } else {
-                        pres.push(std::mem::replace(id, String::new()));
+                        pres.push(std::mem::take(id));
                     }
                 }
 
@@ -633,10 +633,7 @@ impl Parser<'_> {
             Token::Dots => Some(Expr::Dots),
             Token::Integer(i) => Some(Expr::Int(*i)),
             Token::Float(f) => Some(Expr::Float(*f)),
-            Token::Literal(lit) => {
-                let holder = std::mem::replace(lit, String::new());
-                Some(Expr::Literal(holder))
-            }
+            Token::Literal(lit) => Some(Expr::Literal(std::mem::take(lit))),
             _ => None,
         } {
             let line_info = (self.lex.line(), self.lex.line());
@@ -668,7 +665,7 @@ impl Parser<'_> {
             Token::Minus => Some(UnOp::Minus),
             Token::Not => Some(UnOp::Not),
             Token::Len => Some(UnOp::Length),
-            Token::BitXor => Some(UnOp::NoUnary),
+            Token::BitXor => Some(UnOp::BitNot),
             _ => None,
         }
     }
