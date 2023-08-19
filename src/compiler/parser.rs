@@ -998,9 +998,9 @@ mod test {
                     .file_name()
                     .and_then(|s| s.to_str())
                     .map(|s| s.to_string())
-                    .unwrap_or_default();
+                    .unwrap();
                 // read content to string
-                let content = std::fs::read_to_string(p).unwrap_or_default();
+                let content = std::fs::read_to_string(p).unwrap();
                 (file_name, content)
             })
             .for_each(|(file, content)| {
