@@ -288,12 +288,24 @@ pub enum UnOp {
 pub type ExprNode = WithSrcLoc<Expr>;
 pub type StmtNode = WithSrcLoc<Stmt>;
 
+pub trait PassRunStatus {
+    fn is_ok(&self) -> bool;
+    fn is_err(&self) -> bool;
+}
+
+/// Take run result from a pass impl
+pub trait PassRunRes<Output = (), Error = ()>: PassRunStatus {
+    fn output(&self) -> Option<&Output>;
+    fn take_output(&mut self) -> Output;
+    fn error(&self) -> Option<&Error>;
+}
+
 pub trait AnalysisPass {
-    fn walk(&mut self, root: &Block) -> bool;
+    fn walk(&mut self, root: &Block) -> &Self;
 }
 
 pub trait TransformPass {
-    fn walk(&mut self, root: &mut Block) -> bool;
+    fn walk(&mut self, root: &mut Block) -> &Self;
 }
 
 pub enum DumpPrecison {
@@ -307,10 +319,52 @@ pub struct AstDumper {
     colored: bool,       // whether dump with color
     level: DumpPrecison, // dump level
     dump_buf: Vec<u8>,   // dumped string buffer
+    errinfo: Option<AstDumpErr>,
+}
+
+pub struct PassHasNotRun();
+
+enum AstDumpErr {
+    IOErr(std::io::Error),
+    PassHasNotRun,
+}
+
+impl PassRunStatus for AstDumper {
+    fn is_ok(&self) -> bool {
+        self.errinfo.is_none() && self.dump_buf.len() > 0
+    }
+
+    fn is_err(&self) -> bool {
+        !self.is_ok()
+    }
+}
+
+impl PassRunRes<Vec<u8>, AstDumpErr> for AstDumper {
+    fn output(&self) -> Option<&Vec<u8>> {
+        if self.is_ok() {
+            Some(&self.dump_buf)
+        } else {
+            None
+        }
+    }
+
+    fn take_output(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.dump_buf)
+    }
+
+    fn error(&self) -> Option<&AstDumpErr> {
+        if self.errinfo.is_some() {
+            self.errinfo.as_ref()
+        } else if self.dump_buf.len() == 0 {
+            Some(&AstDumpErr::PassHasNotRun)
+        } else {
+            None
+        }
+    }
 }
 
 impl AnalysisPass for AstDumper {
-    fn walk(&mut self, block: &Block) -> bool {
+    fn walk(&mut self, block: &Block) -> &Self {
         const BUF_SIZE: usize = 8192; // equal with std::io::DEFAULT_BUF_SIZE
         if self.dump_buf.len() < BUF_SIZE {
             self.dump_buf.reserve(BUF_SIZE);
@@ -319,9 +373,12 @@ impl AnalysisPass for AstDumper {
         let inner_buf = std::mem::take(&mut self.dump_buf);
         let mut bw = BufWriter::new(inner_buf);
 
-        self.dump_block(block, &mut bw)
+        let _ = self
+            .dump_block(block, &mut bw)
             .map(|_| std::mem::swap(&mut bw.into_inner().unwrap(), &mut self.dump_buf))
-            .is_ok()
+            .map_err(|e| self.errinfo = Some(AstDumpErr::IOErr(e)));
+
+        self
     }
 }
 
@@ -332,6 +389,7 @@ impl AstDumper {
             colored,
             level,
             dump_buf: buf.unwrap_or_default(),
+            errinfo: None,
         }
     }
 
@@ -721,11 +779,17 @@ enum FoldOperation {
     UnaryOp { op: UnOp },
 }
 
-#[cfg(flag = "trace_optimize")]
 pub struct FoldInfo {
-    srcloc: (u32, u32),      // source location
-    derive_n: usize,         //
+    #[cfg(flag = "trace_optimize")]
+    srcloc: (u32, u32), // source location
+
+    #[cfg(flag = "trace_optimize")]
+    derive_n: usize, //
+
+    #[cfg(flag = "trace_optimize")]
     status: AfterFoldStatus, //
+
+    #[cfg(flag = "trace_optimize")]
     // op: FoldOperation,       //
     new: Expr, // updated node (must be a constant)
 }
@@ -735,10 +799,44 @@ pub struct ConstantFoldPass {
     record: Vec<FoldInfo>,
 }
 
-impl TransformPass for ConstantFoldPass {
-    fn walk(&mut self, root: &mut Block) -> bool {
-        self.run_on_bolck(root);
+impl PassRunStatus for ConstantFoldPass {
+    fn is_ok(&self) -> bool {
         true
+    }
+
+    fn is_err(&self) -> bool {
+        false
+    }
+}
+
+impl PassRunRes<Vec<FoldInfo>, PassHasNotRun> for ConstantFoldPass {
+    #[cfg(flag = "trace_optimize")]
+    fn output(&self) -> Option<&Vec<FoldInfo>> {
+        self.record.as_ref()
+    }
+
+    fn output(&self) -> Option<&Vec<FoldInfo>> {
+        None
+    }
+
+    #[cfg(flag = "trace_optimize")]
+    fn take_output(&mut self) -> Vec<FoldInfo> {
+        std::mem::take(&mut self.record)
+    }
+
+    fn take_output(&mut self) -> Vec<FoldInfo> {
+        Vec::new()
+    }
+
+    fn error(&self) -> Option<&PassHasNotRun> {
+        None
+    }
+}
+
+impl TransformPass for ConstantFoldPass {
+    fn walk(&mut self, root: &mut Block) -> &Self {
+        self.run_on_bolck(root);
+        self
     }
 }
 
@@ -1006,7 +1104,6 @@ impl ConstantFoldPass {
 }
 
 mod test {
-
     #[test]
     fn ast_node_size_check() {
         use crate::compiler::ast::*;
@@ -1045,7 +1142,7 @@ mod test {
 
     #[test]
     fn constant_fold_exec_test() {
-        use crate::compiler::ast::{ConstantFoldPass, TransformPass};
+        use crate::compiler::ast::{ConstantFoldPass, PassRunStatus, TransformPass};
         use crate::compiler::parser::Parser;
 
         let emsg = format!(
@@ -1085,7 +1182,7 @@ mod test {
             })
             .for_each(|mut block| {
                 let mut cfp = ConstantFoldPass::new();
-                assert!(cfp.walk(&mut block))
+                assert!(cfp.walk(&mut block).is_ok())
             });
     }
 }
