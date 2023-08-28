@@ -26,6 +26,10 @@ impl<T> WithSrcLoc<T> {
         &self.node
     }
 
+    pub fn inner_mut(&mut self) -> &mut T {
+        &mut self.node
+    }
+
     pub fn lineinfo(&self) -> (u32, u32) {
         self.lineinfo
     }
@@ -58,18 +62,12 @@ pub struct Block {
 impl Block {
     pub const NAMELESS_CHUNK: &'static str = "<anonymous>";
 
-    /// Create an anonymous block.
-    pub fn new(stats: Vec<StmtNode>, ret: Option<Vec<ExprNode>>) -> Self {
+    pub fn new(name: Option<String>, stats: Vec<StmtNode>, ret: Option<Vec<ExprNode>>) -> Self {
         Block {
-            chunk: Self::NAMELESS_CHUNK.to_string(),
+            chunk: name.unwrap_or_else(|| Self::NAMELESS_CHUNK.to_string()),
             stats,
             ret,
         }
-    }
-
-    /// Create block with a chunk name.
-    pub fn chunk(chunk: String, stats: Vec<StmtNode>, ret: Option<Vec<ExprNode>>) -> Self {
-        Block { chunk, stats, ret }
     }
 }
 
@@ -176,14 +174,8 @@ pub enum FuncCall {
 /// funcbody ::= `(` [parlist] `)` block end
 /// paralist ::= namelist [`,` `...`] | `...`
 pub struct FuncBody {
-    params: ParaList,
-    body: Box<Block>,
-}
-
-impl FuncBody {
-    pub fn new(params: ParaList, body: Box<Block>) -> Self {
-        FuncBody { params, body }
-    }
+    pub params: ParaList,
+    pub body: Box<Block>,
 }
 
 /// exp ::=  nil | false | true | Numeral | LiteralString | `...` |
@@ -229,6 +221,12 @@ pub enum Expr {
     },
 }
 
+impl Default for Expr {
+    fn default() -> Self {
+        Expr::Nil
+    }
+}
+
 #[derive(Debug)]
 pub enum Attribute {
     Const,
@@ -236,8 +234,8 @@ pub enum Attribute {
 }
 
 pub struct ParaList {
-    vargs: bool,
-    namelist: Vec<Expr>,
+    pub vargs: bool,
+    pub namelist: Vec<Expr>,
 }
 
 impl ParaList {
@@ -248,8 +246,8 @@ impl ParaList {
 
 /// field ::= `[` exp `]` `=` exp | Name `=` exp | exp
 pub struct Field {
-    key: Option<Box<ExprNode>>,
-    val: Box<ExprNode>,
+    pub key: Option<Box<ExprNode>>,
+    pub val: Box<ExprNode>,
 }
 
 impl Field {
@@ -1075,38 +1073,12 @@ impl ConstantFoldPass {
     fn apply_arithmetic_op_float(lhs: f64, rhs: f64, arth: impl Fn(f64, f64) -> f64) -> Expr {
         Expr::Float(arth(lhs, rhs))
     }
-
-    // fn try_fold_binary_op(&mut self, op: &BinOp, lhs: &mut Expr, rhs: &mut Expr) -> Option<Expr> {
-    //     match op {
-
-    //         // bitwise op
-    //         BinOp::BitAnd => todo!(),
-    //         BinOp::BitOr => todo!(),
-    //         BinOp::BitXor => todo!(),
-    //         BinOp::Shl => todo!(),
-    //         BinOp::Shr => todo!(),
-
-    //         // str1..str2
-    //         BinOp::Concat => todo!(),
-
-    //         // logic op
-    //         BinOp::And => todo!(),
-    //         BinOp::Or => todo!(),
-    //         // BinOp::Eq => todo!(),
-    //         // BinOp::Less => todo!(),
-    //         // BinOp::LE => todo!(),
-    //         // BinOp::Neq => todo!(),
-    //         // BinOp::Great => todo!(),
-    //         // BinOp::GE => todo!(),
-    //         _ => NonConst
-    //     }
-    // }
 }
 
 mod test {
     #[test]
     fn ast_node_size_check() {
-        use crate::compiler::ast::*;
+        use super::*;
         use std::mem::size_of;
 
         const _B_SIZE: usize = size_of::<Block>();
@@ -1120,13 +1092,13 @@ mod test {
 
     #[test]
     fn ast_dump_test() {
-        use crate::compiler::ast::*;
-        use crate::Parser;
+        use super::*;
+        use crate::parser::Parser;
         use std::io::BufWriter;
 
         let lua_src_path = "testes/all.lua";
         let src = std::fs::read_to_string(lua_src_path).unwrap();
-        let block = Parser::parse(&src, lua_src_path.to_string()).unwrap();
+        let block = Parser::parse(&src, Some(lua_src_path.to_string())).unwrap();
 
         let tmp_file = {
             let mut temp_dir = std::env::temp_dir();
@@ -1142,8 +1114,8 @@ mod test {
 
     #[test]
     fn constant_fold_exec_test() {
-        use crate::compiler::ast::{ConstantFoldPass, PassRunStatus, TransformPass};
-        use crate::compiler::parser::Parser;
+        use super::{ConstantFoldPass, PassRunStatus, TransformPass};
+        use crate::parser::Parser;
 
         let emsg = format!(
             "unable to find directory: \"testes\" with base dir:{}",
@@ -1178,7 +1150,7 @@ mod test {
             })
             .flat_map(|(file, content)| {
                 // execute parse
-                Parser::parse(&content, file)
+                Parser::parse(&content, Some(file))
             })
             .for_each(|mut block| {
                 let mut cfp = ConstantFoldPass::new();

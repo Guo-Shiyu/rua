@@ -1,13 +1,20 @@
 [package]
-name = "luac-rs"
-version = "0.1.0"
+name = "rua"
+version = "0.1.1"
 edition = "2021"
 
-[[bin]] 
-name = "luac"
-path = "src/main.rs" 
+[lib]
+name = "rua"
+path = "src/lib.rs"
 
-[profile.release]
-debug = true
+[[bin]] 
+name = "ruac"
+path = "src/bin/ruac.rs" 
+bench = true 
+
+[[bin]] 
+name = "rua"
+path = "src/bin/rua.rs" 
+bench = true 
 
 [dependencies]

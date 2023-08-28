@@ -1,7 +1,152 @@
 use std::num::IntErrorKind;
 use std::str::FromStr;
+use std::str::Chars;
 
-use super::{scanner::Scanner, token::Token};
+/// Defined in [Lua 5.4 manual / 3.1 ](https://www.lua.org/manual/5.4/manual.html) 
+#[rustfmt::skip]
+#[derive(Debug, PartialEq, Clone)]
+pub enum Token {
+
+    // keywords
+    And,    Break,  Do,        Else,   Elseif, End, 
+    False,  For,    Function,  Goto,   If,     In, 
+    Local,  Nil,    Not,       Or,     Repeat, Return, 
+    Then,   True,   Until,     While, 
+
+    // +     -        *       /      %        ^       # 
+    Add,     Minus,   Mul,    Div,   Mod,     Pow,    Len,
+
+    // &     ~        |       <<     >>       // 
+    BitAnd,  BitXor,  BitOr,  Shl,   Shr,     IDiv, 
+
+    // ==    ~=       <=      >=     <        >       =
+    Eq,      Neq,     LE,     GE,    Less,    Great,  Assign,
+
+    // (     )        {       }      [        ]       ::
+    LP,      RP,      LB,     RB,    LS,      RS,     Follow,
+
+    // ;     :        ,       .      ..       ... 
+    Semi,    Colon,   Comma,  Dot,   Concat,  Dots, 
+
+    // others
+    Integer(i64),
+    Float(f64),
+    Ident(String),
+    Literal(String),
+
+    // end 
+    Eof,
+}
+
+impl Token {
+    pub fn is_ident(&self) -> bool {
+        matches!(self, Token::Ident(_))
+    }
+
+    pub fn is_number(&self) -> bool {
+        matches!(self, Token::Integer(_) | Token::Float(_))
+    }
+
+    pub fn is_keyword(&self) -> bool {
+        match self {
+            Token::And
+            | Token::Break
+            | Token::Do
+            | Token::Else
+            | Token::Elseif
+            | Token::End
+            | Token::False
+            | Token::For
+            | Token::Function
+            | Token::Goto
+            | Token::If
+            | Token::In
+            | Token::Local
+            | Token::Nil
+            | Token::Not
+            | Token::Or
+            | Token::Repeat
+            | Token::Return
+            | Token::Then
+            | Token::True
+            | Token::Until
+            | Token::While => true,
+            _ => false,
+        }
+    }
+
+    pub fn is_eof(&self) -> bool {
+        matches!(self, Token::Eof)
+    }
+}
+
+/// A low-level peekable scannner iterate the input character sequence.
+///
+/// Next 'n' th character can be peeked via `first` and `second` method.
+/// Position can be shifted forward via `eat` and `eat_n` method.   
+///
+/// ref: https://github.com/rust-lang/rust/blob/master/compiler/rustc_lexer/src/cursor.rs
+pub struct Scanner<'a> {
+    chars: Chars<'a>,
+}
+//
+impl<'a> Scanner<'a> {
+    pub fn new(input: &'a str) -> Scanner<'a> {
+        Scanner {
+            chars: input.chars(),
+        }
+    }
+
+    /// Peek the next `nth(n)` char without consuming any input.
+    pub fn peek(&self, n: usize) -> Option<char> {
+        let mut it = self.chars.clone();
+        let mut ch = None;
+        (0..n).for_each(|_| ch = it.next());
+        ch
+    }
+
+    pub fn first(&self) -> char {
+        self.peek(1).unwrap_or_default()
+    }
+
+    pub fn second(&self) -> char {
+        self.peek(2).unwrap_or_default()
+    }
+
+    /// Checks if there is nothing more to consume.
+    pub fn is_eof(&self) -> bool {
+        self.chars.as_str().is_empty()
+    }
+}
+
+impl<'a> Scanner<'a> {
+    /// Consume one character.
+    pub fn eat(&mut self) -> Option<char> {
+        self.chars.next()
+    }
+
+    /// Consume while predicate returns `true` or until the end of input.
+    pub fn eat_while(&mut self, mut predicate: impl FnMut(char) -> bool) -> &'a str {
+        let record = self.chars.as_str();
+        let mut len = 0;
+        while predicate(self.first()) && !self.is_eof() {
+            self.eat();
+            len += 1;
+        }
+        &record[0..len]
+    }
+
+    /// Consume n character or until the end of input.
+    pub fn eat_n(&mut self, n: usize) -> &'a str {
+        let record = self.chars.as_str();
+        let mut i = 0;
+        while !self.is_eof() && i < n {
+            self.eat();
+            i += 1;
+        }
+        &record[0..n.min(record.len())]
+    }
+}
 
 /// Lex input sequence to token stream.
 ///

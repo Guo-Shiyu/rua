@@ -1,7 +1,6 @@
 use super::{
     ast::*,
-    lexer::{Lexer, LexicalError},
-    token::Token,
+    lexer::{Lexer, LexicalError, Token},
 };
 
 #[derive(Debug)]
@@ -74,7 +73,7 @@ impl Parser<'_> {
             None
         };
 
-        Ok(Block::new(stats, ret))
+        Ok(Block::new(None, stats, ret))
     }
 
     fn is_block_end(&self) -> bool {
@@ -264,7 +263,7 @@ impl Parser<'_> {
             let end = self.lex.line();
 
             let node = WithSrcLoc::new(else_stmt, (begin, end));
-            let els = Block::new(vec![node], None);
+            let els = Block::new(None, vec![node], None);
             Ok(Stmt::IfElse {
                 exp: Box::new(cond),
                 then: Box::new(then),
@@ -274,7 +273,7 @@ impl Parser<'_> {
         // if-then-end
         else {
             self.check_and_next(Token::End)?;
-            let empty = Block::new(vec![], None);
+            let empty = Block::new(None, vec![], None);
             Ok(Stmt::IfElse {
                 exp: Box::new(cond),
                 then: Box::new(then),
@@ -505,7 +504,10 @@ impl Parser<'_> {
         let body = self.block()?;
         self.check_and_next(Token::End)?;
 
-        Ok(FuncBody::new(params, Box::new(body)))
+        Ok(FuncBody {
+            params,
+            body: Box::new(body),
+        })
     }
 
     /// paralist ::= namelist [`,` `...`] | `...`
@@ -946,7 +948,7 @@ impl Parser<'_> {
 }
 
 impl Parser<'_> {
-    pub fn parse(src: &str, chunkname: String) -> Result<Block, SyntaxError> {
+    pub fn parse(src: &str, chunkname: Option<String>) -> Result<Block, SyntaxError> {
         let mut parser = Parser {
             lex: Lexer::new(src),
             current: Token::Eof,
@@ -963,14 +965,14 @@ impl Parser<'_> {
         debug_assert!(parser.current.is_eof());
         debug_assert!(parser.ahead.is_eof());
 
-        Ok(Block::chunk(chunkname, block.stats, block.ret))
+        Ok(Block::new(chunkname, block.stats, block.ret))
     }
 }
 
 mod test {
     #[test]
     fn parser_all_testes() {
-        use crate::compiler::parser::Parser;
+        use super::Parser;
 
         let emsg = format!(
             "unable to find directory: \"testes\" with base dir:{}",
@@ -1005,7 +1007,7 @@ mod test {
             })
             .for_each(|(file, content)| {
                 // execute parse
-                assert!(Parser::parse(&content, file).is_ok())
+                assert!(Parser::parse(&content, Some(file)).is_ok())
             });
     }
 }
