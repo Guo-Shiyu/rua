@@ -1,6 +1,6 @@
 use std::num::IntErrorKind;
-use std::str::FromStr;
 use std::str::Chars;
+use std::str::FromStr;
 
 /// Defined in [Lua 5.4 manual / 3.1 ](https://www.lua.org/manual/5.4/manual.html) 
 #[rustfmt::skip]
@@ -48,31 +48,31 @@ impl Token {
     }
 
     pub fn is_keyword(&self) -> bool {
-        match self {
+        matches!(
+            self,
             Token::And
-            | Token::Break
-            | Token::Do
-            | Token::Else
-            | Token::Elseif
-            | Token::End
-            | Token::False
-            | Token::For
-            | Token::Function
-            | Token::Goto
-            | Token::If
-            | Token::In
-            | Token::Local
-            | Token::Nil
-            | Token::Not
-            | Token::Or
-            | Token::Repeat
-            | Token::Return
-            | Token::Then
-            | Token::True
-            | Token::Until
-            | Token::While => true,
-            _ => false,
-        }
+                | Token::Break
+                | Token::Do
+                | Token::Else
+                | Token::Elseif
+                | Token::End
+                | Token::False
+                | Token::For
+                | Token::Function
+                | Token::Goto
+                | Token::If
+                | Token::In
+                | Token::Local
+                | Token::Nil
+                | Token::Not
+                | Token::Or
+                | Token::Repeat
+                | Token::Return
+                | Token::Then
+                | Token::True
+                | Token::Until
+                | Token::While
+        )
     }
 
     pub fn is_eof(&self) -> bool {

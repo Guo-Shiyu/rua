@@ -183,7 +183,9 @@ pub struct FuncBody {
 ///     exp binop exp | unop exp
 ///
 /// prefixexp ::= var | functioncall | `(` exp `)`
+#[derive(Default)]
 pub enum Expr {
+    #[default]
     Nil,
     False,
     True,
@@ -221,11 +223,7 @@ pub enum Expr {
     },
 }
 
-impl Default for Expr {
-    fn default() -> Self {
-        Expr::Nil
-    }
-}
+
 
 #[derive(Debug)]
 pub enum Attribute {
@@ -329,7 +327,7 @@ enum AstDumpErr {
 
 impl PassRunStatus for AstDumper {
     fn is_ok(&self) -> bool {
-        self.errinfo.is_none() && self.dump_buf.len() > 0
+        self.errinfo.is_none() && !self.dump_buf.is_empty()
     }
 
     fn is_err(&self) -> bool {
@@ -353,7 +351,7 @@ impl PassRunRes<Vec<u8>, AstDumpErr> for AstDumper {
     fn error(&self) -> Option<&AstDumpErr> {
         if self.errinfo.is_some() {
             self.errinfo.as_ref()
-        } else if self.dump_buf.len() == 0 {
+        } else if self.dump_buf.is_empty() {
             Some(&AstDumpErr::PassHasNotRun)
         } else {
             None
