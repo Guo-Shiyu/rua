@@ -1093,8 +1093,7 @@ mod test {
         use super::*;
         use crate::parser::Parser;
         use std::io::BufWriter;
-
-        let lua_src_path = "testes/all.lua";
+        let lua_src_path = "test/all.lua";
         let src = std::fs::read_to_string(lua_src_path).unwrap();
         let block = Parser::parse(&src, Some(lua_src_path.to_string())).unwrap();
 
@@ -1116,11 +1115,11 @@ mod test {
         use crate::parser::Parser;
 
         let emsg = format!(
-            "unable to find directory: \"testes\" with base dir:{}",
+            "unable to find directory: \"test\" with base dir:{}",
             std::env::current_dir().unwrap().display()
         );
 
-        let dir = std::fs::read_dir("./testes/").expect(&emsg);
+        let dir = std::fs::read_dir("./test/").expect(&emsg);
 
         let mut src_paths = dir
             .map(|e| e.map(|e| e.path()))

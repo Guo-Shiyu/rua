@@ -971,15 +971,15 @@ impl Parser<'_> {
 
 mod test {
     #[test]
-    fn parser_all_testes() {
+    fn parser_all_tests() {
         use super::Parser;
 
         let emsg = format!(
-            "unable to find directory: \"testes\" with base dir:{}",
+            "unable to find directory: \"test\" with base dir:{}",
             std::env::current_dir().unwrap().display()
         );
 
-        let dir = std::fs::read_dir("./testes/").expect(&emsg);
+        let dir = std::fs::read_dir("./test/").expect(&emsg);
 
         let mut src_paths = dir
             .map(|e| e.map(|e| e.path()))
