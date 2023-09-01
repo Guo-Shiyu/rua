@@ -2,14 +2,14 @@ use std::{
     collections::BTreeMap,
     fmt::Debug,
     io::{BufWriter, Write},
-    ptr::NonNull,
     rc::Rc,
 };
 
 use crate::{
     ast::{BinOp, Block, Expr, ExprNode, FuncCall, ParaList, Stmt, StmtNode, UnOp},
-    state::{Heap, State},
-    value::{EstimatedSize, GcColor, GcMark, GcObject, LValue, StrWrapper},
+    heap::{Gc, Heap, HeapMemUsed},
+    state::RegIndex,
+    value::LValue,
 };
 
 /// We assume that instructions are unsigned 32-bit integers.
@@ -196,9 +196,9 @@ impl Instruction {
     const MAX_A: i32 = u8::MAX as i32; // 8 bit
     const MAX_B: i32 = Self::MAX_A; // 8 bit
     const MAX_C: i32 = Self::MAX_A; // 8 bit
-    const MAX_BX: i32 = 0xFFFF_1; // 17 bit
+    const MAX_BX: i32 = 0x000F_FFF1; // 17 bit
     const MAX_SBX: i32 = Self::MAX_BX - 1; // 17 bit but signed
-    const MAX_AX: i32 = 0xFFFF_FF1; // 25 bit
+    const MAX_AX: i32 = 0x0FFF_FFF1; // 25 bit
     const MAX_SJ: i32 = Self::MAX_AX; // 25 bit
 
     const MASK_OP: u32 = 0x7F << Self::OFFSET_OP;
@@ -406,9 +406,7 @@ pub struct UpValue {
 }
 
 /// Lua Function Prototype
-#[repr(C)]
 pub struct Proto {
-    gch: GcMark,
     is_vararg: bool,
     param_num: u8, // positional parameter count
     reg_count: u8, // number of registers used by this function
@@ -418,7 +416,7 @@ pub struct Proto {
 
     kst: Vec<LValue>,       // constants  (assert(!kst[i].is_manged()))
     code: Vec<Instruction>, // bytecodes
-    subfn: Vec<Proto>,      // sub functions
+    subfn: Vec<Gc<Proto>>,  // sub functions
 
     abslines: Vec<(u32, u32)>, // sorted vector record pc -> line, always recorded for error info
     source: Option<Rc<String>>, // source file name, used for debug info
@@ -427,8 +425,8 @@ pub struct Proto {
     upvals: Option<Vec<UpValue>>, // upvalue name, used for debug info
 }
 
-impl EstimatedSize for Proto {
-    fn estimate_size(&self) -> usize {
+impl HeapMemUsed for Proto {
+    fn heap_mem_used(&self) -> usize {
         std::mem::size_of::<Self>()
             + self.kst.capacity()
             + self.code.capacity()
@@ -437,41 +435,24 @@ impl EstimatedSize for Proto {
             + self.abslineinfo.as_ref().map_or(0, |v| v.capacity())
             + self.locvars.as_ref().map_or(0, |l| l.capacity())
             + self.upvals.as_ref().map_or(0, |u| u.capacity())
-    }
-}
-
-impl GcObject for Proto {
-    fn gch_addr(&self) -> *const GcMark {
-        &self.gch as *const GcMark
-    }
-
-    fn mark_reachable(&self) {
-        self.gch.set(GcColor::White);
-    }
-
-    fn mark_unreachable(&self) {
-        self.gch.set(GcColor::Black);
-    }
-
-    fn mark_newborned(&self, white: GcColor) -> &Self {
-        self.gch.set(white);
-        self
+            + self.source.as_ref().map_or(0, |s| s.capacity())
     }
 }
 
 impl Proto {
-    pub fn delegat_by(&self, heap: &mut Heap) {
-        for k in self.kst.iter() {
-            heap.delegate(k.clone());
+    pub fn delegate_to(p: &Proto, heap: &mut Heap) {
+        for k in p.kst.iter() {
+            heap.delegate(*k);
         }
 
-        for sub in self.subfn.iter() {
-            sub.delegat_by(heap);
+        for sub in p.subfn.iter() {
+            heap.delegate_from(*sub);
+            Self::delegate_to(sub, heap);
         }
     }
 
-    pub fn nparams(&self) -> usize {
-        self.param_num as usize
+    pub fn nparams(&self) -> i32 {
+        self.param_num as i32
     }
 
     pub fn reg_count(&self) -> usize {
@@ -486,12 +467,13 @@ impl Proto {
         &self.kst
     }
 
-    pub fn subprotos(&self) -> &[Proto] {
+    pub fn subprotos(&self) -> &[Gc<Proto>] {
         &self.subfn
     }
 
-    pub fn upvalues(&self) -> &[UpValue] {
-        self.upvals.as_ref().map_or(&[], |v| v.as_slice())
+    pub fn upvalues(&self) -> &[LValue] {
+        // self.upvals.as_ref().map_or(&[], |v| v.as_slice())
+        &[]
     }
 }
 
@@ -502,9 +484,6 @@ pub struct LocVar {
                      // start_pc: u32, // first point where variable is active
                      // end_pc: u32,   // first point where variable is dead
 }
-
-///
-type RegIndex = i32;
 
 #[derive(Clone)]
 enum ExprStatus {
@@ -597,7 +576,7 @@ impl GenState {
     fn find_const_str(&self, s: &str) -> Option<i32> {
         for (idx, v) in self.ksts.iter().enumerate() {
             if let LValue::String(sw) = v {
-                if unsafe { sw.as_ref().as_str() } == s {
+                if sw.as_str() == s {
                     return Some(idx as i32);
                 }
             }
@@ -710,15 +689,15 @@ impl CodeGen {
             self.walk_stmt(stmt);
         }
 
-        if let Some(retstmt) = body.ret.as_mut() {
+        if let Some(_retstmt) = body.ret.as_mut() {
             // self.walk_ret_stmt(retstmt);
             todo!()
         }
 
         let state = self.leave_func();
+        let subfns = state.subproto.into_iter().map(Gc::from).collect();
 
         Proto {
-            gch: Default::default(),
             is_vararg,
             param_num: param_num as u8,
             reg_count: state.regs as u8,
@@ -726,7 +705,7 @@ impl CodeGen {
             lastlinedef: *state.absline.last().unwrap(),
             kst: state.ksts,
             code: state.code,
-            subfn: state.subproto,
+            subfn: subfns,
 
             // optional debug infomation
             abslines: if self.strip { Vec::new() } else { Vec::new() },
@@ -808,21 +787,15 @@ impl CodeGen {
                 Expr::Float(f) => {
                     let sidx = cs.alloc_free_reg();
                     let cidx = cs
-                        .find_const_reg(&&LValue::Float(*f))
+                        .find_const_reg(&LValue::Float(*f))
                         .unwrap_or_else(|| cs.alloc_const_reg(LValue::Float(*f))); // lazy
                     cs.gen(Isc::iabx(OpCode::LOADK, sidx, cidx), ln);
                     ExprStatus::Const(cidx)
                 }
                 Expr::Literal(s) => {
                     let sidx = cs.alloc_free_reg();
-                    let cidx = cs.find_const_str(&s).unwrap_or_else(|| {
-                        let wrapper = if s.len() > StrWrapper::MAX_SHORT_LEN {
-                            StrWrapper::from_long(std::mem::take(s))
-                        } else {
-                            StrWrapper::from_short(std::mem::take(s), None, false)
-                        };
-                        let strval =
-                            LValue::String(NonNull::new(Box::into_raw(Box::new(wrapper))).unwrap());
+                    let cidx = cs.find_const_str(s).unwrap_or_else(|| {
+                        let strval = LValue::from(Gc::from(std::mem::take(s)));
                         cs.alloc_const_reg(strval)
                     }); // lazyly
 
@@ -845,9 +818,9 @@ impl CodeGen {
 
                     // FIX:
                     // remove copy
-                    cs.alloc_const_reg(LValue::from(id.clone()));
-                    let status = cs.load_global(&id, ln);
-                    status
+                    cs.alloc_const_reg(LValue::from_wild(Gc::from(id.as_str())));
+
+                    cs.load_global(id, ln)
                 }
 
                 Expr::UnaryOp { op, expr } => {
@@ -1008,7 +981,7 @@ impl CodeGen {
     /// use (line, col) as unique id
     fn take_expr_unique(node: &ExprNode) -> usize {
         let line = node.lineinfo().0 as usize;
-        line << 16 + node.lineinfo().1 as usize
+        line << (16 + node.lineinfo().1 as usize)
     }
 
     fn walk_stmt(&mut self, stmt: &mut StmtNode) {
@@ -1053,9 +1026,9 @@ impl CodeGen {
     fn walk_fncall(&mut self, call: &mut FuncCall) -> ExprStatus {
         match call {
             FuncCall::MethodCall {
-                prefix,
-                method,
-                args,
+                prefix: _,
+                method: _,
+                args: _,
             } => {
                 todo!()
             }
@@ -1065,7 +1038,7 @@ impl CodeGen {
 
                 let ret_begin;
                 let status = self.walk_common_expr(prefix);
-                let mut cs = self.take_current_state();
+                let cs = self.take_current_state();
                 let call_inst = match status {
                     ExprStatus::Reg(reg) => {
                         // a : fn index

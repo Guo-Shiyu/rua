@@ -1,606 +1,528 @@
 use std::{
     cell::Cell,
     collections::{hash_map::DefaultHasher, HashMap},
-    fmt::Display,
+    fmt::{Debug, Display},
     hash::{Hash, Hasher},
-    ptr::NonNull,
 };
 
-use crate::{codegen::Proto, LuaErr};
+use crate::{
+    codegen::Proto,
+    heap::{
+        Gc, GcColor, GcHeader, HeapMemUsed, MarkAndSweepGcOps, Tag, TaggedBox, TypeTag,
+        WithGcHeader,
+    },
+};
 
 use super::{state::State, RuntimeErr};
 
-/// # NanBoxing Technique
-///
-/// for a IEE754 NAN 64 bit floating number, it has a structure like this:
-/// ``` text
-///
-///                     64 bit
-///     +-------------------------------------+
-///     0111 1111 1111 xxxx xxxx .... xxxx xxxx
-///     +------------+ +----------------------+
-///         12 bit             52 bit
-///
-/// in x86 64bit OS, there are only 48 address lines used for addressing
-/// so, a pointer can be stored in a nan float, and extra 4 bits can be
-/// used to mark the ptr's type:
-///
-///          head      tag          payload
-///     +------------+ +--+ +---------------------+
-///     0111 1111 1111 xxxx yyyy yyyy ... yyyy yyyy
-///     +------------+ +--+ +---------------------+
-///         12 bit     4 bit         48 bit
-///
-/// ```
-///
-
-/// https://github.com/Tencent/rapidjson/pull/546
-///
-
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct TaggedBox {
-    repr: u64,
-}
-
-pub const PAYLOAD_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
-pub const TAG_MASK: u64 = 0xFFFF_0000_0000_0000;
-
-/// Heap address head mask for 64 bit OS
-pub const HEAP_ADDR_HEAD_MASK: u64 = 0xFFFF_0000_0000_0000;
-
-#[cfg(target_os = "linux")]
-pub const HEAP_ADDR_HEAD: u64 = 0x7ff0_0000_0000_0000;
-
-#[cfg(target_os = "windows")]
-pub const HEAP_ADDR_HEAD: u64 = 0x0000_0000_0000_0000;
-
-pub type Tag = u8;
-
-impl TaggedBox {
-    pub fn new(tag: Tag, payload: usize) -> Self {
-        let mut repr = u64::MIN;
-
-        // set tag bits
-        repr |= (tag as u64) << 48;
-
-        // set payload bits
-        let fixed_pl = PAYLOAD_MASK & payload as u64;
-        repr |= fixed_pl as u64;
-
-        Self { repr }
-    }
-
-    pub fn in_raw(&self) -> u64 {
-        u64::from_ne_bytes(self.repr.to_ne_bytes())
-    }
-
-    pub fn tag(&self) -> Tag {
-        ((self.in_raw() & TAG_MASK) >> 48) as u8
-    }
-
-    pub fn payload(&self) -> u64 {
-        self.in_raw() & PAYLOAD_MASK
-    }
-
-    pub fn set_tag(&mut self, tag: Tag) -> &Self {
-        *self = Self::new(tag, self.payload() as usize);
-        self
-    }
-
-    pub fn set_payload(&mut self, payload: usize) -> &Self {
-        *self = Self::new(self.tag(), payload);
-        self
-    }
-
-    pub fn replace_payload_with(&mut self, payload: usize) -> usize {
-        let old = self.payload();
-        self.set_payload(payload);
-        old as usize
-    }
-
-    pub fn replace_tag_with(&mut self, tag: Tag) -> Tag {
-        let old = self.tag();
-        self.set_tag(tag);
-        old
-    }
-
-    pub fn as_ptr<T>(&self) -> *const T {
-        (self.payload() | HEAP_ADDR_HEAD) as *const T
-    }
-
-    pub fn as_mut<T>(&self) -> *mut T {
-        (self.payload() | HEAP_ADDR_HEAD) as *mut T
-    }
-
-    pub fn from_heap_ptr<T>(tag: Tag, payload: *const T) -> Self {
-        Self::new(tag, payload as usize)
-    }
-}
-
-#[repr(u8)]
-#[derive(Clone, Copy)]
-pub enum GcColor {
-    Wild,         // not mamaged by any vm
-    Black,        // reachable
-    Gray,         // reachable, but not scanned
-    White,        // unreachable  flag 1
-    AnotherWhite, // unreachable  flag 2
-}
-
-impl Default for GcColor {
-    fn default() -> Self {
-        Self::Wild
-    }
-}
-
-pub trait EstimatedSize {
-    fn estimate_size(&self) -> usize;
-}
-
-pub trait GcObject: EstimatedSize + WithTag {
-    fn gch_addr(&self) -> *const GcMark;
-    fn mark_reachable(&self);
-    fn mark_unreachable(&self);
-    fn mark_newborned(&self, white: GcColor) -> &Self;
-}
-
-// pub type GcMark = Cell<GcColor>;
-pub type GcMark = Cell<GcColor>;
-
-macro_rules! impl_gc_cycle {
-    ($type: ty) => {
-        impl GcObject for $type {
-            fn gch_addr(&self) -> *const GcMark {
-                &self.gch as *const GcMark
-            }
-
-            fn mark_reachable(&self) {
-                self.gch.set(GcColor::White);
-            }
-
-            fn mark_unreachable(&self) {
-                self.gch.set(GcColor::Black);
-            }
-
-            fn mark_newborned(&self, white: GcColor) -> &Self {
-                self.gch.set(white);
-                self
-            }
-        }
-    };
-}
-
-pub enum StrInner {
-    Short { ptr: *mut u8, len: u8, capacity: u8 },
-    Long { inner: String },
-}
+#[derive(Debug)]
+struct FlexibleArrayMarker();
 
 pub type StrHashVal = u32;
 
+/// String are implemented as a flexible array
 /// Depends on the fixed layout, so repr as C.
 #[repr(C)]
-pub struct StrWrapper {
-    gch: GcMark,
-    extra: bool, // reserved (short)  | hashed (long string)
-    hash: StrHashVal,
-    inner: StrInner,
+#[derive(Debug)]
+pub struct StrImpl {
+    len: usize,             // len of string excluding header
+    capacity: usize,        // len of buffer including header
+    hash: Cell<StrHashVal>, // hash unique
+    extra: Cell<bool>,      // reserved (for short)  | hashed (for long)
+    _inplace_ptr: FlexibleArrayMarker,
 }
 
-impl EstimatedSize for StrWrapper {
-    fn estimate_size(&self) -> usize {
-        let inner_buf_size = match &self.inner {
-            StrInner::Short {
-                ptr: _,
-                len,
-                capacity: _,
-            } => *len as usize,
-            StrInner::Long { inner } => inner.capacity(),
-        };
-        inner_buf_size + std::mem::size_of::<StrWrapper>()
+impl HeapMemUsed for StrImpl {
+    fn heap_mem_used(&self) -> usize {
+        self.len + std::mem::size_of::<StrImpl>()
     }
 }
 
-impl_gc_cycle!(StrWrapper);
+impl Debug for Gc<StrImpl> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Gc<StrImpl>")
+            .field("len", &self.len)
+            .field("capacity", &self.capacity)
+            .field("hash", &self.hash.get())
+            .field("extra", &self.extra.get())
+            .finish()
+    }
+}
 
-// impl Drop for StrWrapper {
-//     fn drop(&mut self) {
-//         match self.inner {
-//             StrInner::Short {
-//                 ptr: content,
-//                 len,
-//                 capacity,
-//             } => unsafe {
-//                 let _ = String::from_raw_parts(content, len as usize, capacity as usize);
-//             },
-//             StrInner::Long { inner: _ } => {}
-//         }
-//     }
-// }
-
-impl StrWrapper {
-    pub const MAX_SHORT_LEN: usize = 40;
-
-    pub fn hashid(&mut self) -> StrHashVal {
-        match &self.inner {
-            StrInner::Short {
-                ptr: _,
-                len: _,
-                capacity: _,
-            } => self.hash,
-            StrInner::Long { inner } => {
-                if !self.extra {
-                    self.hash = Self::hash_long(inner);
-                    self.extra = true;
-                }
-
-                self.hash
+impl PartialEq for StrImpl {
+    fn eq(&self, r: &Self) -> bool {
+        if self.len() == r.len() && self.hashid() == r.hashid() {
+            if self.is_short() {
+                true
+            } else {
+                self.as_str() == r.as_str()
             }
-        }
-    }
-
-    pub fn hash_long(s: &str) -> StrHashVal {
-        let mut hasher = DefaultHasher::new();
-        s.chars()
-            .step_by(s.len() >> 5)
-            .for_each(|c| c.hash(&mut hasher));
-        hasher.finish() as StrHashVal
-    }
-
-    pub fn hash_short(ss: &str) -> StrHashVal {
-        let mut hasher = DefaultHasher::new();
-        ss.chars().for_each(|c| c.hash(&mut hasher));
-        hasher.finish() as StrHashVal
-    }
-
-    pub fn len(&self) -> usize {
-        match &self.inner {
-            StrInner::Short {
-                ptr: _,
-                len,
-                capacity: _,
-            } => *len as usize,
-            StrInner::Long { inner } => inner.len(),
-        }
-    }
-
-    pub fn as_str(&self) -> &str {
-        match &self.inner {
-            StrInner::Short {
-                ptr: content,
-                len,
-                capacity: _,
-            } => unsafe {
-                std::str::from_utf8_unchecked(std::slice::from_raw_parts(*content, *len as usize))
-            },
-            StrInner::Long { inner } => inner.as_str(),
-        }
-    }
-
-    pub fn from_short(mut str: String, hash: Option<StrHashVal>, reserve: bool) -> Self {
-        debug_assert!(str.len() <= Self::MAX_SHORT_LEN);
-        let hash = hash.unwrap_or_else(|| Self::hash_short(&str));
-        let (ptr, len, cap) = (str.as_mut_ptr(), str.len(), str.capacity());
-        std::mem::forget(str);
-
-        Self {
-            gch: GcMark::default(),
-            extra: reserve,
-            hash,
-            inner: StrInner::Short {
-                ptr,
-                len: len as u8,      // len < Self::MaxShortLen
-                capacity: cap as u8, // capaciry has shrinked
-            },
-        }
-    }
-
-    pub fn from_long(mut s: String) -> Self {
-        if s.capacity() > 2 * s.len() {
-            s.shrink_to_fit();
-        }
-        Self {
-            gch: GcMark::default(),
-            extra: false,
-            hash: 0,
-            inner: StrInner::Long { inner: s },
-        }
-    }
-
-    pub fn free_short(&mut self) {
-        match self.inner {
-            StrInner::Short {
-                ptr: mut content,
-                mut len,
-                mut capacity,
-            } => unsafe {
-                let _ = String::from_raw_parts(content, len as usize, capacity as usize);
-                content = std::ptr::null_mut();
-                len = 0;
-                capacity = 0;
-            },
-            StrInner::Long { inner: _ } => {}
-        }
-    }
-
-    pub fn is_long(&self) -> bool {
-        match self.inner {
-            StrInner::Short { .. } => false,
-            StrInner::Long { .. } => true,
-        }
-    }
-
-    pub fn is_short(&self) -> bool {
-        !self.is_long()
-    }
-
-    pub fn inner(&self) -> &StrInner {
-        &self.inner
-    }
-
-    pub fn is_reserved(&self) -> bool {
-        if let StrInner::Short {
-            ptr: _,
-            len: _,
-            capacity: _,
-        } = self.inner
-        {
-            self.extra
         } else {
             false
         }
     }
 }
 
-#[repr(C)]
-pub struct Table {
-    gch: GcMark,
-    hashpart: HashMap<usize, LValue>,
-
-    // TODO:
-    // replace arrary part to binary heap
-    array: Vec<LValue>,
-}
-
-impl Default for Table {
-    fn default() -> Self {
-        Self {
-            gch: GcMark::default(),
-            hashpart: HashMap::new(),
-            array: Vec::new(),
+impl From<String> for Gc<StrImpl> {
+    fn from(mut s: String) -> Self {
+        let strlen = s.len();
+        let total_need = s.len() + StrImpl::EXTRA_HEADERS_SIZE;
+        if total_need > s.capacity() {
+            return Self::from(s.as_str());
         }
-    }
-}
 
-impl EstimatedSize for Table {
-    fn estimate_size(&self) -> usize {
-        // TODO:
-        // implement this
-
-        std::mem::size_of::<Table>()
-    }
-}
-
-impl_gc_cycle!(Table);
-
-impl Table {
-    pub fn set(&mut self, k: &LValue, v: LValue) -> Result<(), RuntimeErr> {
-        let unique = Self::as_key(k);
-        if unique == 0 {
-            return Err(RuntimeErr::TableIndexIsNil);
+        if s.capacity() > 2 * total_need {
+            s.shrink_to(total_need);
         }
-        self.hashpart.insert(unique, v);
-        Ok(())
-    }
 
-    pub fn find_by_key(&self, k: &LValue) -> Result<LValue, RuntimeErr> {
-        let unique = Self::as_key(k);
-        if unique == 0 {
-            return Err(RuntimeErr::TableIndexIsNil);
-        }
-        Ok(self.hashpart.get(&unique).cloned().unwrap_or_default())
-    }
-
-    fn as_key(k: &LValue) -> usize {
-        match k.clone() {
-            LValue::Nil => 0,
-            LValue::Bool(b) => b as usize,
-            LValue::Int(i) => i as usize,
-            LValue::Float(f) => {
-                let u = u64::from_ne_bytes(f.to_ne_bytes());
-                u as usize
+        unsafe {
+            // shuffle string to the end of buffer
+            let mut rsrc = s.as_ptr().add(s.len());
+            let mut rdest = rsrc.add(StrImpl::EXTRA_HEADERS_SIZE) as *mut u8;
+            for _ in 0..=s.len() {
+                *rdest = *rsrc;
+                rdest = rdest.sub(1);
+                rsrc = rsrc.sub(1);
             }
-            LValue::String(ref mut s) => unsafe { s.as_mut().hashid() as usize },
-            LValue::Table(t) => unsafe { t.as_ref().gch_addr() as usize },
-            LValue::Function(f) => unsafe { f.as_ref().gch_addr() as usize },
-            LValue::RsFn(rf) => rf as usize,
-            LValue::UserData(ud) => unsafe { ud.as_ref().gch_addr() as usize },
+
+            let (with_gch, cap) = (
+                std::mem::transmute::<*mut u8, *mut WithGcHeader<StrImpl>>(s.as_mut_ptr()),
+                s.capacity(),
+            );
+            std::mem::forget(s);
+
+            let obj = with_gch.as_mut().unwrap_unchecked();
+            obj.gcheader.color.set(GcColor::Wild);
+            obj.gcheader.age.set(0);
+            obj.inner.len = strlen;
+            obj.inner.capacity = cap;
+            obj.inner.extra.set(false);
+            if obj.inner.is_short() {
+                obj.inner.hash = Cell::new(StrImpl::hash_str(obj.inner.as_str()));
+            } else {
+                obj.inner.hash = Cell::new(StrHashVal::MIN);
+            }
+
+            Gc::from(with_gch)
         }
+    }
+}
+
+impl From<&str> for Gc<StrImpl> {
+    fn from(s: &str) -> Self {
+        let (with_gch, cap) = unsafe {
+            let mut buf = String::with_capacity(s.len() + StrImpl::EXTRA_HEADERS_SIZE);
+            let dest = std::slice::from_raw_parts_mut(
+                buf.as_ptr().add(StrImpl::EXTRA_HEADERS_SIZE) as *mut u8,
+                s.len(),
+            );
+            dest.copy_from_slice(std::slice::from_raw_parts(s.as_ptr(), s.len()));
+
+            let res = (
+                buf.as_mut_ptr() as *mut WithGcHeader<StrImpl>,
+                buf.capacity(),
+            );
+            std::mem::forget(buf);
+            res // avoid drop buf
+        };
+
+        unsafe {
+            let obj = with_gch.as_mut().unwrap_unchecked();
+            obj.gcheader.color.set(GcColor::Wild);
+            obj.gcheader.age.set(0);
+            obj.inner.len = s.len();
+            obj.inner.capacity = cap;
+            obj.inner.extra.set(false);
+            if obj.inner.is_short() {
+                obj.inner.hash = Cell::new(StrImpl::hash_str(s));
+            } else {
+                obj.inner.hash = Cell::new(StrHashVal::MIN);
+            }
+        }
+        Gc::from(with_gch)
+    }
+}
+
+impl StrImpl {
+    pub const STR_HEADER_SIZE: usize = std::mem::size_of::<StrImpl>();
+    pub const CACHELINE_SIZE: usize = 64;
+    pub const EXTRA_HEADERS_SIZE: usize = Self::STR_HEADER_SIZE + std::mem::size_of::<GcHeader>();
+    pub const MAX_SHORT_LEN: usize = Self::CACHELINE_SIZE - Self::EXTRA_HEADERS_SIZE;
+
+    pub fn hash_str(ss: &str) -> StrHashVal {
+        let step = if Self::check_short(ss) {
+            1
+        } else {
+            ss.len() >> 5
+        };
+
+        let mut hasher = DefaultHasher::new();
+        ss.chars().step_by(step).for_each(|c| c.hash(&mut hasher));
+        hasher.finish() as StrHashVal
+    }
+
+    pub fn hashid(&self) -> StrHashVal {
+        if self.is_long() && !self.extra.get() {
+            self.hash.set(Self::hash_str(self.as_str()));
+            self.extra.set(true);
+        };
+        self.hash.get()
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn as_str(&self) -> &str {
+        unsafe {
+            let ptr = (self as *const StrImpl as *const u8).add(Self::STR_HEADER_SIZE);
+            let slc = std::slice::from_raw_parts(ptr, self.len);
+            std::str::from_utf8(slc).unwrap()
+        }
+    }
+
+    pub fn is_short(&self) -> bool {
+        self.len <= Self::MAX_SHORT_LEN
+    }
+
+    pub fn is_long(&self) -> bool {
+        !self.is_short()
+    }
+
+    pub fn is_reserved(&self) -> bool {
+        self.is_short() && self.extra.get()
+    }
+
+    /// Return true if s is short
+    pub fn check_short(s: &str) -> bool {
+        s.len() <= StrImpl::MAX_SHORT_LEN
+    }
+
+    pub fn drop(val: Gc<StrImpl>) {
+        unsafe {
+            let ptr = val.heap_address() as *mut u8;
+            let _len = val.len;
+            let cap = val.capacity;
+            let _ = Box::from_raw(std::slice::from_raw_parts_mut(ptr, cap));
+        }
+    }
+}
+
+pub trait AsTableKey {
+    fn as_key(&self) -> usize;
+}
+
+#[repr(C)]
+#[derive(Default)]
+pub struct TableImpl {
+    hmap: HashMap<usize, LValue>,
+    array: Vec<LValue>,
+    meta: Option<Gc<TableImpl>>,
+}
+
+impl HeapMemUsed for TableImpl {
+    fn heap_mem_used(&self) -> usize {
+        let self_and_map = self
+            .hmap
+            .iter()
+            .fold(std::mem::size_of::<TableImpl>(), |acc, (_, val)| {
+                acc + val.heap_mem_used()
+            });
+
+        let ary = self
+            .array
+            .iter()
+            .fold(0, |acc, val| acc + val.heap_mem_used());
+
+        self_and_map + ary
+    }
+}
+
+impl TableImpl {
+    pub fn with_capacity(cap: (usize, usize)) -> Self {
+        Self {
+            hmap: HashMap::with_capacity(cap.0),
+            array: Vec::with_capacity(cap.1),
+            meta: None,
+        }
+    }
+
+    pub fn set<K>(&mut self, k: K, v: LValue)
+    where
+        K: AsTableKey,
+    {
+        self.hmap.insert(k.as_key(), v);
+    }
+
+    pub fn get<K>(&self, k: K) -> LValue
+    where
+        K: AsTableKey,
+    {
+        self.hmap.get(&k.as_key()).cloned().unwrap_or_default()
     }
 }
 
 /// a flexible array
 #[repr(C)]
-pub struct UserData {
-    gch: GcMark,
-    len: usize,
+pub struct UserDataImpl {
+    pub size: usize,
+    _inplace_ptr: FlexibleArrayMarker,
 }
-impl EstimatedSize for UserData {
-    fn estimate_size(&self) -> usize {
-        self.len
+
+impl HeapMemUsed for UserDataImpl {
+    fn heap_mem_used(&self) -> usize {
+        self.size
     }
 }
 
-impl_gc_cycle!(UserData);
+impl UserDataImpl {
+    pub fn get_raw_data(&self) -> &[u8] {
+        unsafe {
+            let ptr = (self as *const UserDataImpl as *const u8).add(std::mem::size_of::<Self>());
+            std::slice::from_raw_parts(ptr, self.size)
+        }
+    }
 
-// usize, stack size after call
+    pub fn as_ptr<T>(&self) -> *const T {
+        self.get_raw_data().as_ptr() as *const T
+    }
+
+    pub fn as_mut<T>(&mut self) -> *mut T {
+        unsafe {
+            (self as *const UserDataImpl as *const u8).add(std::mem::size_of::<Self>()) as *mut T
+        }
+    }
+
+    pub fn drop(val: Gc<UserDataImpl>) {
+        unsafe {
+            let ptr = val.heap_address() as *mut u8;
+            let len = val.size;
+            let _ = Box::from_raw(std::slice::from_raw_parts_mut(ptr, len));
+        }
+    }
+}
+
+// usize: stack size after call
 pub type RsFunc = fn(&mut State) -> Result<usize, RuntimeErr>;
 
-// mark gc objects id
-pub trait WithTag {
-    fn tagid() -> Tag;
-}
-
-macro_rules! tagid_declare {
-    ($s:ty, $id:expr) => {
-        impl WithTag for $s {
-            fn tagid() -> Tag {
-                $id
-            }
-        }
-    };
-}
-
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Default)]
 pub enum LValue {
+    #[default]
     Nil,
-
     Bool(bool),
     Int(i64),
     Float(f64),
-
-    String(NonNull<StrWrapper>), // lua immutable string
-    Table(NonNull<Table>),       // lua table
-    Function(NonNull<Proto>),    // lua function
-    RsFn(RsFunc),                // light rs function
-    UserData(NonNull<UserData>), // light rs user data, managed by lua
+    RsFn(RsFunc),               // light rs function
+    String(Gc<StrImpl>),        // lua immutable string
+    Table(Gc<TableImpl>),       // lua table
+    Function(Gc<Proto>),        // lua function
+    UserData(Gc<UserDataImpl>), // light rs user data, managed by lua
 }
 
-tagid_declare!(StrWrapper, 4);
-tagid_declare!(Table, 5);
-tagid_declare!(Proto, 6);
-tagid_declare!(UserData, 7);
-
-// impl WithTag for LValue {
-//     fn tagid(&self) -> Tag {
-//         use LValue::*;
-//         match self {
-//             Nil => 0,
-//             Bool(_) => 1,
-//             Int(_) => 2,
-//             Float(_) => 3,
-//             String(s) => unsafe { s.as_ref().tagid() },
-//             Table(t) => unsafe { t.as_ref().tagid() },
-//             Function(f) => unsafe { f.as_ref().tagid() },
-//             RsFn(rf) => unsafe { rf.as_ref().tagid() },
-//             UserData { .. } => 8,
-//         }
-//     }
-// }
-
-impl Default for LValue {
-    fn default() -> Self {
-        LValue::Nil
+impl TypeTag for StrImpl {
+    fn tagid() -> Tag {
+        0
     }
 }
 
-impl From<TaggedBox> for LValue {
-    fn from(value: TaggedBox) -> Self {
-        match value.tag() {
-            4 => LValue::String(unsafe { NonNull::new_unchecked(value.as_mut::<StrWrapper>()) }),
-            5 => LValue::Table(unsafe { NonNull::new_unchecked(value.as_mut::<Table>()) }),
-            6 => LValue::Function(unsafe { NonNull::new_unchecked(value.as_mut::<Proto>()) }),
-            7 => LValue::RsFn(unsafe { std::mem::transmute(value.payload()) }),
-            _ => unreachable!(),
-        }
+impl TypeTag for TableImpl {
+    fn tagid() -> Tag {
+        1
     }
 }
 
-impl From<Proto> for LValue {
-    fn from(value: Proto) -> Self {
-        LValue::Function(unsafe { NonNull::new_unchecked(Box::into_raw(Box::new(value))) })
+impl TypeTag for Proto {
+    fn tagid() -> Tag {
+        2
     }
 }
 
-impl From<String> for LValue {
-    fn from(value: String) -> Self {
-        let len = value.len();
-        if len <= StrWrapper::MAX_SHORT_LEN {
-            LValue::String(unsafe {
-                NonNull::new_unchecked(Box::into_raw(Box::new(StrWrapper::from_short(
-                    value, None, false,
-                ))))
-            })
-        } else {
-            LValue::String(unsafe {
-                NonNull::new_unchecked(Box::into_raw(Box::new(StrWrapper::from_long(value))))
-            })
-        }
+impl TypeTag for UserDataImpl {
+    fn tagid() -> Tag {
+        3
     }
 }
 
-impl EstimatedSize for LValue {
-    fn estimate_size(&self) -> usize {
+impl HeapMemUsed for LValue {
+    fn heap_mem_used(&self) -> usize {
         match self {
             // thry are not allocated on heap
             LValue::Nil | LValue::Bool(_) | LValue::Int(_) | LValue::Float(_) | LValue::RsFn(_) => {
                 0
             }
 
-            LValue::String(sw) => unsafe { sw.as_ref().estimate_size() },
-            LValue::Table(tb) => unsafe { tb.as_ref().estimate_size() },
-            LValue::Function(p) => unsafe { p.as_ref().estimate_size() },
-            LValue::UserData(ud) => unsafe { ud.as_ref().estimate_size() },
+            LValue::String(sw) => sw.heap_mem_used(),
+            LValue::Table(tb) => tb.heap_mem_used(),
+            LValue::Function(p) => p.heap_mem_used(),
+            LValue::UserData(ud) => ud.heap_mem_used(),
         }
     }
 }
 
-// impl GcObject for LValue {
-//     fn gch_addr(&self) -> *const GcMark {
-//         match self {
-//             LValue::String(s) => unsafe { s.as_ref().gch_addr() },
-//             LValue::Table(t) => unsafe { t.as_ref().gch_addr() },
-//             LValue::Function(f) => unsafe { f.as_ref().gch_addr() },
-//             LValue::UserData { .. } => todo!(),
-//             _ => std::ptr::null(),
-//         }
-//     }
+impl MarkAndSweepGcOps for LValue {
+    fn mark_newborned(&self, white: GcColor) {
+        match self {
+            LValue::String(s) => s.mark_newborned(white),
+            LValue::Table(t) => t.mark_newborned(white),
+            LValue::Function(f) => f.mark_newborned(white),
+            LValue::UserData(ud) => ud.mark_newborned(white),
+            _ => {}
+        }
+    }
 
-//     fn mark_reachable(&self) {
-//         match self {
-//             LValue::String(s) => unsafe {
-//                 s.as_ref().mark_reachable();
-//             },
-//             LValue::Table(t) => unsafe {
-//                 t.as_ref().mark_reachable();
-//             },
-//             LValue::Function(f) => unsafe {
-//                 f.as_ref().mark_reachable();
-//             },
-//             _ => {}
-//         };
-//     }
+    fn mark_reachable(&self) {
+        match self {
+            LValue::String(s) => s.mark_reachable(),
+            LValue::Table(t) => t.mark_reachable(),
+            LValue::Function(f) => f.mark_reachable(),
+            LValue::UserData(ud) => ud.mark_reachable(),
+            _ => {}
+        }
+    }
 
-//     fn mark_unreachable(&self) {
-//         match self {
-//             LValue::String(s) => unsafe {
-//                 s.as_ref().mark_unreachable();
-//             },
-//             LValue::Table(t) => unsafe {
-//                 t.as_ref().mark_unreachable();
-//             },
-//             LValue::Function(f) => unsafe {
-//                 f.as_ref().mark_unreachable();
-//             },
-//             _ => {}
-//         };
-//     }
+    fn mark_untouched(&self) {
+        match self {
+            LValue::String(s) => s.mark_untouched(),
+            LValue::Table(t) => t.mark_untouched(),
+            LValue::Function(f) => f.mark_untouched(),
+            LValue::UserData(ud) => ud.mark_untouched(),
+            _ => {}
+        }
+    }
+}
 
-//     fn mark_newborned(&self, white: GcColor) -> &Self {
-//         let _ = match self {
-//             LValue::String(s) => unsafe {
-//                 s.as_ref().mark_newborned(white);
-//             },
-//             LValue::Table(t) => unsafe {
-//                 t.as_ref().mark_newborned(white);
-//             },
-//             LValue::Function(f) => unsafe {
-//                 f.as_ref().mark_newborned(white);
-//             },
-//             _ => {}
-//         };
-//         self
-//     }
-// }
+impl PartialEq for LValue {
+    fn eq(&self, other: &Self) -> bool {
+        match (*self, *other) {
+            (LValue::Nil, LValue::Nil) => true,
+            (LValue::Bool(l), LValue::Bool(r)) => l == r,
+            (LValue::Int(l), LValue::Int(r)) => l == r,
+            (LValue::Float(l), LValue::Float(r)) => l == r,
+            (LValue::RsFn(l), LValue::RsFn(r)) => l == r,
+            (LValue::String(l), LValue::String(r)) => l == r,
+            (LValue::Table(l), LValue::Table(r)) => l.heap_address() == r.heap_address(),
+            (LValue::Function(l), LValue::Function(r)) => l.heap_address() == r.heap_address(),
+            (LValue::UserData(l), LValue::UserData(r)) => l.heap_address() == r.heap_address(),
+            _ => false,
+        }
+    }
+}
+
+impl From<TaggedBox> for LValue {
+    /// See 'LValue::tagid()' method for each case
+    fn from(tp: TaggedBox) -> Self {
+        use LValue::*;
+        type Udi = UserDataImpl;
+        match tp.tag() {
+            s if s == StrImpl::tagid() => String(Gc::from(tp.as_mut::<WithGcHeader<StrImpl>>())),
+            t if t == TableImpl::tagid() => Table(Gc::from(tp.as_mut::<WithGcHeader<TableImpl>>())),
+            f if f == Proto::tagid() => Function(Gc::from(tp.as_mut::<WithGcHeader<Proto>>())),
+            u if u == Udi::tagid() => UserData(Gc::from(tp.as_mut::<WithGcHeader<UserDataImpl>>())),
+            _ => unreachable!(),
+        }
+    }
+}
+
+impl AsTableKey for LValue {
+    fn as_key(&self) -> usize {
+        match *self {
+            LValue::Nil => unreachable!("index table by nil key"),
+            LValue::Bool(b) => b as usize,
+            LValue::Int(i) => i as usize,
+            LValue::Float(f) => usize::from_ne_bytes(f.to_ne_bytes()),
+            LValue::String(s) => ((s.hashid() as usize) << 32) | s.len(),
+            LValue::Table(t) => t.gch_ptr() as usize,
+            LValue::Function(f) => f.gch_ptr() as usize,
+            LValue::RsFn(rf) => rf as usize,
+            LValue::UserData(ud) => ud.gch_ptr() as usize,
+        }
+    }
+}
+
+impl From<bool> for LValue {
+    fn from(value: bool) -> Self {
+        LValue::Bool(value)
+    }
+}
+
+impl From<i64> for LValue {
+    fn from(value: i64) -> Self {
+        LValue::Int(value)
+    }
+}
+
+impl From<f64> for LValue {
+    fn from(value: f64) -> Self {
+        LValue::Float(value)
+    }
+}
+
+impl From<u64> for LValue {
+    fn from(value: u64) -> Self {
+        if value > i64::MAX as u64 {
+            LValue::Float(value as f64)
+        } else {
+            LValue::Int(value as i64)
+        }
+    }
+}
+
+impl From<usize> for LValue {
+    fn from(value: usize) -> Self {
+        if value > i64::MAX as usize {
+            LValue::Float(value as f64)
+        } else {
+            LValue::Int(value as i64)
+        }
+    }
+}
+
+impl From<RsFunc> for LValue {
+    fn from(value: RsFunc) -> Self {
+        LValue::RsFn(value)
+    }
+}
+
+impl From<Gc<StrImpl>> for LValue {
+    fn from(value: Gc<StrImpl>) -> Self {
+        LValue::String(value)
+    }
+}
+
+impl From<Gc<TableImpl>> for LValue {
+    fn from(value: Gc<TableImpl>) -> Self {
+        LValue::Table(value)
+    }
+}
+
+impl From<Gc<Proto>> for LValue {
+    fn from(value: Gc<Proto>) -> Self {
+        LValue::Function(value)
+    }
+}
+
+impl From<Gc<UserDataImpl>> for LValue {
+    fn from(value: Gc<UserDataImpl>) -> Self {
+        LValue::UserData(value)
+    }
+}
+
+impl TryInto<TaggedBox> for LValue {
+    type Error = ();
+    fn try_into(self) -> Result<TaggedBox, Self::Error> {
+        match self {
+            LValue::String(s) => Ok(TaggedBox::from_heap_ptr(StrImpl::tagid(), s.gch_ptr())),
+            LValue::Table(t) => Ok(TaggedBox::from_heap_ptr(TableImpl::tagid(), t.gch_ptr())),
+            LValue::Function(f) => Ok(TaggedBox::from_heap_ptr(Proto::tagid(), f.gch_ptr())),
+            LValue::UserData(u) => Ok(TaggedBox::from_heap_ptr(UserDataImpl::tagid(), u.gch_ptr())),
+            _ => Err(()),
+        }
+    }
+}
 
 impl Display for LValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -610,28 +532,41 @@ impl Display for LValue {
             Bool(b) => write!(f, "{}", b),
             Int(i) => write!(f, "{}", i),
             Float(fl) => write!(f, "{}", fl),
-            String(s) => write!(f, "{}", unsafe { s.as_ref().as_str() }),
-            Table(t) => write!(f, "table: 0x{:x}", unsafe {
-                t.as_ref().gch_addr() as usize
-            }),
-            Function(func) => write!(f, "function: 0x{:x}", unsafe {
-                func.as_ref().gch_addr() as usize
-            }),
-            RsFn(rsf) => write!(f, "rsfn: 0x{:x}", rsf as *const _ as usize),
-            UserData(ud) => write!(f, "userdata: 0x{:x}", unsafe {
-                ud.as_ref().gch_addr() as usize
-            }),
+            String(s) => write!(f, "{}", s.as_str()),
+            Table(t) => write!(f, "table: 0x{:X}", t.heap_address()),
+            Function(func) => write!(f, "function: 0x{:X}", { func.heap_address() }),
+            RsFn(rsf) => write!(f, "rsfn: 0x{:X}", rsf as *const _ as usize),
+            UserData(ud) => write!(f, "userdata: 0x{:X}", ud.heap_address()),
         }
     }
 }
 
 impl LValue {
+    pub fn from_wild<T>(val: Gc<T>) -> LValue
+    where
+        T: TypeTag + HeapMemUsed,
+        LValue: From<Gc<T>>,
+    {
+        LValue::from(val)
+    }
+
     /// Check if the value is managed by lua gc
     pub fn is_managed(&self) -> bool {
         use LValue::*;
         match self {
             Nil | Bool(_) | Int(_) | Float(_) => false,
             String(_) | Table(_) | Function(_) | RsFn(_) | UserData { .. } => true,
+        }
+    }
+
+    pub fn tagid(&self) -> Option<Tag> {
+        use LValue::*;
+        match self {
+            Nil | Bool(_) | Int(_) | Float(_) | RsFn(_) => None,
+            String(_) => Some(StrImpl::tagid()),
+            Table(_) => Some(TableImpl::tagid()),
+            Function(_) => Some(Proto::tagid()),
+            UserData(_) => Some(UserDataImpl::tagid()),
         }
     }
 
@@ -667,6 +602,12 @@ impl LValue {
         matches!(self, LValue::RsFn(_))
     }
 
+    pub fn is_callable(&self) -> bool {
+        // TODO:
+        // metatable __call metamethod
+        self.is_luafn() || self.is_rsfn()
+    }
+
     pub fn is_userdata(&self) -> bool {
         matches!(self, LValue::UserData { .. })
     }
@@ -692,23 +633,23 @@ impl LValue {
         }
     }
 
-    pub fn as_string(&self) -> Option<&StrWrapper> {
+    pub fn as_string(&self) -> Option<&StrImpl> {
         match self {
-            LValue::String(s) => Some(unsafe { s.as_ref() }),
+            LValue::String(s) => Some(s),
             _ => None,
         }
     }
 
-    pub fn as_table(&self) -> Option<&Table> {
+    pub fn as_table(&self) -> Option<&TableImpl> {
         match self {
-            LValue::Table(t) => Some(unsafe { t.as_ref() }),
+            LValue::Table(t) => Some(t),
             _ => None,
         }
     }
 
     pub fn as_luafn(&self) -> Option<&Proto> {
         match self {
-            LValue::Function(f) => Some(unsafe { f.as_ref() }),
+            LValue::Function(f) => Some(f),
             _ => None,
         }
     }
@@ -723,14 +664,6 @@ impl LValue {
 
 mod size_check {
     #[test]
-    fn strwrapper_size_check() {
-        use super::StrWrapper;
-        use std::mem::size_of;
-
-        assert_eq!(size_of::<StrWrapper>(), 32);
-    }
-
-    #[test]
     fn value_size_check() {
         use super::LValue;
         use std::mem::size_of;
@@ -739,48 +672,7 @@ mod size_check {
     }
 }
 
-mod platform_check {
-
-    #[test]
-    fn x64_os_check() {
-        assert!(cfg!(target_pointer_width = "64"))
-    }
-
-    #[test]
-    fn heap_addr_lookup() {
-        use super::{TaggedBox, HEAP_ADDR_HEAD, HEAP_ADDR_HEAD_MASK, PAYLOAD_MASK, TAG_MASK};
-
-        // notice: this will cause a memory leak
-        for _ in 0..128 {
-            let heap_addr = Box::into_raw(Box::new(1u64));
-            let nb = TaggedBox::from_heap_ptr(0x0, heap_addr);
-
-            // print!("{:0>16x}  : ", heap_addr as u64);
-            // print!("{:0>16x}  : ", nb.in_raw());
-            // print!("{:0>16x}  : ", nb.as_ptr::<u64>() as usize);
-            // println!();
-
-            assert_eq!(nb.in_raw() & HEAP_ADDR_HEAD_MASK, HEAP_ADDR_HEAD);
-        }
-    }
-
-    #[test]
-    fn f64nan_head_lookup() {
-        use super::{TaggedBox, HEAP_ADDR_HEAD_MASK, PAYLOAD_MASK, TAG_MASK};
-        let nan = u64::from_ne_bytes(f64::NAN.to_ne_bytes());
-        assert_ne!(nan & HEAP_ADDR_HEAD_MASK, 0);
-    }
-
-    #[test]
-    fn constants_check() {
-        use super::{TaggedBox, HEAP_ADDR_HEAD_MASK, PAYLOAD_MASK, TAG_MASK};
-        assert!(PAYLOAD_MASK & TAG_MASK == 0);
-        assert!(PAYLOAD_MASK | TAG_MASK == u64::MAX);
-    }
-}
-
 mod test {
-
     #[test]
     fn basic() {
         use super::TaggedBox;
@@ -823,41 +715,48 @@ mod test {
         }
     }
 
+    /// Test for string implementation, this function will casuse memory leak
     #[test]
-    fn hash_test() {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
+    fn strimpl() {
+        use super::Gc;
+        use super::StrImpl;
 
-        let i = 0;
-        let k = 0;
+        {
+            let s = "hello world";
+            let gs = Gc::from(s);
 
-        // k.hash(&mut hasher);
-        // let kh = hasher.finish();
-        // assert_ne!(ih, kh);
+            assert!(gs.is_short());
+            assert!(!gs.is_reserved());
+            assert_eq!(gs.len(), s.len());
+            assert_eq!(gs.as_str(), s);
 
-        // let s = "123".to_string();
+            let ogs = Gc::from(s);
+            assert_eq!(ogs.as_str(), gs.as_str());
+            assert_eq!(ogs.hashid(), gs.hashid());
 
-        // assert_ne!(s.as_ptr(), e.as_ptr());
+            assert_eq!(*ogs, *gs);
+        }
 
-        // s.chars().for_each(|c| c.hash(&mut hasher));
-        // let sh = hasher.finish();
+        {
+            let s = "hello world".repeat(10);
+            assert!(!StrImpl::check_short(s.as_str()));
 
-        let e = "123".to_string();
+            let gs = Gc::<StrImpl>::from(s.as_str());
+            assert!(gs.is_long());
+            assert!(!gs.is_reserved());
+            assert_eq!(gs.len(), s.len());
+            assert_eq!(gs.as_str(), s);
+        }
 
-        let mut hasher = DefaultHasher::new();
+        {
+            let mut s = String::with_capacity(StrImpl::MAX_SHORT_LEN * 4);
+            let original_buf_size = s.capacity();
+            s.push_str("short string");
+            let gs = Gc::<StrImpl>::from(s);
+            assert!(gs.is_short());
 
-        // i.hash(&mut hasher);
-        // let ih = hasher.finish();
-
-        e.chars().for_each(|c| c.hash(&mut hasher));
-        let eh = hasher.finish();
-
-        let mut ohasher = DefaultHasher::new();
-        e.chars().for_each(|c| c.hash(&mut ohasher));
-        let oeh = ohasher.finish();
-
-        assert_eq!(oeh, eh);
-
-        // assert_eq!(sh, eh);
+            // buffer will shirnk to fit the length if it is too large
+            assert!(gs.capacity < original_buf_size);
+        }
     }
 }
