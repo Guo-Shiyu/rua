@@ -1,170 +1,89 @@
-use std::collections::{BTreeMap, LinkedList};
-
-use std::convert::From;
-use std::ops::{Deref, DerefMut, Index, IndexMut};
-use std::ptr::NonNull;
-
-use crate::codegen::{CodeGen, Instruction, Proto};
-use crate::ffi::StdLib;
-use crate::parser::{Parser, SyntaxError};
-use crate::value::{EstimatedSize, UserData};
-use crate::StaticErr;
-
-use super::value::{
-    GcColor, GcMark, GcObject, LValue, RsFunc, StrHashVal, StrWrapper, Table, Tag, TaggedBox,
-    WithTag,
+use std::{
+    cell::UnsafeCell,
+    cmp::Ordering,
+    collections::{BTreeMap, LinkedList},
+    convert::From,
+    ops::{Deref, DerefMut},
+    ptr,
 };
+
+use crate::{
+    codegen::{CodeGen, Instruction, Proto},
+    ffi::StdLib,
+    heap::{Heap, ManagedHeap, Tag},
+    parser::Parser,
+    value::{AsTableKey, LValue, RsFunc, TableImpl},
+    StaticErr,
+};
+
 use super::LuaErr;
 
-pub struct VmStack {
-    stk: Vec<LValue>,
-    top: u32,
-}
+pub type RegIndex = i32;
 
-impl VmStack {
-    pub const MIN_STACK_SIZE: usize = 32;
-    pub const MAX_STACK_SIZE: usize = 1024;
-
-    pub fn init() -> Self {
-        let mut stk = Vec::new();
-        stk.resize_with(Self::MIN_STACK_SIZE, || LValue::Nil);
-        VmStack { stk, top: 0 }
-    }
-
-    pub fn top(&mut self) -> i64 {
-        // TODO:
-        self.stk.last().unwrap().as_int().unwrap()
-    }
-
-    pub fn ati(&self, i: i32) -> LValue {
-        self.stk[i as usize].clone()
-    }
-
-    pub fn seti(&mut self, i: i32, val: LValue) {
-        self.stk[i as usize] = val;
-    }
-}
-
-impl Deref for VmStack {
-    type Target = Vec<LValue>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.stk
-    }
-}
-
-impl DerefMut for VmStack {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.stk
-    }
-}
-
-#[derive(Clone, Copy)]
-pub enum GcStage {
-    Pause,
-    Propgate,
-    Sweep,
-    Finalize,
-}
-
-impl From<usize> for GcStage {
-    fn from(n: usize) -> Self {
-        use GcStage::*;
-        match n {
-            0 => Pause,
-            1 => Propgate,
-            2 => Sweep,
-            3 => Finalize,
-            _ => unreachable!(),
-        }
-    }
-}
-
-impl Into<usize> for GcStage {
-    fn into(self) -> usize {
-        use GcStage::*;
-        match self {
-            Pause => 0,
-            Propgate => 1,
-            Sweep => 2,
-            Finalize => 3,
-        }
-    }
-}
-
-impl GcStage {
-    fn to_next_stage(&mut self) {
-        use GcStage::*;
-        *self = match self {
-            Pause => Propgate,
-            Propgate => Sweep,
-            Sweep => Finalize,
-            Finalize => Pause,
-        }
-    }
-}
-
-#[repr(u8)]
-enum ManagedObjKind {
-    Str,
-    Table,
-    Function,
-    UserData,
-}
-
-impl Into<Tag> for ManagedObjKind {
-    fn into(self) -> Tag {
-        self as u8
-    }
-}
-
-impl From<Tag> for ManagedObjKind {
-    fn from(tag: Tag) -> Self {
-        let map: [u8; 4] = [
-            StrWrapper::tagid(),
-            Table::tagid(),
-            Proto::tagid(),
-            UserData::tagid(),
-        ];
-        map[tag as usize].into()
-    }
-}
-
-pub struct Frame<'f> {
+/// CallInfo
+#[derive(Clone)]
+pub struct Frame {
     oldpc: u32, // previous frame pc state
     pc: u32,    // current frame pc
 
-    reg_base: i32, // first avaialbe register
-    reg_top: i32,  // last available register + 1
+    stk_base: *mut LValue, // stack base pointer
+    stk_last: *mut LValue, // stack last pointer (extra stack space is not included )
+    reg_base: RegIndex, // function register index, (first avaliable register index - 1), based on stk_base
+    reg_top: RegIndex, // last available register index + 1, first unavailable register index, based on stk_base
 
-    upvalues: &'f [LValue],       // refer to proto upvalues
-    constants: &'f [LValue],      // refer to proto constants
-    bytescode: &'f [Instruction], // ref to proto bytescode
+    upvalues: (*const LValue, u32),       // refer to proto upvalues
+    constants: (*const LValue, u32),      // refer to proto constants
+    bytescode: (*const Instruction, u32), // ref to proto bytescode
 }
 
-impl<'f> Frame<'f> {
-    pub const LVALUE_PLACE_HOLDER: Vec<LValue> = Vec::new();
-    pub const BYTECODE_PLACE_HOLDER: Vec<Instruction> = Vec::new();
-
-    // First frame of a vm (rc call lua)
-    pub fn init() -> Self {
-        Frame {
-            oldpc: u32::MAX,
-            pc: 0,
-            reg_base: 0,
-            reg_top: 0,
-            upvalues: &[],
-            constants: &[],
-            bytescode: &[],
-        }
-    }
-
+impl Frame {
     pub fn is_init_frame(&self) -> bool {
         self.oldpc == u32::MAX
     }
 
-    pub fn nregs(&self) -> usize {
-        (self.reg_top - self.reg_base) as usize
+    // Get stack height of current frame.
+    pub fn top(&self) -> i32 {
+        self.reg_top - self.reg_base - 1
+    }
+
+    pub fn iget(&self) -> Instruction {
+        unsafe { self.bytescode.0.offset(self.pc as isize).read() }
+    }
+
+    pub fn kget(&self, idx: RegIndex) -> LValue {
+        unsafe { self.constants.0.offset(idx as isize).read() }
+    }
+
+    pub fn upget(&self, idx: RegIndex) -> LValue {
+        unsafe { self.upvalues.0.offset(idx as isize).read() }
+    }
+
+    pub fn rget(&self, idx: RegIndex) -> Result<LValue, RuntimeErr> {
+        match idx.cmp(&0) {
+            Ordering::Less => {
+                let absidx = self.reg_top + idx;
+                if absidx > self.reg_base {
+                    let val = unsafe { self.stk_base.offset(absidx as isize).read() };
+                    Ok(val)
+                } else {
+                    Err(RuntimeErr::InvalidStackIndex)
+                }
+            }
+            Ordering::Greater => {
+                let absidx = self.reg_base + idx;
+                if absidx < self.reg_top {
+                    let val = unsafe { self.stk_base.offset(absidx as isize).read() };
+                    Ok(val)
+                } else {
+                    Err(RuntimeErr::InvalidStackIndex)
+                }
+            }
+            _ => Err(RuntimeErr::InvalidStackIndex),
+        }
+    }
+
+    pub fn rset(&self, idx: RegIndex, val: LValue) {
+        unsafe { *self.stk_base.offset((self.reg_base + idx) as isize) = val }
     }
 }
 
@@ -172,343 +91,278 @@ pub struct DebugPoint {}
 
 type HookFn = fn(&mut State, &DebugPoint);
 
+#[derive(Debug, Clone, Copy, Default)]
 pub enum HookMask {
+    #[default]
     One,
     Two,
     Three,
 }
 
-pub enum GcKind {
-    Incremental,
-    Generational,
-}
-
 #[derive(Debug)]
 pub enum RuntimeErr {
+    RecursionLimit,
+    StackOverflow,
+    InvalidStackIndex,
     TableIndexIsNil,
-    WrongCallFuncValue { typ: String, name: String },
+    WrongCallFuncValue,
 }
 
-pub struct Stack<'s> {
-    stkref: &'s mut VmStack,
+pub struct Rvm {
+    stack: Vec<LValue>,                // vm registers stack
+    callchain: LinkedList<Frame>,      // call frames
+    ci: Frame,                         // current frame
+    globaltab: TableImpl,              // global table
+    metatab: BTreeMap<Tag, TableImpl>, // meta table for basic types
+    warnfn: RsFunc,                    // warn handler
+    panicfn: RsFunc,                   // panic handler
+    allowhook: bool,                   // enable hook
+    hook: HookFn,                      // hook handler
+    hkmask: HookMask,                  // hook mask
 }
 
-impl<'s> Stack<'s> {
-    pub fn top(&self) -> usize {
-        self.stkref.top as usize
-    }
+impl Deref for Rvm {
+    type Target = Frame;
 
-    pub fn push(&mut self, val: LValue) {
-        self.stkref.top += 1;
-        let idx = self.stkref.top as usize;
-        self.stkref[idx] = val;
-    }
-
-    // pub fn pop(&mut self) -> LValue {
-    //     self.stkref.pop().unwrap_or_default()
-    // }
-
-    pub fn last(&self) -> LValue {
-        self.stkref[self.stkref.top as usize].clone()
-    }
-
-    pub fn get(&self, idx: i32) -> LValue {
-        self.stkref[idx as usize].clone()
+    fn deref(&self) -> &Self::Target {
+        &self.ci
     }
 }
 
-pub struct Hook<'k> {
-    hook: &'k HookFn,
-    mask: &'k HookMask,
+impl DerefMut for Rvm {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.ci
+    }
 }
 
-pub struct Heap<'h> {
-    sstrpool: &'h mut BTreeMap<StrHashVal, NonNull<StrWrapper>>,
-    curwhite: &'h mut GcColor,
-    curstage: &'h mut GcStage,
-    incr: &'h mut usize,                  // incremental mem size
-    threshold: &'h mut usize,             // threshold for next gc
-    total: &'h mut usize,                 // total mem size
-    gckind: &'h mut GcKind,               // which kind in using
-    allocs: &'h mut Vec<TaggedBox>,       // other managed object
-    stralloc: &'h mut Vec<*const GcMark>, // strings are pooled in a separate set
-}
+impl Rvm {
+    pub const MAX_CALL_NUM: usize = 200; // recursion limit
+    pub const MIN_STACK_SPACE: usize = 32; //min stack size
+    pub const MAX_STACK_SPACE: usize = 256; // max stack limit
+    pub const EXTRA_STACK_SPACE: usize = 8; // extra slot for error handling
 
-impl<'h> Heap<'h> {
-    pub fn delegate(&mut self, gcval: LValue) {
-        match gcval {
-            // strings are pooled in a separate set
-            LValue::String(mut sw) => {
-                let new = unsafe { sw.as_mut() };
-
-                let need_pool = new.is_long() || {
-                    let hash = new.hashid();
-                    if self.sstrpool.contains_key(&hash) {
-                        let old = self.sstrpool.get(&hash).unwrap();
-                        unsafe { old.as_ref().mark_newborned(*self.curwhite) };
-                        if unsafe { old.as_ref().as_str().as_ptr() } != new.as_str().as_ptr() {
-                            new.free_short();
-                        }
-                        false
-                    } else {
-                        true
-                    }
-                };
-
-                if need_pool {
-                    self.stralloc.push(sw.as_ptr().cast::<GcMark>());
-                    unsafe { sw.as_ref().mark_newborned(*self.curwhite) };
-                }
-            }
-
-            LValue::Table(tb) => self.delegate_from(tb),
-            LValue::Function(f) => {
-                self.delegate_from(f);
-
-                // SAFETY ?
-                unsafe { f.as_ref().delegat_by(self) };
-            }
-            LValue::UserData(ud) => self.delegate_from(ud),
-
-            _ => {}
-        }
+    pub fn height(&mut self) -> u32 {
+        self.stack.len() as u32
     }
 
-    fn delegate_from<T: GcObject>(&mut self, v: NonNull<T>) {
-        let tp = TaggedBox::from_heap_ptr(T::tagid(), v.as_ptr());
-        self.allocs.push(tp);
+    pub fn new() -> Self {
+        let mut stack = Self::init_stack();
 
-        // SAFETY ?
-        unsafe { v.as_ref().mark_newborned(*self.curwhite) };
-    }
-
-    fn delegate_str(&mut self, s: String) {
-        if s.len() > StrWrapper::MAX_SHORT_LEN {
-            let sw = StrWrapper::from_long(s);
-            let nnsw = unsafe { NonNull::new_unchecked(Box::leak(Box::new(sw))) };
-            self.delegate(LValue::String(nnsw));
-        } else {
-            let hash = StrWrapper::hash_short(&s);
-            if !self.sstrpool.contains_key(&hash) {
-                let sw = StrWrapper::from_short(s, Some(hash), false);
-                let nnsw = unsafe { NonNull::new_unchecked(Box::leak(Box::new(sw))) };
-                self.delegate(LValue::String(nnsw));
-            } else {
-                // TODO:
-                // frees.push (s.leak())
-                // let k = Box::leak(s.into_boxed_str());
-            }
-        }
-    }
-
-    fn alloc<O>(&mut self, content: O) -> LValue
-    where
-        LValue: From<O>,
-    {
-        let val = LValue::from(content);
-        self.delegate(val.clone());
-        *self.total += val.estimate_size();
-        self.check_gc();
-        val
-    }
-
-    /// Alloc UserData in single api because it's size should be added to gc state.
-    fn alloc_userdata(&mut self, bytes: usize) -> LValue {
-        let userdata = Vec::<u8>::with_capacity(bytes).as_ptr().cast::<UserData>();
-
-        let nonnull = unsafe {
-            userdata.clone().read().mark_newborned(*self.curwhite);
-            NonNull::new(userdata.cast_mut()).unwrap_unchecked()
+        // First frame of a vm (rust call lua frame)
+        let rsclua = Frame {
+            oldpc: u32::MAX,
+            pc: 0,
+            stk_base: stack.as_mut_ptr(),
+            stk_last: unsafe {
+                stack
+                    .as_mut_ptr()
+                    .add(stack.capacity() - Self::EXTRA_STACK_SPACE)
+            },
+            reg_base: -1,
+            reg_top: 0,
+            upvalues: (ptr::null(), 0),
+            constants: (ptr::null(), 0),
+            bytescode: (ptr::null(), 0),
         };
 
-        let val = LValue::UserData(nonnull);
-        self.delegate(val.clone());
-        *self.total += bytes;
-        self.check_gc();
-
-        val
-    }
-
-    // If gc is needed, run single step gc
-    fn check_gc(&mut self) -> bool {
-        if self.total >= self.threshold {
-            self.gc_single_step();
-            true
-        } else {
-            false
+        Rvm {
+            stack,
+            callchain: LinkedList::new(),
+            ci: rsclua,
+            globaltab: TableImpl::with_capacity((24, 0)),
+            metatab: init_metatable(),
+            warnfn: default_warnfn,
+            panicfn: default_panicfn,
+            allowhook: false,
+            hook: |_, _| {},
+            hkmask: HookMask::default(),
         }
     }
 
-    fn gc_single_step(&mut self) {
-        // match self.stage {
-        //     GcStage::Pause => self.gc_restart(),
-        //     GcStage::Propgate => {
-        //         self.stage.to_next_stage();
-        //     }
-        //     GcStage::Sweep => {
-        //         self.stage.to_next_stage();
-        //     }
-        //     GcStage::Finalize => {
-        //         self.stage.to_next_stage();
-        //     }
-        // }
+    pub fn set_global<K>(&mut self, k: K, val: LValue)
+    where
+        K: AsTableKey,
+    {
+        self.globaltab.set(k, val);
     }
 
-    /// Mark all reachable objects from root set and add them to gray list
-    fn gc_restart(&mut self) {
-        // global table
+    pub fn get_global<K>(&mut self, k: K) -> LValue
+    where
+        K: AsTableKey,
+    {
+        self.globaltab.get(k)
+    }
 
-        // stack
+    pub fn stk_push(&mut self, val: LValue) -> Result<(), RuntimeErr> {
+        self.try_extend_stack()?;
+        self.stack.push(val);
+        self.reg_top += 1;
+        Ok(())
+    }
 
-        // mainthread
+    pub fn stk_pop(&mut self) -> Option<LValue> {
+        self.try_shrink_stack();
+        debug_assert!(self.reg_top >= self.reg_base);
+        if self.reg_top > self.reg_base {
+            self.reg_top -= 1;
+            self.stack.pop()
+        } else {
+            None
+        }
+    }
+
+    // pub fn stk_get(&self, idx: RegIndex) -> Result<LValue, RuntimeErr> {
+    // match idx.cmp(&0) {
+    //     std::cmp::Ordering::Greater => {
+    //         let idx = idx as usize;
+    //         if idx < self.reg_top as usize {
+    //             Ok(unsafe { self.stack.get_unchecked(idx).clone() })
+    //         } else {
+    //             Err(RuntimeErr::InvalidStackIndex)
+    //         }
+    //     }
+    //     std::cmp::Ordering::Equal => Err(RuntimeErr::InvalidStackIndex),
+    //     std::cmp::Ordering::Less => {
+    //         let idx = self.reg_top + idx;
+    //         if idx >= self.reg_base {
+    //             Ok(self.stack[idx as usize].clone())
+    //         } else {
+    //             Err(RuntimeErr::InvalidStackIndex)
+    //         }
+    //     }
+    // }
+    // }
+
+    pub fn stk_remain(&self) -> usize {
+        let total = unsafe { self.stk_last.offset_from(self.stk_base) };
+        (total - self.reg_top as isize) as usize
+    }
+
+    // pub fn stk_check_with(&self, idx: RegIndex, op: impl FnOnce(&LValue) -> bool) -> bool {
+    //     if idx > self.callinfo().reg_top {
+    //         false
+    //     } else {
+    //         let val = self.stk_get(idx).unwrap();
+    //         op(&val)
+    //     }
+    // }
+
+    fn try_shrink_stack(&mut self) {
+        // shrink stack to half if stack size is less than 1/3 of capacity
+        if self.stack.len() < self.stack.capacity() / 3 {
+            self.stack.shrink_to(self.stack.capacity() / 2);
+            self.correct_callinfo();
+        }
+    }
+
+    fn try_extend_stack(&mut self) -> Result<(), RuntimeErr> {
+        if self.stack.len() + Self::EXTRA_STACK_SPACE >= self.stack.capacity() {
+            let need = self.stack.capacity() * 2;
+            if need > Self::MAX_STACK_SPACE {
+                return Err(RuntimeErr::StackOverflow);
+            }
+            self.stack.reserve(need + Self::EXTRA_STACK_SPACE);
+            self.correct_callinfo();
+        }
+        Ok(())
+    }
+
+    fn correct_callinfo(&mut self) {
+        self.ci.stk_base = self.stack.as_mut_ptr();
+        self.ci.stk_last = unsafe { self.ci.stk_base.add(self.stack.capacity()) };
+
+        self.callchain.iter_mut().for_each(|ci| {
+            ci.stk_base = self.ci.stk_base;
+            ci.stk_last = self.ci.stk_last;
+        })
+    }
+
+    fn init_stack() -> Vec<LValue> {
+        Vec::with_capacity(Self::MIN_STACK_SPACE + Self::EXTRA_STACK_SPACE)
     }
 }
-
 // enum LoadMode {
 //     Auto,   // auto detect mode by input
 //     Text,
 //     Binary,
 // }
 
-pub struct State<'a> {
-    allowhook: bool, // weither enable hooks
-
-    stack: VmStack,                   // vm stack
-    callchain: LinkedList<Frame<'a>>, // call frames
-
-    glotab: Table,
-
-    sstrpool: BTreeMap<StrHashVal, NonNull<StrWrapper>>, // short string pool
-
-    // gc state
-    using_white: GcColor, // GcMark::White or GcMark::AnotherWhite
-    stage: GcStage,
-
-    // gc param
-    incr: usize,      // incremental mem size
-    threshold: usize, // threshold for next gc
-    total: usize,     // total mem size
-    gckind: GcKind,   // which kind in using
-
-    // gc object marks
-    allocs: Vec<TaggedBox>,       // other managed object
-    stralloc: Vec<*const GcMark>, // strings are pooled in a separate set
-
-    mematbs: Vec<Table>, // meta table used for basic types, indexed by LValue.tagid
-
-    warnfn: Option<RsFunc>,  // warn handler
-    panicfn: Option<RsFunc>, // panic handler
-
-    hook: HookFn,       // hook function
-    hookmask: HookMask, // hook mask
-
-    _unused: bool,
-    // TODO:
-    // executor for coroutine
-
-    // TODO:
-    // BinaryHeap
-    // frees: BTreeMap<usize, (usize, *const char)>, // an ordered list of free memory
+pub struct State {
+    vm: UnsafeCell<Rvm>, // runtime
+    heap: ManagedHeap,   // GC heap
 }
 
-impl<'a> State<'a> {
-    pub fn stack_view(&mut self) -> Stack {
-        Stack {
-            stkref: &mut self.stack,
+impl Deref for State {
+    type Target = Rvm;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { &*self.vm.get() }
+    }
+}
+
+impl DerefMut for State {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { &mut *self.vm.get() }
+    }
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl State {
+    pub fn new() -> Self {
+        State {
+            vm: UnsafeCell::new(Rvm::new()),
+            heap: ManagedHeap::default(),
         }
+    }
+
+    pub fn vm_view(&mut self) -> &mut Rvm {
+        self.vm.get_mut()
     }
 
     pub fn heap_view(&mut self) -> Heap {
-        Heap {
-            sstrpool: &mut self.sstrpool,
-            curwhite: &mut self.using_white,
-            curstage: &mut self.stage,
-            incr: &mut self.incr,
-            threshold: &mut self.threshold,
-            total: &mut self.total,
-            gckind: &mut self.gckind,
-            allocs: &mut self.allocs,
-            stralloc: &mut self.stralloc,
-        }
+        Heap::new(self.vm.get_mut(), &mut self.heap)
     }
 
-    pub fn hook_view(&mut self) -> Hook {
-        Hook {
-            hook: &self.hook,
-            mask: &self.hookmask,
-        }
-    }
-
-    pub fn stack<O>(&mut self, op: O) -> &Self
+    pub fn context<O>(&mut self, op: O) -> Result<(), RuntimeErr>
     where
-        O: FnOnce(&mut Stack, &mut Heap),
+        O: FnOnce(&mut Rvm, &mut Heap) -> Result<(), RuntimeErr>,
     {
-        op(
-            &mut Stack {
-                stkref: &mut self.stack,
-            },
-            &mut Heap {
-                sstrpool: &mut self.sstrpool,
-                curwhite: &mut self.using_white,
-                curstage: &mut self.stage,
-                incr: &mut self.incr,
-                threshold: &mut self.threshold,
-                total: &mut self.total,
-                gckind: &mut self.gckind,
-                allocs: &mut self.allocs,
-                stralloc: &mut self.stralloc,
-            },
-        );
-        self
+        unsafe {
+            op(
+                &mut *self.vm.get(),
+                &mut Heap::new(self.vm.get_mut(), &mut self.heap),
+            )
+        }
     }
 
-    pub fn heap<O>(&mut self, op: O) -> &Self
+    pub fn vm_with<O>(&mut self, op: O) -> Result<(), RuntimeErr>
     where
-        O: FnOnce(&mut Heap) -> (),
+        O: FnOnce(&mut Rvm) -> Result<(), RuntimeErr>,
+    {
+        op(self.vm_view())
+    }
+
+    pub fn heap_with<O>(&mut self, op: O) -> &Self
+    where
+        O: FnOnce(&mut Heap),
     {
         op(&mut self.heap_view());
         self
-    }
-}
-
-// method about GC
-impl State<'_> {
-    pub fn new() -> Self {
-        let mut state = State {
-            allowhook: false,
-            stack: VmStack::init(),
-            callchain: LinkedList::new(),
-            glotab: Table::default(),
-            sstrpool: BTreeMap::new(),
-            using_white: GcColor::White,
-            stage: GcStage::Pause,
-            incr: 0,
-            threshold: 0,
-            total: 0,
-            gckind: GcKind::Incremental,
-            allocs: Vec::new(),
-            stralloc: Vec::new(),
-            mematbs: Vec::new(),
-            warnfn: None,
-            panicfn: None,
-            hook: |_, _| {},
-            hookmask: HookMask::One,
-            _unused: false,
-        };
-
-        // init first frame, rust call lua entry
-        state.callchain.push_back(Frame::init());
-
-        // init meta table for basic types
-        // state.mematbs.resize(ManagedObjKind::UserData.into() + 1, Table::new());
-        state
     }
 
     pub fn open(&mut self, lib: StdLib) {
         let entrys = crate::ffi::get_std_libs(lib);
         for (name, func) in entrys.iter() {
-            // SAFETY: function names in std lib is not nil
-            unsafe { self.set_func(name, *func).unwrap_unchecked() };
+            let _r = self.context(|vm, heap| {
+                vm.globaltab.set(heap.alloc(*name), LValue::from(*func));
+                Ok(())
+            });
+            debug_assert!(_r.is_ok())
         }
     }
 
@@ -518,19 +372,19 @@ impl State<'_> {
         }
     }
 
-    // pub fn safe_script()
+    pub fn safe_script(&mut self, _src: &str) -> Result<(), LuaErr> {
+        todo!()
+    }
 
     // Return the retval count of the script, and the val has pushed on the stack in return order.
     pub fn script(&mut self, src: &str) -> Result<usize, LuaErr> {
-        let preidx = self.stack_view().top();
+        let preidx = self.top();
 
-        self.load_str(src, Some("main".to_string()))
-            .map_err(LuaErr::CompileErr)?;
+        self.load_str(src, Some("main".to_string()))?;
+        self.do_call(self.top(), 0, 0)?;
 
-        self.do_call(None)?;
-
-        let postidx = self.stack_view().top();
-        Ok(postidx - preidx)
+        let postidx = self.top();
+        Ok((postidx - preidx) as usize)
     }
 
     pub fn script_file(&mut self, _filepath: &str) -> Result<(), LuaErr> {
@@ -538,10 +392,10 @@ impl State<'_> {
     }
 
     /// Loads a Lua chunk without running it. If there are no errors, `load` pushes the compiled chunk as a Lua function on top of the stack.
-    pub fn load_str(&mut self, src: &str, chunkname: Option<String>) -> Result<(), StaticErr> {
+    pub fn load_str(&mut self, src: &str, chunkname: Option<String>) -> Result<(), LuaErr> {
         let proto = Self::compile(src, chunkname)?;
-        let fval = self.heap_view().alloc(proto);
-        self.stack_view().push(fval.clone());
+        let luaf = self.heap_view().alloc(proto);
+        self.vm_view().stk_push(luaf)?;
         Ok(())
     }
 
@@ -553,36 +407,68 @@ impl State<'_> {
     //     todo!()
     // }
 
-    pub fn do_call(&mut self, fnidx: Option<i32>) -> Result<(), RuntimeErr> {
-        let f = if let Some(idx) = fnidx {
-            self.stack_view().get(idx)
-        } else {
-            self.stack_view().last()
-        };
+    pub fn do_call(&mut self, fnidx: RegIndex, nin: usize, _nout: usize) -> Result<(), RuntimeErr> {
+        let f = self.rget(fnidx)?;
+        assert!(f.is_callable());
+
         match f {
             LValue::RsFn(f) => {
+                // call rust function directly
                 f(self)?;
             }
-            LValue::Function(pptr) => {
-                let proto = unsafe { pptr.as_ref() };
-                debug_assert!(self.stack.len() - self.stack_view().top() >= proto.nparams());
+            LValue::Function(p) => {
+                self.vm_with(|vm| {
+                    if vm.callchain.len() > Rvm::MAX_CALL_NUM {
+                        Err(RuntimeErr::RecursionLimit)
+                    } else if vm.stk_remain() < nin {
+                        vm.try_extend_stack()
+                    } else {
+                        Ok(())
+                    }
+                })?;
 
-                let base_reg = self.stack_view().top() - proto.nparams() - 1; // fn is a slot also
-                let prev_frame = self.callchain.back().unwrap(); // unchecked
-                self.callchain.push_back(Frame {
-                    oldpc: prev_frame.pc,
+                let ncodes = p.bytecode();
+                let nkst = p.constants();
+                let nups = p.upvalues();
+
+                let mut nextci = Frame {
+                    oldpc: self.ci.pc,
                     pc: 0,
-                    reg_base: base_reg as i32,
-                    reg_top: (base_reg + proto.reg_count()) as i32,
-                    upvalues: &[],
-                    constants: proto.constants(),
-                    bytescode: proto.bytecode(),
-                });
+                    stk_base: self.ci.stk_base,
+                    stk_last: self.ci.stk_last,
+                    reg_base: self.ci.reg_top - 1,
+                    reg_top: self.ci.reg_top,
+                    upvalues: (nups.as_ptr(), nups.len() as u32),
+                    constants: (nkst.as_ptr(), nkst.len() as u32),
+                    bytescode: (ncodes.as_ptr(), ncodes.len() as u32),
+                };
 
-                while self.callchain.back().unwrap().pc < proto.bytecode().len() as u32 {
-                    let code = proto.bytecode()[self.callchain.back().unwrap().pc as usize];
-                    self.interpret(code)?;
+                // update ci
+                std::mem::swap(&mut nextci, &mut self.ci);
+                self.callchain.push_back(nextci);
+
+                // balance parameters and argument
+                let narg = self.top();
+                let nparam = p.nparams() + 2; // FIXME:  remove + 2 because of codegen
+                let diff = narg.abs_diff(nparam);
+                match narg.cmp(&nparam) {
+                    Ordering::Less => {
+                        for _ in 0..diff {
+                            self.stk_push(LValue::Nil)?;
+                        }
+                    }
+                    Ordering::Greater => {
+                        for _ in 0..diff {
+                            self.stk_pop();
+                        }
+                    }
+                    Ordering::Equal => {}
                 }
+
+                self.interpret()?;
+
+                // TODO:
+                self.pos_call();
             }
             LValue::Table(_) => todo!("get metatable __call"),
             LValue::UserData(_) => todo!(),
@@ -603,9 +489,7 @@ impl State<'_> {
                 println!("try to call a float value");
                 todo!("error report")
             }
-            LValue::String(sw) => unsafe {
-                println!("try to call a string value: {}", sw.as_ref().as_str())
-            },
+            LValue::String(sw) => println!("try to call a string value: {}", sw.as_str()),
         }
         Ok(())
     }
@@ -622,96 +506,85 @@ impl State<'_> {
         Ok(proto)
     }
 
-    pub fn set_func(&mut self, name: &str, func: RsFunc) -> Result<(), RuntimeErr> {
-        let delegated = self.heap_view().alloc(name.to_string());
-        self.glotab.set(&delegated, LValue::RsFn(func))?;
-        Ok(())
+    /// Set warn handler, return old handler
+    pub fn set_warn_handler(&mut self, new: RsFunc) -> RsFunc {
+        let vm = self.vm.get_mut();
+        let old = vm.warnfn;
+        vm.warnfn = new;
+        old
     }
 
-    pub fn set_warn_handler(&mut self, warnfn: RsFunc) {
-        self.warnfn = Some(warnfn);
-    }
-
-    pub fn set_panic_handler(&mut self, panicfn: RsFunc) {
-        self.panicfn = Some(panicfn);
+    /// Set panic handler, return old handler
+    pub fn set_panic_handler(&mut self, new: RsFunc) -> RsFunc {
+        let vm = self.vm.get_mut();
+        let old = vm.panicfn;
+        vm.panicfn = new;
+        old
     }
 
     pub fn set_hook_handler(&mut self, hook: HookFn, mask: HookMask) {
-        self.hook = hook;
-        self.hookmask = mask;
+        let vm = self.vm.get_mut();
+        vm.hook = hook;
+        vm.hkmask = mask;
     }
-
-    pub fn set_gc_threshold(&mut self, threshold: usize) {
-        self.threshold = threshold;
-    }
-
-    pub fn set_gc_kind(&mut self, kind: GcKind) {
-        self.gckind = kind;
-    }
-
-    pub fn set_gc_incr(&mut self, incr: usize) {
-        self.incr = incr;
-    }
-
-    // pub fn set_hook(&mut self, allow: bool) {
-    //     self.allowhook = allow;
-    // }
 
     fn pre_call(&mut self) {}
 
-    fn interpret(&mut self, code: Instruction) -> Result<(), RuntimeErr> {
-        println!("{:?}", code);
+    fn pos_call(&mut self) {}
+
+    fn interpret(&mut self) -> Result<(), RuntimeErr> {
         use super::codegen::OpCode::*;
         use super::codegen::OpMode;
-        match code.mode() {
-            OpMode::IABC => {
-                let (op, a, b, c, k) = code.repr_abck();
-                match op {
-                    VARARGPREP => {
-                        // TODO:
-                        // do nothing for now
-                    }
-                    LOADK => {
-                        let mut fa = self.callchain.back_mut().unwrap();
-                        self.stack
-                            .seti(fa.reg_base + a, fa.constants[b as usize].clone());
-                    }
 
-                    GETTABUP => {
-                        // let upval = fa.upvalues[c as usize];
-                        // let key = fa.constants[b as usize].clone();
-                        // let val = upval.get(&key)?;
-                        // let val = ;
-                        let mut fa = self.callchain.back_mut().unwrap();
-                        self.stack.seti(
-                            fa.reg_base + a,
-                            self.glotab.find_by_key(&fa.constants[c as usize])?,
-                        );
-                    }
+        loop {
+            let code = self.ci.iget();
+            // println!("{:?}", code);
 
-                    MOVE => {
-                        let mut fa = self.callchain.back_mut().unwrap();
-                        self.stack
-                            .seti(fa.reg_base + a, self.stack.ati(fa.reg_base + b));
+            match code.mode() {
+                OpMode::IABC => {
+                    let (op, a, b, _c, _k) = code.repr_abck();
+                    match op {
+                        VARARGPREP => {
+                            // TODO:
+                            // do nothing for now
+                        }
+                        // LOADK => {
+                        //     let fa = self.callchain.back_mut().unwrap();
+                        //     self.stack.seti(fa.reg_base + a, fa.constants[b as usize]);
+                        // }
+                        GETTABUP => {
+                            let gval = self.globaltab.get(self.ci.kget(b));
+                            self.ci.rset(a, gval);
+                        }
+
+                        MOVE => self.ci.rset(a, self.ci.rget(b)?),
+                        CALL => self.do_call(a, 0, 0)?,
+                        _ => unimplemented!("unimplemented opcode: {:?}", op),
                     }
-                    CALL => {
-                        let mut fa = self.callchain.back_mut().unwrap();
-                        let dest_idx = fa.reg_base + a;
-                        self.do_call(Some(dest_idx));
-                    }
-                    _ => unimplemented!("unimplemented opcode: {:?}", op),
                 }
+                OpMode::IABx => todo!(),
+                OpMode::IAsBx => todo!(),
+                OpMode::IAx => todo!(),
+                OpMode::IsJ => todo!(),
             }
-            OpMode::IABx => todo!(),
-            OpMode::IAsBx => todo!(),
-            OpMode::IAx => todo!(),
-            OpMode::IsJ => todo!(),
+            self.ci.pc += 1;
+            if self.ci.pc >= self.ci.bytescode.1 {
+                break;
+            }
         }
-
-        // TODO:
-        let mut fa = self.callchain.back_mut().unwrap();
-        fa.pc += 1;
-
         Ok(())
     }
+}
+
+fn init_metatable() -> BTreeMap<Tag, TableImpl> {
+    // TODO:
+    BTreeMap::new()
+}
+
+fn default_panicfn(_vm: &mut State) -> Result<usize, RuntimeErr> {
+    todo!()
+}
+
+pub fn default_warnfn(_vm: &mut State) -> Result<usize, RuntimeErr> {
+    todo!()
 }

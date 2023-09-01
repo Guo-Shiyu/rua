@@ -1,12 +1,12 @@
 pub mod ast;
 pub mod codegen;
 pub mod ffi;
+pub mod heap;
 pub mod lexer;
+pub mod lstd;
 pub mod parser;
 pub mod state;
 pub mod value;
-
-pub mod lstd;
 
 use codegen::CodeGenErr;
 use parser::SyntaxError;
@@ -35,6 +35,12 @@ pub enum LuaErr {
     IOErr(std::io::Error),
     CompileErr(StaticErr),
     RuntimeErr(RuntimeErr),
+}
+
+impl From<StaticErr> for LuaErr {
+    fn from(err: StaticErr) -> Self {
+        LuaErr::CompileErr(err)
+    }
 }
 
 impl From<RuntimeErr> for LuaErr {

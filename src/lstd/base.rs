@@ -3,62 +3,56 @@ use crate::{
     value::RsFunc,
 };
 
-fn lua_print(lua: &mut State) -> Result<usize, RuntimeErr> {
-    let n = 1;
-    // for i in 1..=n {
-    //     print!("{}", lua.stack_view().get(i as i32).to_string());
+fn lua_print(_lua: &mut State) -> Result<usize, RuntimeErr> {
+    // let n = lua.top();
+    println!("Hello Rua!");
+    // for i in 1..=4 {
     //     if i > 1 {
     //         print!("\t");
     //     }
+    //     print!("{i}:{}", lua.rget(i)?);
     // }
 
-    for i in 1..=6 {
-        print!("{}", lua.stack_view().get(-1 + i as i32).to_string());
-        if i > 1 {
-            print!("\t");
-        }
-    }
-    println!("");
     Ok(0)
 }
 
-fn lua_assert(lua: &mut State) -> Result<usize, RuntimeErr> {
+fn lua_assert(_lua: &mut State) -> Result<usize, RuntimeErr> {
     todo!();
 }
 
-fn lua_error(lua: &mut State) -> Result<usize, RuntimeErr> {
+fn lua_error(_lua: &mut State) -> Result<usize, RuntimeErr> {
     todo!();
 }
 
-fn lua_pcall(lua: &mut State) -> Result<usize, RuntimeErr> {
+fn lua_pcall(_lua: &mut State) -> Result<usize, RuntimeErr> {
     todo!();
 }
 
-fn lua_xpcall(lua: &mut State) -> Result<usize, RuntimeErr> {
+fn lua_xpcall(_lua: &mut State) -> Result<usize, RuntimeErr> {
     todo!();
 }
 
-fn lua_getmetatable(lua: &mut State) -> Result<usize, RuntimeErr> {
+fn lua_getmetatable(_lua: &mut State) -> Result<usize, RuntimeErr> {
     todo!();
 }
 
-fn lua_setmetatable(lua: &mut State) -> Result<usize, RuntimeErr> {
+fn lua_setmetatable(_lua: &mut State) -> Result<usize, RuntimeErr> {
     todo!();
 }
 
-fn lua_next(lua: &mut State) -> Result<usize, RuntimeErr> {
+fn lua_next(_lua: &mut State) -> Result<usize, RuntimeErr> {
     todo!();
 }
 
-fn lua_pairs(lua: &mut State) -> Result<usize, RuntimeErr> {
+fn lua_pairs(_lua: &mut State) -> Result<usize, RuntimeErr> {
     todo!();
 }
 
-fn lua_ipairs(lua: &mut State) -> Result<usize, RuntimeErr> {
+fn lua_ipairs(_lua: &mut State) -> Result<usize, RuntimeErr> {
     todo!();
 }
 
-fn lua_load(lua: &mut State) -> Result<usize, RuntimeErr> {
+fn lua_load(_lua: &mut State) -> Result<usize, RuntimeErr> {
     todo!();
 }
 

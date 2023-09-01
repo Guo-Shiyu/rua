@@ -1,29 +1,36 @@
-fn main() {
-    println!("Hello, world!")
+use rua::{ffi::StdLib, state::State, LuaErr};
+
+fn main() -> Result<(), LuaErr> {
+    let mut vm = State::new();
+    vm.open(StdLib::Base);
+    let src = r#" print 'Hello Rua!' "#;
+    let _res = vm.script(src)?;
+    Ok(())
 }
 
 mod test {
-    use rua::{ffi::StdLib, state::State, value::LValue};
 
     #[test]
     fn hello_world() {
+        use rua::ffi::StdLib;
+        use rua::state::State;
+
         let mut vm = State::new();
         vm.open(StdLib::Base);
 
-        let src = r##"
+        let src = r#"
             print "Hello Rua!"
-        "##;
-        assert!(vm.script(src).is_ok());
+        "#;
+
+        let res = vm.script(src);
+        assert!(res.is_ok());
+        assert_eq!(res.unwrap(), 0);
     }
 
     #[test]
     fn stack_op() {
-        let mut vm = State::new();
+        // use rua::state::State;
+        // let mut vm = State::new();
         // vm.with_stack(|stk| stk.push(LValue::default()));
-
-        vm.stack(|s, h| {
-            // s.pop();
-            // h.
-        });
     }
 }
