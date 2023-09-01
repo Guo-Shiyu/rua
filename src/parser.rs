@@ -574,16 +574,16 @@ impl Parser<'_> {
     }
 
     /// exp ::=  `nil` |
-    ///	   `false` |
-    ///	   `true` |
-    ///	   Numeral |
-    ///	   LiteralString |
-    ///	   `...` |
-    ///	   functiondef |
-    ///	   prefixexp |
-    ///	   tablector |
-    ///	   exp binop exp |
-    ///	   unop exp
+    ///	    `false` |
+    ///	    `true` |
+    ///	    Numeral |
+    ///	    LiteralString |
+    ///	    `...` |
+    ///	    functiondef |
+    ///	    prefixexp |
+    ///	    tablector |
+    ///	    exp binop exp |
+    ///	    unop exp
     fn subexpr(&mut self, limit: usize) -> Result<ExprNode, SyntaxError> {
         let begin = self.lex.line();
         let mut lhs = if let Some(uniop) = self.unary_op() {
