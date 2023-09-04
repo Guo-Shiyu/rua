@@ -3,16 +3,15 @@ use crate::{
     value::RsFunc,
 };
 
-fn lua_print(_lua: &mut State) -> Result<usize, RuntimeErr> {
-    // let n = lua.top();
-    println!("Hello Rua!");
-    // for i in 1..=4 {
-    //     if i > 1 {
-    //         print!("\t");
-    //     }
-    //     print!("{i}:{}", lua.rget(i)?);
-    // }
-
+fn lua_print(lua: &mut State) -> Result<usize, RuntimeErr> {
+    let n = lua.top();
+    print!("{}", lua.rget(1)?);
+    if n > 1 {
+        for i in 2..=n {
+            print!("\t{}", lua.rget(i)?);
+        }
+    }
+    println!();
     Ok(0)
 }
 
