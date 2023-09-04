@@ -69,7 +69,7 @@ impl Frame {
                     Err(RuntimeErr::InvalidStackIndex)
                 }
             }
-            Ordering::Greater => {
+            Ordering::Greater | Ordering::Equal => {
                 let absidx = self.reg_base + idx;
                 if absidx < self.reg_top {
                     let val = unsafe { self.stk_base.offset(absidx as isize).read() };
@@ -78,7 +78,6 @@ impl Frame {
                     Err(RuntimeErr::InvalidStackIndex)
                 }
             }
-            _ => Err(RuntimeErr::InvalidStackIndex),
         }
     }
 
@@ -249,8 +248,11 @@ impl Rvm {
 
     fn try_shrink_stack(&mut self) {
         // shrink stack to half if stack size is less than 1/3 of capacity
-        if self.stack.len() < self.stack.capacity() / 3 {
-            self.stack.shrink_to(self.stack.capacity() / 2);
+        let cur_len = self.stack.len() - Self::EXTRA_STACK_SPACE;
+        if cur_len > Self::MIN_STACK_SPACE && cur_len < self.stack.capacity() / 3 {
+            let fixed = Self::MIN_STACK_SPACE.max(self.stack.capacity() / 2);
+            self.stack.shrink_to(fixed);
+            debug_assert!(fixed >= Self::MIN_STACK_SPACE);
             self.correct_callinfo();
         }
     }
@@ -407,20 +409,21 @@ impl State {
     //     todo!()
     // }
 
-    pub fn do_call(&mut self, fnidx: RegIndex, nin: usize, _nout: usize) -> Result<(), RuntimeErr> {
+    pub fn do_call(&mut self, fnidx: RegIndex, nin: i32, _nout: i32) -> Result<(), RuntimeErr> {
         let f = self.rget(fnidx)?;
         assert!(f.is_callable());
 
         match f {
             LValue::RsFn(f) => {
-                // call rust function directly
+                self.ci.reg_top += nin;
                 f(self)?;
+                self.ci.reg_top -= nin;
             }
             LValue::Function(p) => {
                 self.vm_with(|vm| {
                     if vm.callchain.len() > Rvm::MAX_CALL_NUM {
                         Err(RuntimeErr::RecursionLimit)
-                    } else if vm.stk_remain() < nin {
+                    } else if vm.stk_remain() < nin as usize {
                         vm.try_extend_stack()
                     } else {
                         Ok(())
@@ -449,7 +452,7 @@ impl State {
 
                 // balance parameters and argument
                 let narg = self.top();
-                let nparam = p.nparams() + 2; // FIXME:  remove + 2 because of codegen
+                let nparam = p.nparams();
                 let diff = narg.abs_diff(nparam);
                 match narg.cmp(&nparam) {
                     Ordering::Less => {
@@ -542,27 +545,30 @@ impl State {
 
             match code.mode() {
                 OpMode::IABC => {
-                    let (op, a, b, _c, _k) = code.repr_abck();
+                    let (op, a, b, c, k) = code.repr_abck();
                     match op {
                         VARARGPREP => {
                             // TODO:
                             // do nothing for now
                         }
-                        // LOADK => {
-                        //     let fa = self.callchain.back_mut().unwrap();
-                        //     self.stack.seti(fa.reg_base + a, fa.constants[b as usize]);
-                        // }
                         GETTABUP => {
                             let gval = self.globaltab.get(self.ci.kget(b));
                             self.ci.rset(a, gval);
                         }
 
                         MOVE => self.ci.rset(a, self.ci.rget(b)?),
-                        CALL => self.do_call(a, 0, 0)?,
+                        CALL => self.do_call(a, b - 1, c)?,
+                        RETURN0 => {}
                         _ => unimplemented!("unimplemented opcode: {:?}", op),
                     }
                 }
-                OpMode::IABx => todo!(),
+                OpMode::IABx => {
+                    let (op, a, bx) = code.repr_abx();
+                    match op {
+                        LOADK => self.ci.rset(a, self.ci.kget(bx)),
+                        _ => unimplemented!("unimplemented opcode: {:?}", op),
+                    }
+                }
                 OpMode::IAsBx => todo!(),
                 OpMode::IAx => todo!(),
                 OpMode::IsJ => todo!(),
