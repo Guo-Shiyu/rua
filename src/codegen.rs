@@ -763,7 +763,7 @@ impl CodeGen {
         let lineinfo = stmt.lineinfo();
         match stmt.into_inner() {
             Stmt::Assign { vars: _, exprs: _ } => todo!(),
-            Stmt::FuncCall(call) => self.walk_fncall(call),
+            Stmt::FuncCall(call) => self.walk_fncall(call, 0),
             Stmt::Lable(_) => todo!(),
             Stmt::Goto(_) => todo!(),
             Stmt::Break => todo!(),
@@ -793,7 +793,7 @@ impl CodeGen {
                 body: _,
             } => todo!(),
             Stmt::LocalVarDecl { names: _, exprs: _ } => todo!(),
-            Stmt::Expr(exp) => self.walk_common_expr(ExprNode::new(*exp, lineinfo)),
+            Stmt::Expr(exp) => self.walk_common_expr(ExprNode::new(*exp, lineinfo), 0),
         };
     }
 
@@ -805,7 +805,7 @@ impl CodeGen {
                     let ret_node = unsafe { rets.pop().unwrap_unchecked() };
                     let line = ret_node.lineinfo().0;
 
-                    let status = self.walk_common_expr(ret_node);
+                    let status = self.walk_common_expr(ret_node, usize::MAX);
                     let mut gen_lit_template = |op| {
                         let reg = self.alloc_free_reg();
                         self.gen(Isc::iabc(op, reg, 0, 0), line);
@@ -861,7 +861,7 @@ impl CodeGen {
         }
     }
 
-    fn walk_fncall(&mut self, call: FuncCall) -> ExprStatus {
+    fn walk_fncall(&mut self, call: FuncCall, exp_ret: usize) -> ExprStatus {
         match call {
             FuncCall::MethodCall {
                 prefix: _,
@@ -874,7 +874,7 @@ impl CodeGen {
                 let nparam = args.namelist.len();
                 let lineinfo = prefix.lineinfo();
 
-                let fnreg = match self.walk_common_expr(*prefix) {
+                let fnreg = match self.walk_common_expr(*prefix, 1) {
                     ExprStatus::Reg(reg) => reg,
                     ExprStatus::Up(upidx) => {
                         let reg = self.alloc_free_reg();
@@ -894,7 +894,8 @@ impl CodeGen {
 
                 for (posi, param) in args.namelist.into_iter().enumerate() {
                     let penode = ExprNode::new(param, (lineinfo.0, lineinfo.1 + (posi + 1) as u32));
-                    match self.walk_common_expr(penode) {
+                    let expect = if posi == nparam - 1 { usize::MAX } else { 1 };
+                    match self.walk_common_expr(penode, expect) {
                         ExprStatus::Kst(k) => {
                             let reg = self.alloc_free_reg();
                             self.gen(Isc::iabx(OpCode::LOADK, reg, k), 0);
@@ -908,7 +909,7 @@ impl CodeGen {
                 }
 
                 self.gen(
-                    Isc::iabc(OpCode::CALL, fnreg, (nparam + 1) as i32, 0),
+                    Isc::iabc(OpCode::CALL, fnreg, (nparam + 1) as i32, exp_ret as i32 + 1),
                     lineinfo.0,
                 );
                 ExprStatus::Reg(fnreg)
@@ -916,7 +917,7 @@ impl CodeGen {
         }
     }
 
-    fn walk_common_expr(&mut self, node: ExprNode) -> ExprStatus {
+    fn walk_common_expr(&mut self, node: ExprNode, expect_return: usize) -> ExprStatus {
         let ln = node.lineinfo().0;
         let unique = Self::take_expr_unique(&node);
 
@@ -985,7 +986,7 @@ impl CodeGen {
                 }
 
                 Expr::UnaryOp { op, expr } => {
-                    let es = self.walk_common_expr(*expr);
+                    let es = self.walk_common_expr(*expr, 1);
                     let unop_code = match op {
                         UnOp::Minus => OpCode::UNM,
                         UnOp::Not => OpCode::NOT,
@@ -1001,7 +1002,10 @@ impl CodeGen {
                 }
 
                 Expr::BinaryOp { lhs, op, rhs } => {
-                    let (lst, rst) = (self.walk_common_expr(*lhs), self.walk_common_expr(*rhs));
+                    let (lst, rst) = (
+                        self.walk_common_expr(*lhs, 1),
+                        self.walk_common_expr(*rhs, 1),
+                    );
                     let destreg = self.alloc_free_reg();
 
                     let select_arithmetic_kop = |bop: BinOp| -> OpCode {
@@ -1070,10 +1074,7 @@ impl CodeGen {
 
                 Expr::Index { prefix: _, key: _ } => todo!("expr codegen : Table Index"),
 
-                Expr::FuncCall(_call) => {
-                    // todo
-                    todo!("expr codegen : func call")
-                }
+                Expr::FuncCall(call) => self.walk_fncall(call, expect_return),
 
                 Expr::TableCtor(flist) => {
                     // idx of this table
@@ -1082,7 +1083,7 @@ impl CodeGen {
 
                     let aryidx = 1; // array in lua start at index 1
                     for field in flist.into_iter() {
-                        let valstatus = self.walk_common_expr(*field.val);
+                        let valstatus = self.walk_common_expr(*field.val, 1);
 
                         let valreg = match valstatus {
                             ExprStatus::Kst(k) => {
@@ -1096,7 +1097,7 @@ impl CodeGen {
                         };
 
                         if let Some(key) = field.key {
-                            let keystatus = self.walk_common_expr(*key);
+                            let keystatus = self.walk_common_expr(*key, 1);
                             match keystatus {
                                 ExprStatus::Kst(kidx) => {
                                     let free = self.alloc_free_reg();
