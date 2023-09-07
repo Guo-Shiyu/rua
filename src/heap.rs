@@ -40,9 +40,6 @@ impl TaggedBox {
 
     /// Heap address head mask for 64 bit OS
     const HEAP_ADDR_HEAD_MASK: u64 = 0xFFFF_0000_0000_0000;
-    #[cfg(target_os = "linux")]
-    const HEAP_ADDR_HEAD: u64 = 0x7ff0_0000_0000_0000;
-    #[cfg(target_os = "windows")]
     const HEAP_ADDR_HEAD: u64 = 0x0000_0000_0000_0000;
 
     pub fn new(tag: Tag, payload: usize) -> Self {
