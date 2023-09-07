@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, LinkedList},
     fmt::Debug,
-    io::{BufWriter, Write},
+    io::{BufReader, BufWriter, Read, Write},
     ops::{Deref, DerefMut},
     rc::Rc,
 };
@@ -450,12 +450,12 @@ impl HeapMemUsed for Proto {
 }
 
 impl Proto {
-    pub fn delegate_to(p: &Proto, heap: &mut Heap) {
-        for k in p.kst.iter() {
-            heap.delegate(*k);
+    pub fn delegate_to(p: &mut Proto, heap: &mut Heap) {
+        for k in p.kst.iter_mut() {
+            heap.delegate(k);
         }
 
-        for sub in p.subfn.iter() {
+        for sub in p.subfn.iter_mut() {
             heap.delegate_from(*sub);
             Self::delegate_to(sub, heap);
         }
@@ -1153,6 +1153,10 @@ impl ChunkDumper {
     }
 
     pub fn dump(_chunk: &Proto, _buf: &mut BufWriter<impl Write>) -> std::io::Result<()> {
+        todo!()
+    }
+
+    pub fn undump(buf: &mut BufReader<impl Read>) -> std::io::Result<Proto> {
         todo!()
     }
 }

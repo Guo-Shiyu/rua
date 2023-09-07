@@ -108,16 +108,16 @@ pub enum RuntimeErr {
 }
 
 pub struct Rvm {
-    stack: Vec<LValue>,                // vm registers stack
-    callchain: LinkedList<Frame>,      // call frames
-    ci: Frame,                         // current frame
-    globaltab: TableImpl,              // global table
-    metatab: BTreeMap<Tag, TableImpl>, // meta table for basic types
-    warnfn: RsFunc,                    // warn handler
-    panicfn: RsFunc,                   // panic handler
-    allowhook: bool,                   // enable hook
-    hook: HookFn,                      // hook handler
-    hkmask: HookMask,                  // hook mask
+    pub(crate) stack: Vec<LValue>,                // vm registers stack
+    callchain: LinkedList<Frame>,                 // call frames
+    ci: Frame,                                    // current frame
+    pub(crate) globaltab: TableImpl,              // global table
+    pub(crate) metatab: BTreeMap<Tag, TableImpl>, // meta table for basic types
+    warnfn: RsFunc,                               // warn handler
+    panicfn: RsFunc,                              // panic handler
+    allowhook: bool,                              // enable hook
+    hook: HookFn,                                 // hook handler
+    hkmask: HookMask,                             // hook mask
 }
 
 impl Deref for Rvm {
@@ -248,7 +248,7 @@ impl Rvm {
 
     fn try_shrink_stack(&mut self) {
         // shrink stack to half if stack size is less than 1/3 of capacity
-        let cur_len = self.stack.len() - Self::EXTRA_STACK_SPACE;
+        let cur_len = self.stack.capacity() - Self::EXTRA_STACK_SPACE;
         if cur_len > Self::MIN_STACK_SPACE && cur_len < self.stack.capacity() / 3 {
             let fixed = Self::MIN_STACK_SPACE.max(self.stack.capacity() / 2);
             self.stack.shrink_to(fixed);
@@ -322,6 +322,12 @@ impl State {
         }
     }
 
+    pub fn with_libs(libs: &[StdLib]) -> Self {
+        let mut vm = Self::new();
+        vm.open_libs(libs);
+        vm
+    }
+
     pub fn vm_view(&mut self) -> &mut Rvm {
         self.vm.get_mut()
     }
@@ -389,8 +395,9 @@ impl State {
         Ok((postidx - preidx) as usize)
     }
 
-    pub fn script_file(&mut self, _filepath: &str) -> Result<(), LuaErr> {
-        Ok(())
+    pub fn script_file(&mut self, file: &str) -> Result<usize, LuaErr> {
+        let src = std::fs::read_to_string(file)?;
+        self.script(&src)
     }
 
     /// Loads a Lua chunk without running it. If there are no errors, `load` pushes the compiled chunk as a Lua function on top of the stack.
