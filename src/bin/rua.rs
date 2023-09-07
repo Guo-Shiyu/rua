@@ -1,10 +1,18 @@
+use std::env;
+
 use rua::{ffi::StdLib, state::State, LuaErr};
 
 fn main() -> Result<(), LuaErr> {
-    let mut vm = State::new();
-    vm.open(StdLib::Base);
-    let src = r#" print 'Hello Rua!' "#;
-    let _res = vm.script(src)?;
+    let mut vm = State::with_libs(&[StdLib::Base]);
+    if let Some(file) = env::args().nth(1) {
+        vm.script_file(&file)?;
+    } else {
+        let hello = r#"
+            print "Hello Rua!"
+        "#;
+
+        vm.script(hello)?;
+    }
     Ok(())
 }
 
