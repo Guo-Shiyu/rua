@@ -210,6 +210,13 @@ impl StrImpl {
             let _ = Box::from_raw(std::slice::from_raw_parts_mut(ptr, cap));
         }
     }
+
+    pub fn new_reserved(s: &str) -> Gc<StrImpl> {
+        let gc = Gc::from(s);
+        debug_assert!(gc.is_short());
+        gc.extra.set(true);
+        gc
+    }
 }
 
 pub trait AsTableKey {
@@ -239,6 +246,21 @@ impl HeapMemUsed for TableImpl {
             .fold(0, |acc, val| acc + val.heap_mem_used());
 
         self_and_map + ary
+    }
+}
+
+impl MarkAndSweepGcOps for TableImpl {
+    fn mark_newborned(&self, _: GcColor) {
+        unimplemented!()
+    }
+
+    fn mark_reachable(&self) {
+        self.hmap.iter().for_each(|(_, val)| val.mark_reachable());
+        self.array.iter().for_each(|val| val.mark_reachable());
+    }
+
+    fn mark_untouched(&self) {
+        todo!()
     }
 }
 
