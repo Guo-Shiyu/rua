@@ -48,3 +48,9 @@ impl From<RuntimeErr> for LuaErr {
         LuaErr::RuntimeErr(err)
     }
 }
+
+impl From<std::io::Error> for LuaErr {
+    fn from(value: std::io::Error) -> Self {
+        LuaErr::IOErr(value)
+    }
+}
