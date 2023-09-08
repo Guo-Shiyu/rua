@@ -16,6 +16,14 @@ All notable changes to this project will be documented in this file.
 
 * changes here.  -->
 
+## 0.1.2 (2023-09-08)
+Add GC support, which implemented as a stop-the-world full collector.
+
+### Features
+* A usable GC.  
+* Stablize `State::script_file(file)`.  
+
+
 ## 0.1.1 (2023-08-29)
 First runnable version with a few testing.  
 
