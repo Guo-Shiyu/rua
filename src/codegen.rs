@@ -490,12 +490,6 @@ impl HeapMemUsed for Proto {
     }
 }
 
-impl Binary for Proto {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        todo!()
-    }
-}
-
 impl Display for Proto {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(
@@ -1245,25 +1239,49 @@ impl CodeGen {
     }
 }
 
-pub struct ChunkDumper {}
-
-impl Default for ChunkDumper {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+pub struct ChunkDumper();
 
 impl ChunkDumper {
-    pub fn new() -> Self {
-        Self {}
-    }
+    const DUMP_INT_BUFFER_SIZE: usize = std::mem::size_of::<usize>() * 8 / 7 + 1;
 
-    pub fn dump(_chunk: &Proto, _buf: &mut BufWriter<impl Write>) -> std::io::Result<()> {
+    pub fn dump(chunk: &Proto, buf: &mut BufWriter<impl Write>) -> std::io::Result<()> {
         todo!()
     }
 
     pub fn undump(buf: &mut BufReader<impl Read>) -> std::io::Result<Proto> {
         todo!()
+    }
+
+    fn dump_varint(mut x: usize, buf: &mut BufWriter<impl Write>) -> std::io::Result<()> {
+        let mut buff = [0_u8; Self::DUMP_INT_BUFFER_SIZE];
+        let mut n = 0;
+        loop {
+            n += 1;
+            buff[Self::DUMP_INT_BUFFER_SIZE - n] = x as u8 & 0x7f; /* fill buffer in reverse order */
+            x >>= 7;
+            if x == 0 {
+                break;
+            }
+        }
+        buff[Self::DUMP_INT_BUFFER_SIZE - 1] |= 0x80; /* mark last byte */
+        for byte in buff[(Self::DUMP_INT_BUFFER_SIZE - n)..].iter() {
+            buf.write(&[*byte])?;
+        }
+        Ok(())
+    }
+
+    fn undump_varint(buf: &mut BufReader<impl Read>) -> std::io::Result<usize> {
+        let mut x: usize = 0;
+        let mut byte = [0_u8; 1];
+        loop {
+            buf.read(&mut byte)?;
+            let b = u8::from_ne_bytes(byte);
+            x = (x << 7) | (b & 0x7f) as usize;
+            if (b & 0x80) != 0 {
+                break;
+            }
+        }
+        Ok(x)
     }
 }
 
@@ -1273,5 +1291,34 @@ mod test {
     fn instruction_size_check() {
         use super::Instruction;
         assert_eq!(std::mem::size_of::<Instruction>(), 4);
+    }
+
+    #[test]
+    fn varint_dump_and_undump() {
+        use super::ChunkDumper;
+        use std::io::{BufReader, BufWriter};
+
+        let to_write = [1, 2, 3, 123, 999999, -1, -2];
+
+        for i in to_write.iter().map(|x| *x as usize) {
+            let tmp_file = {
+                let mut temp_dir = std::env::temp_dir();
+                temp_dir.push("ruac.test.binary.dump");
+                std::fs::File::create(temp_dir).unwrap()
+            };
+
+            let same_file = {
+                let mut temp_dir = std::env::temp_dir();
+                temp_dir.push("ruac.test.binary.dump");
+                std::fs::File::open(temp_dir).unwrap()
+            };
+
+            let mut writer = BufWriter::new(tmp_file);
+            ChunkDumper::dump_varint(i, &mut writer).unwrap();
+
+            let k = ChunkDumper::undump_varint(&mut BufReader::new(same_file)).unwrap();
+
+            debug_assert_eq!(i, k);
+        }
     }
 }
