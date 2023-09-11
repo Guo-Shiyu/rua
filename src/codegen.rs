@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, LinkedList},
-    fmt::Debug,
+    fmt::{Binary, Debug, Display},
     io::{BufReader, BufWriter, Read, Write},
     ops::{Deref, DerefMut},
     rc::Rc,
@@ -37,6 +37,18 @@ pub enum OpMode {
     IAsBx,
     IAx,
     IsJ,
+}
+
+impl Display for OpMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OpMode::IABC => f.write_str("IABC "),
+            OpMode::IABx => f.write_str("IABx "),
+            OpMode::IAsBx => f.write_str("IAsBx"),
+            OpMode::IAx => f.write_str("IAx "),
+            OpMode::IsJ => f.write_str("IsJ "),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -180,6 +192,12 @@ pub enum OpCode {
     VARARG,     //  A C       R[A], R[A+1], ..., R[A+C-2] = vararg
     VARARGPREP, //  A         (adjust vararg parameters)
     EXTRAARG,   //  Ax        extra (larger) argument for previous opcode
+}
+
+impl Display for OpCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(format!("{:?}", self).as_str())
+    }
 }
 
 impl Instruction {
@@ -399,14 +417,37 @@ impl OpCode {
     }
 }
 
-impl Debug for Instruction {
+impl Display for Instruction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.mode() {
-            OpMode::IABC => write!(f, "IABC: {:?}", self.repr_abck()),
-            OpMode::IABx => write!(f, "IABx: {:?}", self.repr_abx()),
-            OpMode::IAsBx => write!(f, "IAsBx: {:?}", self.repr_asbx()),
-            OpMode::IAx => write!(f, "IAx: {:?}", self.repr_ax()),
-            OpMode::IsJ => write!(f, "IsJ: {:?}", self.repr_sj()),
+        let mode = self.mode();
+        write!(f, "{:<4}", mode)?;
+
+        match mode {
+            OpMode::IABC => {
+                let (code, a, b, c, k) = self.repr_abck();
+                write!(f, "{:<16}\t{:<3} {:<3} {:<3}", code, a, b, c)?;
+                if k {
+                    f.write_str("k")
+                } else {
+                    Ok(())
+                }
+            }
+            OpMode::IABx => {
+                let (code, a, bx) = self.repr_abx();
+                write!(f, "{code:<16}\t{:<3} {:<3}    ", a, bx)
+            }
+            OpMode::IAsBx => {
+                let (code, a, sbx) = self.repr_asbx();
+                write!(f, "{code:<16}\t{a:<3} {sbx:<3}")
+            }
+            OpMode::IAx => {
+                let (code, ax) = self.repr_ax();
+                write!(f, "{code:<16}\t{ax:<3}      ")
+            }
+            OpMode::IsJ => {
+                let (code, sj) = self.repr_sj();
+                write!(f, "{code:<16}\t{sj:<3}      ")
+            }
         }
     }
 }
@@ -446,6 +487,71 @@ impl HeapMemUsed for Proto {
             + self.locvars.capacity()
             + self.upvals.capacity()
             + self.source.capacity()
+    }
+}
+
+impl Binary for Proto {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        todo!()
+    }
+}
+
+impl Display for Proto {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(
+            f,
+            "function <{}:{},{}> ({} instructions at 0x{:X})",
+            self.source.as_str(),
+            self.begline,
+            self.endline,
+            self.code.len(),
+            self as *const Proto as usize
+        )?;
+
+        if self.vararg {
+            f.write_str("0+ params, ")?;
+        } else {
+            write!(f, "{} params, ", self.nparam)?;
+        }
+
+        writeln!(
+            f,
+            "{} slots, {} upvalue, {} locals, {}, constants, {} functions",
+            self.nreg,
+            self.upvals.len(),
+            self.locvars.len(),
+            self.kst.len(),
+            self.subfn.len()
+        )?;
+        for (idx, code) in self.code.iter().enumerate() {
+            let line = self.pcline.get(idx).unwrap_or(&0);
+            writeln!(f, "\t{idx}\t[{}]\t{:?>8} ;", line, code)?;
+        }
+
+        Ok(())
+    }
+}
+
+impl Debug for Proto {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "{}", self)?;
+        let self_addr = self as *const Proto as usize;
+        writeln!(f, "{} constants for 0x{:X}", self.kst.len(), self_addr)?;
+        for (idx, k) in self.kst.iter().enumerate() {
+            writeln!(f, "\t{idx}\t{k}")?;
+        }
+
+        writeln!(f, "{} locals for 0x{:X}", self.locvars.len(), self_addr)?;
+        for (idx, loc) in self.locvars.iter().enumerate() {
+            writeln!(f, "\t{idx}\t\"{}\"", loc.name.as_str())?;
+        }
+
+        writeln!(f, "{} upvalues for 0x{:X}", self.upvals.len(), self_addr)?;
+        for (idx, up) in self.upvals.iter().enumerate() {
+            writeln!(f, "\t{idx}\t\"{}\"", up.name.as_str())?;
+        }
+
+        Ok(())
     }
 }
 
@@ -725,7 +831,7 @@ impl CodeGen {
 
         // strip debug infomation
         if self.strip {
-            let _ = std::mem::take(&mut self.srcfile);
+            let _ = std::mem::replace(&mut self.srcfile, Rc::new("?".to_string()));
             for loc in self.locals.iter_mut() {
                 let _ = std::mem::take(&mut loc.name);
             }
