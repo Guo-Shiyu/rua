@@ -1347,7 +1347,7 @@ impl ChunkDumper {
 
         Self::dump_varint(chunk.code.len(), bw)?;
         for isc in chunk.code.iter() {
-            Self::dump_varint(isc.code as usize, bw)?;
+            bw.write(&isc.code.to_ne_bytes())?;
         }
 
         Self::dump_varint(chunk.kst.len(), bw)?;
@@ -1473,10 +1473,11 @@ impl ChunkDumper {
         }
 
         let upval_num = Self::undump_varint(r)?;
-        for _ in 0..upval_num {
-            let _name = Self::undump_string(r)?;
-        }
         debug_assert_eq!(upval_num, nupval);
+        for i in 0..upval_num {
+            let name = Self::undump_string(r)?;
+            ups[i].name = name;
+        }
 
         Ok(Proto {
             vararg: is_vararg,
@@ -1676,20 +1677,22 @@ mod test {
         "#;
 
         let ast = Parser::parse(src, None).unwrap();
-        let proto = super::CodeGen::generate(ast, false).unwrap();
+        let origin = super::CodeGen::generate(ast, false).unwrap();
+        // println!("{:?}", origin);
 
         let tmp_file = std::fs::File::create(tmpfile.clone()).unwrap();
         let mut writer = BufWriter::new(tmp_file);
-        ChunkDumper::dump(&proto, &mut writer).unwrap();
+        ChunkDumper::dump(&origin, &mut writer).unwrap();
         writer.flush().unwrap();
 
         let same_file = std::fs::File::open(tmpfile.clone()).unwrap();
         let mut reader = BufReader::new(same_file);
-        let k = ChunkDumper::undump(&mut reader).unwrap();
+        let recover = ChunkDumper::undump(&mut reader).unwrap();
+        // println!("{:?}", recover);
 
         let mut vm = State::new();
         // TODO:
-        //
+        // load and execute origin and recover to check result
         // vm.load(proto);
     }
 
