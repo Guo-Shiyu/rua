@@ -230,16 +230,6 @@ pub enum Attribute {
     Close,
 }
 
-impl From<u8> for Attribute {
-    fn from(v: u8) -> Self {
-        match v {
-            0 => Attribute::Const,
-            1 => Attribute::Close,
-            _ => panic!("invalid attribute value"),
-        }
-    }
-}
-
 impl Into<u8> for Attribute {
     fn into(self) -> u8 {
         match self {

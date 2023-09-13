@@ -1271,16 +1271,16 @@ impl ChunkDumper {
     const LUAC_FLOAT: f64 = 370.5; // from luac 5.4
 
     pub fn dump(chunk: &Proto, bw: &mut BufWriter<impl Write>) -> std::io::Result<()> {
-        bw.write(Self::LUA_SIGNATURE.as_bytes())?;
-        bw.write(&[Self::LUA_VERSION, Self::LUAC_FORMAT])?;
-        bw.write(&Self::LUAC_MAGIC)?;
-        bw.write(&[
+        bw.write_all(Self::LUA_SIGNATURE.as_bytes())?;
+        bw.write_all(&[Self::LUA_VERSION, Self::LUAC_FORMAT])?;
+        bw.write_all(&Self::LUAC_MAGIC)?;
+        bw.write_all(&[
             std::mem::size_of::<Instruction>() as u8,
             std::mem::size_of::<isize>() as u8,
             std::mem::size_of::<f64>() as u8,
         ])?;
-        bw.write(&Self::LUAC_INT.to_ne_bytes())?;
-        bw.write(&Self::LUAC_FLOAT.to_ne_bytes())?;
+        bw.write_all(&Self::LUAC_INT.to_ne_bytes())?;
+        bw.write_all(&Self::LUAC_FLOAT.to_ne_bytes())?;
 
         Self::dump_proto(chunk, bw)
     }
@@ -1347,7 +1347,7 @@ impl ChunkDumper {
 
         Self::dump_varint(chunk.code.len(), bw)?;
         for isc in chunk.code.iter() {
-            bw.write(&isc.code.to_ne_bytes())?;
+            bw.write_all(&isc.code.to_ne_bytes())?;
         }
 
         Self::dump_varint(chunk.kst.len(), bw)?;
@@ -1474,9 +1474,8 @@ impl ChunkDumper {
 
         let upval_num = Self::undump_varint(r)?;
         debug_assert_eq!(upval_num, nupval);
-        for i in 0..upval_num {
-            let name = Self::undump_string(r)?;
-            ups[i].name = name;
+        for up in ups.iter_mut().take(upval_num) {
+            up.name = Self::undump_string(r)?;
         }
 
         Ok(Proto {
@@ -1508,35 +1507,35 @@ impl ChunkDumper {
             }
             n += 1;
         }
-        bw.write(&buff[..n + 1])?;
+        bw.write_all(&buff[..n + 1])?;
         Ok(())
     }
 
     fn dump_const(val: &LValue, w: &mut BufWriter<impl Write>) -> std::io::Result<()> {
         match val {
             LValue::Nil => {
-                w.write(&[0x00])?;
+                w.write_all(&[0x00])?;
             }
             LValue::Bool(b) => {
                 if *b {
-                    w.write(&[0x11])?;
+                    w.write_all(&[0x11])?;
                 } else {
-                    w.write(&[0x1])?;
+                    w.write_all(&[0x1])?;
                 }
             }
             LValue::Int(i) => {
-                w.write(&[0x03])?;
+                w.write_all(&[0x03])?;
                 unsafe { Self::dump_varint(std::mem::transmute(i), w)? }
             }
             LValue::Float(f) => {
-                w.write(&[0x13])?;
+                w.write_all(&[0x13])?;
                 Self::dump_float(*f, w)?;
             }
             LValue::String(s) => {
                 if s.is_short() {
-                    w.write(&[0x04])?;
+                    w.write_all(&[0x04])?;
                 } else {
-                    w.write(&[0x14])?;
+                    w.write_all(&[0x14])?;
                 }
                 Self::dump_string(s.as_str(), w)?;
             }
@@ -1566,7 +1565,7 @@ impl ChunkDumper {
             Self::dump_varint(0, w)?;
         } else {
             Self::dump_varint(len + 1, w)?;
-            w.write(s.as_bytes())?;
+            w.write_all(s.as_bytes())?;
         }
         Ok(())
     }
@@ -1591,7 +1590,7 @@ impl ChunkDumper {
         let mut n = 0;
         loop {
             let mut byte = [0_u8; 1];
-            buf.read(&mut byte)?;
+            buf.read_exact(&mut byte)?;
             let byte = u8::from_ne_bytes(byte);
             let pad = (byte & 0x7f) as usize;
             x |= pad << (7 * n);
@@ -1604,13 +1603,11 @@ impl ChunkDumper {
     }
 
     fn dump_float(f: f64, bw: &mut BufWriter<impl Write>) -> std::io::Result<()> {
-        let i = unsafe { std::mem::transmute::<f64, usize>(f) };
-        Self::dump_varint(i, bw)
+        Self::dump_varint(f.to_bits() as usize, bw)
     }
 
     fn undump_float(buf: &mut BufReader<impl Read>) -> std::io::Result<f64> {
-        let u = Self::undump_varint(buf)?;
-        Ok(unsafe { std::mem::transmute::<usize, f64>(u) })
+        Ok(f64::from_bits(Self::undump_varint(buf)? as u64))
     }
 }
 
@@ -1713,7 +1710,7 @@ mod test {
         dump_and_undump(
             "ruac.test.binary.string",
             &str_to_write,
-            |k, w| ChunkDumper::dump_string(&k, w).unwrap(),
+            |k, w| ChunkDumper::dump_string(k, w).unwrap(),
             |r| ChunkDumper::undump_string(r).unwrap(),
         );
     }
