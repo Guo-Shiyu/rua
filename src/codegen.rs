@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, LinkedList},
-    fmt::{Binary, Debug, Display},
+    fmt::{Debug, Display},
     io::{BufReader, BufWriter, Read, Write},
     ops::{Deref, DerefMut},
     rc::Rc,
@@ -196,7 +196,12 @@ pub enum OpCode {
 
 impl Display for OpCode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(format!("{:?}", self).as_str())
+        let buf = format!("{:?}", self);
+        f.write_str(buf.as_str())?;
+        for _ in buf.len()..12 {
+            f.write_str(" ")?;
+        }
+        Ok(())
     }
 }
 
@@ -420,7 +425,7 @@ impl OpCode {
 impl Display for Instruction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mode = self.mode();
-        write!(f, "{:<4}", mode)?;
+        write!(f, "{:<4} ", mode)?;
 
         match mode {
             OpMode::IABC => {
@@ -590,7 +595,7 @@ impl Proto {
 
 pub struct LocVar {
     name: String,
-    // regid: RegIndex, // register index on stack
+    reg: RegIndex, // register index on stack
     start_pc: u32, // first point where variable is active
     end_pc: u32,   // first point where variable is dead
 }
@@ -643,6 +648,10 @@ impl GenState {
             srcfile,
             absline: Vec::with_capacity(8),
         }
+    }
+
+    fn cur_pc(&self) -> u32 {
+        self.code.len() as u32
     }
 
     fn gen(&mut self, inst: Instruction, line: u32) {
@@ -700,9 +709,9 @@ impl GenState {
 
     /// Find local variable and return its index
     fn find_local(&self, name: &str) -> Option<RegIndex> {
-        for (idx, v) in self.locals.iter().rev().enumerate() {
+        for v in self.locals.iter().rev() {
             if v.name == name {
-                return Some(idx as RegIndex);
+                return Some(v.reg);
             }
         }
         None
@@ -736,6 +745,53 @@ impl GenState {
         // self.gen(Isc::iabc(OpCode::GETUPVAL, a, b, c, isk), line);
         // reg
         todo!()
+    }
+
+    fn gen_local_desc(&mut self, name: String, status: ExprStatus, lineinfo: (u32, u32)) -> LocVar {
+        let mut vreg = self.alloc_free_reg();
+
+        match status {
+            ExprStatus::LitNil => self.gen(Isc::iabc(OpCode::LOADNIL, vreg, 0, 0), lineinfo.0),
+            ExprStatus::LitTrue => self.gen(Isc::iabc(OpCode::LOADTRUE, vreg, 0, 0), lineinfo.0),
+            ExprStatus::LitFalse => self.gen(Isc::iabc(OpCode::LOADFALSE, vreg, 0, 0), lineinfo.0),
+            ExprStatus::LitInt(i) => {
+                if i.abs() > Isc::MAX_SBX.abs() as i64 {
+                    let kreg = self.alloc_const_reg(LValue::Int(i));
+                    self.gen(Isc::iabx(OpCode::LOADK, vreg, kreg), lineinfo.0)
+                } else {
+                    self.gen(Isc::iasbx(OpCode::LOADI, vreg, i as i32), lineinfo.0)
+                }
+            }
+            ExprStatus::LitFlt(f) => {
+                // FIX ME:
+                // use LOADF for small float.
+
+                let kreg = self.alloc_const_reg(LValue::Float(f));
+                self.gen(Isc::iabx(OpCode::LOADK, vreg, kreg), lineinfo.0)
+            }
+            ExprStatus::Call(reg) => {
+                vreg = reg;
+                self.free_reg();
+            }
+            ExprStatus::Kst(reg) => {
+                self.gen(Isc::iabc(OpCode::MOVE, vreg, reg, 0), lineinfo.0);
+            }
+            ExprStatus::Reg(reg) => {
+                vreg = reg;
+                self.free_reg();
+            }
+            ExprStatus::Up(ureg) => {
+                // self.load_upval(ureg);
+                todo!()
+            }
+        }
+
+        LocVar {
+            name,
+            reg: vreg,
+            start_pc: self.cur_pc(),
+            end_pc: self.cur_pc(),
+        }
     }
 
     fn gen_unary_const(&mut self, _op: OpCode, kidx: RegIndex, line: u32) -> ExprStatus {
@@ -864,7 +920,9 @@ impl CodeGen {
         let lineinfo = stmt.lineinfo();
         match stmt.into_inner() {
             Stmt::Assign { vars: _, exprs: _ } => todo!(),
-            Stmt::FuncCall(call) => self.walk_fncall(call, 0),
+            Stmt::FuncCall(call) => {
+                let _ = self.walk_fncall(call, 0);
+            }
             Stmt::Lable(_) => todo!(),
             Stmt::Goto(_) => todo!(),
             Stmt::Break => todo!(),
@@ -893,9 +951,73 @@ impl CodeGen {
                 method: _,
                 body: _,
             } => todo!(),
-            Stmt::LocalVarDecl { names: _, exprs: _ } => todo!(),
-            Stmt::Expr(exp) => self.walk_common_expr(ExprNode::new(*exp, lineinfo), 0),
+            Stmt::LocalVarDecl { names, exprs } => {
+                self.walk_local_decl(names, exprs, lineinfo);
+            }
+            Stmt::Expr(exp) => {
+                let _ = self.walk_common_expr(ExprNode::new(*exp, lineinfo), 0);
+            }
         };
+    }
+
+    fn walk_local_decl(
+        &mut self,
+        mut names: Vec<(String, Option<Attribute>)>,
+        mut exprs: Vec<crate::ast::WithSrcLoc<Expr>>,
+        lineinfo: (u32, u32),
+    ) {
+        debug_assert!(names.len() >= 1);
+        debug_assert!(exprs.len() >= 1);
+
+        let (nvar, nexp) = (names.len(), exprs.len());
+        if nvar <= exprs.len() {
+            // TODO:
+            // add attribute support
+            for (idx, (def, _attr)) in names.into_iter().enumerate() {
+                let status = exprs
+                    .get_mut(idx)
+                    .map(|e| self.walk_common_expr(std::mem::take(e), 1))
+                    .unwrap_or(ExprStatus::LitNil);
+                let local_desc = self.gen_local_desc(def, status, lineinfo);
+                self.locals.push(local_desc);
+            }
+
+            for extra in exprs.into_iter().skip(nvar) {
+                let _ = self.walk_common_expr(extra, 0);
+            }
+        } else {
+            // SAFETY:
+            // there are at least 1 expr
+            let last = unsafe { exprs.pop().unwrap_unchecked() };
+
+            for (idx, e) in exprs.into_iter().enumerate() {
+                let status = self.walk_common_expr(e, 1);
+                // TODO:
+                // add attribute support
+                let desc = unsafe { &mut names.get_mut(idx).unwrap_unchecked() };
+                let name = std::mem::take(&mut desc.0);
+                let local_desc = self.gen_local_desc(name, status, lineinfo);
+                self.locals.push(local_desc);
+            }
+
+            let remain = names.iter().skip(nexp).count();
+            debug_assert!(remain > 0);
+            let last_sta = self.walk_common_expr(last, remain);
+            if let ExprStatus::Call(reg) = last_sta {
+                for (idx, (name, _attr)) in names.into_iter().skip(nexp).enumerate() {
+                    self.gen_local_desc(name, ExprStatus::Reg(reg + idx as RegIndex), lineinfo);
+                }
+            } else {
+                let mut iter = names.into_iter().skip(nexp);
+                // SAFETY: there are must at least 1 remain variable
+                let next = unsafe { iter.next().unwrap_unchecked() };
+                self.gen_local_desc(next.0, last_sta, lineinfo);
+
+                while let Some((name, _attr)) = iter.next() {
+                    self.gen_local_desc(name, ExprStatus::LitNil, lineinfo);
+                }
+            }
+        }
     }
 
     fn walk_return(&mut self, ret: Option<Vec<ExprNode>>) {
@@ -1013,6 +1135,14 @@ impl CodeGen {
                     Isc::iabc(OpCode::CALL, fnreg, (nparam + 1) as i32, exp_ret as i32 + 1),
                     lineinfo.0,
                 );
+
+                // reserve enuogh space for return value
+                if exp_ret > nparam {
+                    for _ in nparam..exp_ret {
+                        self.alloc_free_reg();
+                    }
+                }
+
                 ExprStatus::Reg(fnreg)
             }
         }

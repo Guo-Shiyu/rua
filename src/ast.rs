@@ -3,6 +3,7 @@ use std::{
     ops::{Deref, DerefMut},
 };
 
+#[derive(Default)]
 /// Warpper for an ast-node to attach source location info
 pub struct WithSrcLoc<T> {
     node: T,
