@@ -37,7 +37,7 @@
  }
 
  ProtoType {
-     u8 upvalue_size;
+     u8          upvalue_size;
      String      source;
      varint      line_defined;
      varint      last_line_defined;
