@@ -106,6 +106,14 @@ fn main() -> Result<(), LuaErr> {
         .map_err(StaticErr::CodeGenErr)
         .map_err(LuaErr::CompileErr)?;
 
+    if args.list > 0 {
+        if args.list == 1 {
+            println!("{}", chunk);
+        } else if args.list >= 2 {
+            println!("{:?}", chunk);
+        }
+    }
+
     let mut ruacout =
         std::io::BufWriter::new(std::fs::File::create(&args.output).map_err(LuaErr::IOErr)?);
     ChunkDumper::dump(&chunk, &mut ruacout).map_err(LuaErr::IOErr)?;

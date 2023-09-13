@@ -554,7 +554,7 @@ impl Display for LValue {
             Bool(b) => write!(f, "{}", b),
             Int(i) => write!(f, "{}", i),
             Float(fl) => write!(f, "{}", fl),
-            String(s) => write!(f, "{}", s.as_str()),
+            String(s) => write!(f, "\"{}\"", s.as_str()),
             Table(t) => write!(f, "table: 0x{:X}", t.heap_address()),
             Function(func) => write!(f, "function: 0x{:X}", { func.heap_address() }),
             RsFn(rsf) => write!(f, "rsfn: 0x{:X}", rsf as *const _ as usize),

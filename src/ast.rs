@@ -223,12 +223,20 @@ pub enum Expr {
     },
 }
 
-
-
-#[derive(Debug)]
+#[repr(u8)]
+#[derive(Debug, Clone, Copy)]
 pub enum Attribute {
     Const,
     Close,
+}
+
+impl Into<u8> for Attribute {
+    fn into(self) -> u8 {
+        match self {
+            Attribute::Const => 0,
+            Attribute::Close => 1,
+        }
+    }
 }
 
 pub struct ParaList {

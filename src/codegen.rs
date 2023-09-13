@@ -1,16 +1,16 @@
 use std::{
     collections::{BTreeMap, LinkedList},
-    fmt::Debug,
+    fmt::{Binary, Debug, Display},
     io::{BufReader, BufWriter, Read, Write},
     ops::{Deref, DerefMut},
     rc::Rc,
 };
 
 use crate::{
-    ast::{BinOp, Block, Expr, ExprNode, FuncCall, ParaList, Stmt, StmtNode, UnOp},
+    ast::{Attribute, BinOp, Block, Expr, ExprNode, FuncCall, ParaList, Stmt, StmtNode, UnOp},
     heap::{Gc, Heap, HeapMemUsed},
     state::RegIndex,
-    value::LValue,
+    value::{LValue, StrImpl},
 };
 
 /// We assume that instructions are unsigned 32-bit integers.
@@ -37,6 +37,18 @@ pub enum OpMode {
     IAsBx,
     IAx,
     IsJ,
+}
+
+impl Display for OpMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OpMode::IABC => f.write_str("IABC "),
+            OpMode::IABx => f.write_str("IABx "),
+            OpMode::IAsBx => f.write_str("IAsBx"),
+            OpMode::IAx => f.write_str("IAx "),
+            OpMode::IsJ => f.write_str("IsJ "),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -180,6 +192,12 @@ pub enum OpCode {
     VARARG,     //  A C       R[A], R[A+1], ..., R[A+C-2] = vararg
     VARARGPREP, //  A         (adjust vararg parameters)
     EXTRAARG,   //  Ax        extra (larger) argument for previous opcode
+}
+
+impl Display for OpCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(format!("{:?}", self).as_str())
+    }
 }
 
 impl Instruction {
@@ -399,14 +417,37 @@ impl OpCode {
     }
 }
 
-impl Debug for Instruction {
+impl Display for Instruction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.mode() {
-            OpMode::IABC => write!(f, "IABC: {:?}", self.repr_abck()),
-            OpMode::IABx => write!(f, "IABx: {:?}", self.repr_abx()),
-            OpMode::IAsBx => write!(f, "IAsBx: {:?}", self.repr_asbx()),
-            OpMode::IAx => write!(f, "IAx: {:?}", self.repr_ax()),
-            OpMode::IsJ => write!(f, "IsJ: {:?}", self.repr_sj()),
+        let mode = self.mode();
+        write!(f, "{:<4}", mode)?;
+
+        match mode {
+            OpMode::IABC => {
+                let (code, a, b, c, k) = self.repr_abck();
+                write!(f, "{:<16}\t{:<3} {:<3} {:<3}", code, a, b, c)?;
+                if k {
+                    f.write_str("k")
+                } else {
+                    Ok(())
+                }
+            }
+            OpMode::IABx => {
+                let (code, a, bx) = self.repr_abx();
+                write!(f, "{code:<16}\t{:<3} {:<3}    ", a, bx)
+            }
+            OpMode::IAsBx => {
+                let (code, a, sbx) = self.repr_asbx();
+                write!(f, "{code:<16}\t{a:<3} {sbx:<3}")
+            }
+            OpMode::IAx => {
+                let (code, ax) = self.repr_ax();
+                write!(f, "{code:<16}\t{ax:<3}      ")
+            }
+            OpMode::IsJ => {
+                let (code, sj) = self.repr_sj();
+                write!(f, "{code:<16}\t{sj:<3}      ")
+            }
         }
     }
 }
@@ -415,6 +456,7 @@ impl Debug for Instruction {
 pub struct UpValue {
     name: String,             // for debug infomation
     stkidx: Option<RegIndex>, // stack index
+    kind: Option<Attribute>,  // close / const ...
 }
 
 /// Lua Function Prototype
@@ -446,6 +488,65 @@ impl HeapMemUsed for Proto {
             + self.locvars.capacity()
             + self.upvals.capacity()
             + self.source.capacity()
+    }
+}
+
+impl Display for Proto {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(
+            f,
+            "function <{}:{},{}> ({} instructions at 0x{:X})",
+            self.source.as_str(),
+            self.begline,
+            self.endline,
+            self.code.len(),
+            self as *const Proto as usize
+        )?;
+
+        if self.vararg {
+            f.write_str("0+ params, ")?;
+        } else {
+            write!(f, "{} params, ", self.nparam)?;
+        }
+
+        writeln!(
+            f,
+            "{} slots, {} upvalue, {} locals, {}, constants, {} functions",
+            self.nreg,
+            self.upvals.len(),
+            self.locvars.len(),
+            self.kst.len(),
+            self.subfn.len()
+        )?;
+        for (idx, code) in self.code.iter().enumerate() {
+            let line = self.pcline.get(idx).unwrap_or(&0);
+            writeln!(f, "\t{idx}\t[{}]\t{:?>8} ;", line, code)?;
+        }
+
+        Ok(())
+    }
+}
+
+impl Debug for Proto {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "{}", self)?;
+        let self_addr = self as *const Proto as usize;
+        writeln!(f, "{} constants for 0x{:X}", self.kst.len(), self_addr)?;
+        for (idx, k) in self.kst.iter().enumerate() {
+            writeln!(f, "\t{idx}\t{k}")?;
+        }
+
+        writeln!(f, "{} locals for 0x{:X}", self.locvars.len(), self_addr)?;
+        for (idx, loc) in self.locvars.iter().enumerate() {
+            writeln!(f, "\t{idx}\t\"{}\"", loc.name.as_str())?;
+        }
+
+        writeln!(f, "{} upvalues for 0x{:X}", self.upvals.len(), self_addr)?;
+        for (idx, up) in self.upvals.iter().enumerate() {
+            writeln!(f, "\t{idx}\t\"{}\"", up.name.as_str())?;
+        }
+
+        Ok(())
     }
 }
 
@@ -489,8 +590,7 @@ impl Proto {
 
 pub struct LocVar {
     name: String,
-    regid: RegIndex, // register index on stack
-
+    // regid: RegIndex, // register index on stack
     start_pc: u32, // first point where variable is active
     end_pc: u32,   // first point where variable is dead
 }
@@ -713,6 +813,7 @@ impl CodeGen {
         self.upvals.push(UpValue {
             name: "_ENV".to_string(),
             stkidx: None,
+            kind: None,
         });
 
         // statements
@@ -725,7 +826,7 @@ impl CodeGen {
 
         // strip debug infomation
         if self.strip {
-            let _ = std::mem::take(&mut self.srcfile);
+            let _ = std::mem::replace(&mut self.srcfile, Rc::new("?".to_string()));
             for loc in self.locals.iter_mut() {
                 let _ = std::mem::take(&mut loc.name);
             }
@@ -971,15 +1072,19 @@ impl CodeGen {
                             self.upvals.push(UpValue {
                                 name: id,
                                 stkidx: Some(regidx),
+                                kind: None,
                             });
                             return ExprStatus::Up(self.upvals.len() as i32 - 1);
                         }
                     }
 
                     // if not found, acquire _ENV table, record upvalue's name
+                    // TODO:
+                    // support for variable with attribute
                     self.upvals.push(UpValue {
                         name: id.clone(),
                         stkidx: None,
+                        kind: None,
                     });
                     self.alloc_const_reg(LValue::from_wild(Gc::from(id)));
                     ExprStatus::Up(self.upvals.len() as i32 - 1)
@@ -1139,33 +1244,510 @@ impl CodeGen {
     }
 }
 
-pub struct ChunkDumper {}
+#[derive(Debug)]
+pub enum BinLoadErr {
+    IOErr(std::io::Error),
+    NotBinaryChunk,
+    VersionMismatch,
+    UnsupportedFormat,
+    IncompatiablePlatform,
+}
 
-impl Default for ChunkDumper {
-    fn default() -> Self {
-        Self::new()
+impl From<std::io::Error> for BinLoadErr {
+    fn from(value: std::io::Error) -> Self {
+        BinLoadErr::IOErr(value)
     }
 }
 
+pub struct ChunkDumper();
+
 impl ChunkDumper {
-    pub fn new() -> Self {
-        Self {}
+    const LUA_SIGNATURE: &'static str = "\x1bLua";
+    const LUA_VERSION: u8 = 0x54;
+
+    const LUAC_MAGIC: [u8; 6] = [0x19, 0x93, 0x0d, 0x0a, 0x1a, 0x0a];
+    const LUAC_FORMAT: u8 = 0; // standard luac format
+    const LUAC_INT: u64 = 0x5678; // from luac 5.4
+    const LUAC_FLOAT: f64 = 370.5; // from luac 5.4
+
+    pub fn dump(chunk: &Proto, bw: &mut BufWriter<impl Write>) -> std::io::Result<()> {
+        bw.write_all(Self::LUA_SIGNATURE.as_bytes())?;
+        bw.write_all(&[Self::LUA_VERSION, Self::LUAC_FORMAT])?;
+        bw.write_all(&Self::LUAC_MAGIC)?;
+        bw.write_all(&[
+            std::mem::size_of::<Instruction>() as u8,
+            std::mem::size_of::<isize>() as u8,
+            std::mem::size_of::<f64>() as u8,
+        ])?;
+        bw.write_all(&Self::LUAC_INT.to_ne_bytes())?;
+        bw.write_all(&Self::LUAC_FLOAT.to_ne_bytes())?;
+
+        Self::dump_proto(chunk, bw)
     }
 
-    pub fn dump(_chunk: &Proto, _buf: &mut BufWriter<impl Write>) -> std::io::Result<()> {
-        todo!()
+    pub fn undump(r: &mut BufReader<impl Read>) -> Result<Proto, BinLoadErr> {
+        let mut signature = [0_u8; 4];
+        r.read_exact(&mut signature)?;
+        for (i, s) in Self::LUA_SIGNATURE.bytes().enumerate() {
+            if signature[i] != s {
+                return Err(BinLoadErr::NotBinaryChunk);
+            }
+        }
+
+        let mut version = [0_u8; 1];
+        r.read_exact(&mut version)?;
+        if u8::from_ne_bytes(version) != Self::LUA_VERSION {
+            return Err(BinLoadErr::VersionMismatch);
+        }
+
+        let mut format = [0_u8; 1];
+        r.read_exact(&mut format)?;
+        if u8::from_ne_bytes(format) != Self::LUAC_FORMAT {
+            return Err(BinLoadErr::UnsupportedFormat);
+        }
+
+        let mut magic = [0_u8; 6];
+        r.read_exact(&mut magic)?;
+        for (i, m) in Self::LUAC_MAGIC.iter().enumerate() {
+            if magic[i] != *m {
+                return Err(BinLoadErr::NotBinaryChunk);
+            }
+        }
+
+        let mut code_size = [0_u8; 1];
+        let mut int_size = [0_u8; 1];
+        let mut flt_size = [0_u8; 1];
+        let mut luac_int = [0_u8; 8];
+        let mut luac_flt = [0_u8; 8];
+
+        r.read_exact(&mut code_size)?;
+        r.read_exact(&mut int_size)?;
+        r.read_exact(&mut flt_size)?;
+        r.read_exact(&mut luac_int)?;
+        r.read_exact(&mut luac_flt)?;
+
+        let csize_check = u8::from_ne_bytes(code_size) != std::mem::size_of::<Instruction>() as u8;
+        let size_check = u8::from_ne_bytes(int_size) != std::mem::size_of::<isize>() as u8;
+        let flt_check = u8::from_ne_bytes(flt_size) != std::mem::size_of::<f64>() as u8;
+        let luacint_check = u64::from_ne_bytes(luac_int) != Self::LUAC_INT;
+        let luacflt_check = f64::from_ne_bytes(luac_flt) != Self::LUAC_FLOAT;
+        if csize_check || size_check || flt_check || luacint_check || luacflt_check {
+            return Err(BinLoadErr::IncompatiablePlatform);
+        }
+
+        Self::undump_proto(r)
     }
 
-    pub fn undump(buf: &mut BufReader<impl Read>) -> std::io::Result<Proto> {
-        todo!()
+    fn dump_proto(chunk: &Proto, bw: &mut BufWriter<impl Write>) -> std::io::Result<()> {
+        Self::dump_varint(chunk.upvals.len(), bw)?;
+        Self::dump_string(&chunk.source, bw)?;
+        Self::dump_varint(chunk.begline as usize, bw)?;
+        Self::dump_varint(chunk.endline as usize, bw)?;
+        bw.write_all(&[chunk.nparam, chunk.vararg as u8, chunk.nreg])?;
+
+        Self::dump_varint(chunk.code.len(), bw)?;
+        for isc in chunk.code.iter() {
+            bw.write_all(&isc.code.to_ne_bytes())?;
+        }
+
+        Self::dump_varint(chunk.kst.len(), bw)?;
+        for k in chunk.kst.iter() {
+            Self::dump_const(k, bw)?;
+        }
+
+        Self::dump_varint(chunk.upvals.len(), bw)?;
+        for up in chunk.upvals.iter() {
+            let (onstk, stkid) = if let Some(idx) = up.stkidx {
+                (true, idx)
+            } else {
+                (false, 0)
+            };
+            let attr: u8 = if let Some(a) = up.kind { a as u8 } else { 0 };
+            Self::dump_varint(onstk as usize, bw)?;
+            Self::dump_varint(stkid as usize, bw)?;
+            Self::dump_varint(attr as usize, bw)?;
+        }
+
+        Self::dump_varint(chunk.subfn.len(), bw)?;
+        for p in chunk.subfn.iter() {
+            Self::dump_proto(p, bw)?;
+        }
+
+        // TODO
+        // support dump line infomation
+        Self::dump_varint(0, bw)?; // size_line_info
+        Self::dump_varint(0, bw)?; // size_abs_line_info
+
+        Self::dump_varint(chunk.locvars.len(), bw)?;
+        for loc in chunk.locvars.iter() {
+            Self::dump_string(&loc.name, bw)?;
+            Self::dump_varint(loc.start_pc as usize, bw)?;
+            Self::dump_varint(loc.end_pc as usize, bw)?;
+        }
+
+        Self::dump_varint(chunk.upvals.len(), bw)?;
+        for up in chunk.upvals.iter() {
+            Self::dump_string(&up.name, bw)?;
+        }
+
+        Ok(())
+    }
+
+    pub fn undump_proto(r: &mut BufReader<impl Read>) -> Result<Proto, BinLoadErr> {
+        let nupval = Self::undump_varint(r)?;
+        let src = Rc::new(Self::undump_string(r)?);
+        let begline = Self::undump_varint(r)?;
+        let endline = Self::undump_varint(r)?;
+
+        let mut byte = [0; 1];
+        r.read_exact(&mut byte)?;
+        let nparam = u8::from_ne_bytes(byte);
+        r.read_exact(&mut byte)?;
+        let is_vararg = u8::from_ne_bytes(byte) != 0;
+        r.read_exact(&mut byte)?;
+        let nreg = u8::from_ne_bytes(byte);
+
+        let code_size = Self::undump_varint(r)?;
+        let mut code = Vec::with_capacity(code_size);
+        let mut isc_buf = 0_u32.to_ne_bytes();
+        for _ in 0..code_size {
+            r.read_exact(&mut isc_buf)?;
+            code.push(Instruction {
+                code: u32::from_ne_bytes(isc_buf),
+            })
+        }
+
+        let kst_size = Self::undump_varint(r)?;
+        let mut kst = Vec::with_capacity(kst_size);
+        for _ in 0..kst_size {
+            kst.push(Self::undump_const(r)?)
+        }
+
+        let up_size = Self::undump_varint(r)?;
+        let mut ups = Vec::with_capacity(up_size);
+        for _ in 0..up_size {
+            r.read_exact(&mut byte)?;
+            let onstk = u8::from_ne_bytes(byte) != 0;
+
+            r.read_exact(&mut byte)?;
+            let stkid = u8::from_ne_bytes(byte);
+
+            r.read_exact(&mut byte)?;
+            // TODO:
+            // support attribute dump
+            // let attr = ...
+
+            ups.push(UpValue {
+                name: String::new(),
+                stkidx: if onstk { Some(stkid as RegIndex) } else { None },
+                kind: None,
+            })
+        }
+
+        let proto_size = Self::undump_varint(r)?;
+        let mut subfn = Vec::with_capacity(proto_size);
+        for _ in 0..proto_size {
+            let mut p = Self::undump_proto(r)?;
+            p.source = src.clone();
+            subfn.push(Gc::new(p));
+        }
+
+        // TODO:
+        // support line info undump
+        let line_info_size = Self::undump_varint(r)?;
+        for _ in 0..line_info_size {
+            r.read_exact(&mut byte)?;
+        }
+
+        let abs_line_info_size = Self::undump_varint(r)?;
+        for _ in 0..abs_line_info_size {
+            let _pc = Self::undump_varint(r)?;
+            let _line = Self::undump_varint(r)?;
+        }
+
+        let loc_num = Self::undump_varint(r)?;
+        for _ in 0..loc_num {
+            let _name = Self::undump_string(r)?;
+            let _start_pc = Self::undump_varint(r)?;
+            let _end_pc = Self::undump_varint(r)?;
+        }
+
+        let upval_num = Self::undump_varint(r)?;
+        debug_assert_eq!(upval_num, nupval);
+        for up in ups.iter_mut().take(upval_num) {
+            up.name = Self::undump_string(r)?;
+        }
+
+        Ok(Proto {
+            vararg: is_vararg,
+            nparam: nparam,
+            nreg: nreg,
+            begline: begline as u32,
+            endline: endline as u32,
+            kst: kst,
+            code: code,
+            subfn: subfn,
+            pcline: Vec::new(),
+            source: src,
+            locvars: Vec::new(),
+            upvals: ups,
+        })
+    }
+
+    const DUMP_INT_BUFFER_SIZE: usize = std::mem::size_of::<usize>() * 8 / 7 + 1;
+    fn dump_varint(mut x: usize, bw: &mut BufWriter<impl Write>) -> std::io::Result<()> {
+        let mut buff = [0_u8; Self::DUMP_INT_BUFFER_SIZE];
+        let mut n = 0;
+        loop {
+            buff[n] = x as u8 & 0x7f;
+            x >>= 7;
+            if x == 0 {
+                buff[n] |= 0x80;
+                break;
+            }
+            n += 1;
+        }
+        bw.write_all(&buff[..n + 1])?;
+        Ok(())
+    }
+
+    fn dump_const(val: &LValue, w: &mut BufWriter<impl Write>) -> std::io::Result<()> {
+        match val {
+            LValue::Nil => {
+                w.write_all(&[0x00])?;
+            }
+            LValue::Bool(b) => {
+                if *b {
+                    w.write_all(&[0x11])?;
+                } else {
+                    w.write_all(&[0x1])?;
+                }
+            }
+            LValue::Int(i) => {
+                w.write_all(&[0x03])?;
+                unsafe { Self::dump_varint(std::mem::transmute(i), w)? }
+            }
+            LValue::Float(f) => {
+                w.write_all(&[0x13])?;
+                Self::dump_float(*f, w)?;
+            }
+            LValue::String(s) => {
+                if s.is_short() {
+                    w.write_all(&[0x04])?;
+                } else {
+                    w.write_all(&[0x14])?;
+                }
+                Self::dump_string(s.as_str(), w)?;
+            }
+            _ => unreachable!(),
+        };
+        Ok(())
+    }
+
+    fn undump_const(r: &mut BufReader<impl Read>) -> std::io::Result<LValue> {
+        let mut byte = [0; 1];
+        r.read_exact(&mut byte)?;
+        let val = match u8::from_ne_bytes(byte) {
+            0x00 => LValue::Nil,
+            0x01 => LValue::Bool(false),
+            0x11 => LValue::Bool(true),
+            0x03 => LValue::Int(unsafe { std::mem::transmute(Self::undump_varint(r)?) }),
+            0x13 => LValue::Float(Self::undump_float(r)?),
+            0x04 | 0x14 => LValue::from_wild(Self::undump_string(r)?.into()),
+            _ => unreachable!(),
+        };
+        Ok(val)
+    }
+
+    fn dump_string(s: &str, w: &mut BufWriter<impl Write>) -> std::io::Result<()> {
+        let len = s.len();
+        if len == 0 {
+            Self::dump_varint(0, w)?;
+        } else {
+            Self::dump_varint(len + 1, w)?;
+            w.write_all(s.as_bytes())?;
+        }
+        Ok(())
+    }
+
+    fn undump_string(r: &mut BufReader<impl Read>) -> std::io::Result<String> {
+        let len = Self::undump_varint(r)?;
+        if len == 0 {
+            Ok(String::with_capacity(StrImpl::EXTRA_HEADERS_SIZE))
+        } else {
+            let mut buf = String::with_capacity(len + StrImpl::EXTRA_HEADERS_SIZE);
+            let reallen = len - 1;
+            for _ in 0..reallen {
+                buf.push('\0');
+            }
+            r.read_exact(&mut unsafe { buf.as_bytes_mut() }[0..reallen])?;
+            Ok(buf)
+        }
+    }
+
+    fn undump_varint(buf: &mut BufReader<impl Read>) -> std::io::Result<usize> {
+        let mut x: usize = 0;
+        let mut n = 0;
+        loop {
+            let mut byte = [0_u8; 1];
+            buf.read_exact(&mut byte)?;
+            let byte = u8::from_ne_bytes(byte);
+            let pad = (byte & 0x7f) as usize;
+            x |= pad << (7 * n);
+            if (byte & 0x80) != 0 {
+                break;
+            }
+            n += 1;
+        }
+        Ok(x)
+    }
+
+    fn dump_float(f: f64, bw: &mut BufWriter<impl Write>) -> std::io::Result<()> {
+        Self::dump_varint(f.to_bits() as usize, bw)
+    }
+
+    fn undump_float(buf: &mut BufReader<impl Read>) -> std::io::Result<f64> {
+        Ok(f64::from_bits(Self::undump_varint(buf)? as u64))
     }
 }
 
 mod test {
+    use std::{
+        fmt::Debug,
+        fs::File,
+        io::{BufReader, BufWriter, Write},
+    };
 
     #[test]
     fn instruction_size_check() {
         use super::Instruction;
         assert_eq!(std::mem::size_of::<Instruction>(), 4);
+    }
+
+    fn dump_and_undump<W, R, T>(filename: &str, to_test: &[T], wop: W, rop: R)
+    where
+        W: Fn(&T, &mut BufWriter<File>),
+        R: Fn(&mut BufReader<File>) -> T,
+        T: Eq + Debug,
+    {
+        let tmpfile = {
+            let mut temp_dir = std::env::temp_dir();
+            temp_dir.push(filename);
+            temp_dir
+        };
+
+        for i in to_test.iter() {
+            let tmp_file = std::fs::File::create(tmpfile.clone()).unwrap();
+            let mut writer = BufWriter::new(tmp_file);
+            wop(i, &mut writer);
+            writer.flush().unwrap();
+
+            let same_file = std::fs::File::open(tmpfile.clone()).unwrap();
+            let mut reader = BufReader::new(same_file);
+            let k = rop(&mut reader);
+
+            debug_assert_eq!(*i, k);
+        }
+    }
+
+    #[test]
+    fn proto() {
+        use super::ChunkDumper;
+        use crate::parser::Parser;
+        use crate::state::State;
+        use std::io::{BufReader, BufWriter, Write};
+
+        let tmpfile = {
+            let mut temp_dir = std::env::temp_dir();
+            temp_dir.push("ruac.test.binary.proto");
+            temp_dir
+        };
+
+        // let src = r#"
+        //     local function f(a, b)
+        //         return a + b
+        //     end
+        // "#;
+
+        let src = r#"
+            print "Hello World"
+        "#;
+
+        let ast = Parser::parse(src, None).unwrap();
+        let origin = super::CodeGen::generate(ast, false).unwrap();
+        // println!("{:?}", origin);
+
+        let tmp_file = std::fs::File::create(tmpfile.clone()).unwrap();
+        let mut writer = BufWriter::new(tmp_file);
+        ChunkDumper::dump(&origin, &mut writer).unwrap();
+        writer.flush().unwrap();
+
+        let same_file = std::fs::File::open(tmpfile.clone()).unwrap();
+        let mut reader = BufReader::new(same_file);
+        let recover = ChunkDumper::undump(&mut reader).unwrap();
+        // println!("{:?}", recover);
+
+        let mut vm = State::new();
+        // TODO:
+        // load and execute origin and recover to check result
+        // vm.load(proto);
+    }
+
+    #[test]
+    fn string() {
+        use super::ChunkDumper;
+        let str_to_write = [
+            "123",
+            "",
+            "中文",
+            "ksta#$%^&*\x01\x46\r\n",
+            "longggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg string",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>();
+
+        dump_and_undump(
+            "ruac.test.binary.string",
+            &str_to_write,
+            |k, w| ChunkDumper::dump_string(k, w).unwrap(),
+            |r| ChunkDumper::undump_string(r).unwrap(),
+        );
+    }
+
+    #[test]
+    fn varint() {
+        use super::ChunkDumper;
+        let int_to_write = [999, 0, 1, 2, 3, 123, 999999, -1, -2, -999];
+        dump_and_undump(
+            "ruac.test.binary.varint",
+            &int_to_write.map(|x| x as usize),
+            |k, w| ChunkDumper::dump_varint(*k, w).unwrap(),
+            |r| ChunkDumper::undump_varint(r).unwrap(),
+        );
+    }
+
+    #[test]
+    fn float() {
+        use super::ChunkDumper;
+        use std::io::{BufReader, BufWriter, Write};
+        let tmpfile = {
+            let mut temp_dir = std::env::temp_dir();
+            temp_dir.push("ruac.test.binary.folat");
+            temp_dir
+        };
+
+        let flt_to_write = [0.01, 789.0, 449.7, -1000000.555];
+        for f in flt_to_write.into_iter() {
+            let tmp_file = std::fs::File::create(tmpfile.clone()).unwrap();
+            let mut writer = BufWriter::new(tmp_file);
+            ChunkDumper::dump_float(f, &mut writer).unwrap();
+            writer.flush().unwrap();
+
+            let same_file = std::fs::File::open(tmpfile.clone()).unwrap();
+            let mut reader = BufReader::new(same_file);
+            let r = ChunkDumper::undump_float(&mut reader).unwrap();
+            debug_assert_eq!(f, r);
+        }
     }
 }
