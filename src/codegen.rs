@@ -220,7 +220,7 @@ impl Instruction {
     const MAX_A: i32 = u8::MAX as i32; // 8 bit
     const MAX_B: i32 = Self::MAX_A; // 8 bit
     const MAX_C: i32 = Self::MAX_A; // 8 bit
-    const MAX_BX: i32 = 0x000F_FFF1; // 17 bit
+    const MAX_BX: i32 = 0x0001_FFFF; // 17 bit
     const MAX_SBX: i32 = Self::MAX_BX - 1; // 17 bit but signed
     const MAX_AX: i32 = 0x0FFF_FFF1; // 25 bit
     const MAX_SJ: i32 = Self::MAX_AX; // 25 bit
@@ -260,13 +260,11 @@ impl Instruction {
     }
 
     fn set_bx(code: &mut u32, bx: i32) {
-        debug_assert!(bx <= Self::MAX_BX);
         *code |= (bx as u32) << Self::OFFSET_BX;
     }
 
     fn set_sbx(code: &mut u32, sbx: i32) {
-        debug_assert!(sbx <= Self::MAX_SBX);
-        *code |= (sbx as u32) << Self::OFFSET_SBX;
+        Self::set_bx(code, sbx & 0x1_FFFF)
     }
 
     fn set_ax(code: &mut u32, ax: i32) {
@@ -367,7 +365,7 @@ impl Instruction {
     }
 
     fn get_sbx(&self) -> i32 {
-        ((self.code & Self::MASK_SBX) >> Self::OFFSET_SBX) as i32
+        (self.code as i32 & Self::MASK_SBX as i32) >> Self::OFFSET_SBX
     }
 
     fn get_ax(&self) -> i32 {
@@ -1747,6 +1745,20 @@ mod test {
         fs::File,
         io::{BufReader, BufWriter, Write},
     };
+
+    #[test]
+    fn instruction_build() {
+        use super::Isc;
+        use crate::codegen::OpMode;
+
+        for signed in [0, 1, 123, 999, -1, -999] {
+            let i = Isc::iasbx(super::OpCode::LOADI, 0, signed);
+            assert_eq!(i.mode(), OpMode::IAsBx);
+            let (_, a, sbx) = i.repr_asbx();
+            assert_eq!(a, 0);
+            assert_eq!(sbx, signed);
+        }
+    }
 
     #[test]
     fn instruction_size_check() {
