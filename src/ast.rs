@@ -231,9 +231,9 @@ pub enum Attribute {
     Close,
 }
 
-impl Into<u8> for Attribute {
-    fn into(self) -> u8 {
-        match self {
+impl From<Attribute> for u8 {
+    fn from(value: Attribute) -> Self {
+        match value {
             Attribute::Const => 0,
             Attribute::Close => 1,
         }
