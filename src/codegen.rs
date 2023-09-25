@@ -689,15 +689,15 @@ impl GenState {
         idx as i32
     }
 
-    /// Find value in constants and return its index
-    fn find_const_reg(&self, k: &LValue) -> Option<i32> {
-        for (idx, v) in self.ksts.iter().enumerate() {
-            if v == k {
-                return Some(idx as i32);
-            }
-        }
-        None
-    }
+    // /// Find value in constants and return its index
+    // fn find_const_reg(&self, k: &LValue) -> Option<i32> {
+    //     for (idx, v) in self.ksts.iter().enumerate() {
+    //         if v == k {
+    //             return Some(idx as i32);
+    //         }
+    //     }
+    //     None
+    // }
 
     /// Find string in constants and return its index
     fn find_const_str(&self, s: &str) -> Option<RegIndex> {
@@ -752,23 +752,6 @@ impl GenState {
         debug_assert!((upidx as usize) < self.upvals.len());
 
         todo!()
-    }
-
-    fn emit_rkc<F: FnOnce() -> (bool, RegIndex)>(
-        &mut self,
-        op: OpCode,
-        a: RegIndex,
-        b: RegIndex,
-        cstate: F,
-        ln: u32,
-    ) {
-        let (k, c) = cstate();
-        let code = if k {
-            Isc::iabck(op, a, b, c)
-        } else {
-            Isc::iabc(op, a, b, c)
-        };
-        self.emit(code, ln);
     }
 
     fn emit_local_decl(&mut self, name: String, status: ExprStatus, lineinfo: (u32, u32)) {
@@ -909,6 +892,8 @@ impl GenState {
 pub enum CodeGenErr {
     TooManyLocalVariable,
     RegisterOverflow,
+    RepeatedLable { lable: String },
+    NonexistedLable { lable: String },
 }
 
 /// Code generation pass
@@ -941,7 +926,7 @@ impl CodeGen {
         }
     }
 
-    fn consume(&mut self, mut ast_root: Block) -> Proto {
+    fn consume(&mut self, mut ast_root: Block) -> Result<Proto, CodeGenErr> {
         debug_assert_eq!(self.genstk.len(), 0);
 
         // take chunk name, construct an empty para list
@@ -950,13 +935,22 @@ impl CodeGen {
 
         let mut main = GenState::new(name);
         std::mem::swap(&mut main, &mut self.cgs);
-        let res = self.walk_fn_block(plist, ast_root);
+        let mut res = self.walk_fn_body(plist, ast_root, false)?;
+
+        if self.strip {
+            Self::strip_src_info(&mut res, Rc::new("?".to_string()))
+        }
 
         debug_assert_eq!(self.genstk.len(), 0);
-        res
+        Ok(res)
     }
 
-    fn walk_fn_block(&mut self, params: ParaList, body: Block) -> Proto {
+    fn walk_fn_body(
+        &mut self,
+        params: ParaList,
+        body: Block,
+        selfcall: bool,
+    ) -> Result<Proto, CodeGenErr> {
         // vararg
         if params.vargs {
             let nparam = params.namelist.len();
@@ -970,17 +964,22 @@ impl CodeGen {
             kind: None,
         });
 
+        // reserve space for self call
+        if selfcall {
+            let free = self.alloc_free_reg();
+            self.emit_local_decl("self".to_string(), ExprStatus::Reg(free), (0, 0));
+        }
+
         // statements
         for stmt in body.stats.into_iter() {
-            self.walk_stmt(stmt);
+            self.walk_stmt(stmt)?;
         }
 
         // return statement
-        self.walk_return(body.ret);
+        self.walk_return(body.ret)?;
 
         // strip debug infomation
         if self.strip {
-            let _ = std::mem::replace(&mut self.srcfile, Rc::new("?".to_string()));
             for loc in self.locals.iter_mut() {
                 let _ = std::mem::take(&mut loc.name);
             }
@@ -997,9 +996,7 @@ impl CodeGen {
                 let step = (*dest as i64) - pc as i64;
                 self.code[index].code = Isc::isj(OpCode::JMP, step as i32).code;
             } else {
-                // TODO:
-                // throw an error
-                unimplemented!()
+                return Err(CodeGenErr::NonexistedLable { lable });
             }
         }
 
@@ -1011,7 +1008,7 @@ impl CodeGen {
             .into_iter()
             .map(Gc::from)
             .collect();
-        Proto {
+        let res = Proto {
             vararg: params.vargs,
             nparam: params.namelist.len() as u8,
             nreg: self.regs as u8,
@@ -1024,14 +1021,22 @@ impl CodeGen {
             pcline: std::mem::take(&mut self.absline),
             locvars: std::mem::take(&mut self.locals),
             upvals: std::mem::take(&mut self.upvals),
-        }
+        };
+        Ok(res)
     }
 
-    fn walk_stmt(&mut self, stmt: StmtNode) {
+    fn strip_src_info(p: &mut Proto, anonymous: Rc<String>) {
+        p.source = anonymous.clone();
+        p.subfn
+            .iter_mut()
+            .for_each(|p| Self::strip_src_info(p, anonymous.clone()))
+    }
+
+    fn walk_stmt(&mut self, stmt: StmtNode) -> Result<(), CodeGenErr> {
         let lineinfo = stmt.lineinfo();
         match stmt.into_inner() {
             Stmt::Assign { vars, exprs } => {
-                self.walk_assign_stmt(vars, exprs);
+                self.walk_assign_stmt(vars, exprs)?;
             }
             Stmt::FuncCall(call) => {
                 let _ = self.walk_fncall(call, 0);
@@ -1039,8 +1044,7 @@ impl CodeGen {
             Stmt::Lable(lable) => {
                 let dest = self.cur_pc();
                 if self.lables.contains_key(&lable) {
-                    // TODO:
-                    // raise an error if lable repeated
+                    return Err(CodeGenErr::RepeatedLable { lable });
                 } else {
                     self.lables.insert(lable, dest);
                 }
@@ -1064,7 +1068,7 @@ impl CodeGen {
                 exp: _,
                 then: _,
                 els: _,
-            } => todo!(),
+            } => {}
             Stmt::NumericFor {
                 iter: _,
                 init: _,
@@ -1077,26 +1081,88 @@ impl CodeGen {
                 exprs: _,
                 body: _,
             } => todo!(),
-            Stmt::FnDef {
-                pres: _,
-                method: _,
-                body: _,
-            } => todo!(),
+            Stmt::FnDef { pres, method, body } => {
+                self.walk_func_def(pres, method, body, lineinfo)?;
+            }
             Stmt::LocalVarDecl { names, exprs } => {
-                self.walk_local_decl(names, exprs, lineinfo);
+                self.walk_local_decl(names, exprs, lineinfo)?;
             }
             Stmt::Expr(exp) => {
-                let _ = self.walk_common_expr(ExprNode::new(*exp, lineinfo), 0);
+                let _ = self.walk_common_expr(ExprNode::new(*exp, lineinfo), 0)?;
             }
         };
+        Ok(())
+    }
+
+    fn walk_func_def(
+        &mut self,
+        pres: Vec<String>,
+        method: Option<String>,
+        body: Box<crate::ast::FuncBody>,
+        lineinfo: (u32, u32),
+    ) -> Result<(), CodeGenErr> {
+        let kstidx = pres
+            .iter()
+            .map(|s| {
+                self.find_const_str(s).unwrap_or_else(|| {
+                    self.alloc_const_reg(LValue::from_wild(Gc::from(s.as_str())))
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let rootreg = if !pres.is_empty() {
+            // SAFETY: Length of pres has been checked
+            let root = unsafe { pres.first().unwrap_unchecked() };
+            let rootreg = if let Some(locidx) = self.find_local(root) {
+                locidx
+            } else if let Some(upidx) = self.find_up(root) {
+                let free = self.alloc_free_reg();
+                // SAFETY: Length of kstidx is same with pres
+                let kreg = unsafe { *kstidx.first().unwrap_unchecked() };
+                self.emit(Isc::iabc(OpCode::GETTABUP, free, upidx, kreg), lineinfo.0);
+                free
+            } else {
+                unreachable!()
+            };
+
+            // skip root index
+            for idx in kstidx.into_iter().skip(1) {
+                self.emit(
+                    Isc::iabc(OpCode::GETFIELD, rootreg, rootreg, idx),
+                    lineinfo.0,
+                );
+            }
+            Some(rootreg)
+        } else {
+            None
+        };
+
+        let fnreg = self.alloc_free_reg();
+        let pirdx = self.subproto.len();
+        let pro = self.walk_fn_body(body.params, *body.body, false)?;
+        self.subproto.push(pro);
+        self.emit(Isc::iabx(OpCode::CLOSURE, fnreg, pirdx as i32), lineinfo.0);
+
+        // method call, set field
+        if let Some(metd) = method {
+            debug_assert!(rootreg.is_some());
+            let metdkidx = self
+                .find_const_str(&metd)
+                .unwrap_or_else(|| self.alloc_const_reg(LValue::from_wild(Gc::from(metd))));
+            self.emit(
+                Isc::iabck(OpCode::SETFIELD, rootreg.unwrap(), metdkidx, metdkidx),
+                lineinfo.0,
+            );
+        }
+        Ok(())
     }
 
     fn walk_local_decl(
         &mut self,
         mut names: Vec<(String, Option<Attribute>)>,
-        mut exprs: Vec<crate::ast::WithSrcLoc<Expr>>,
+        mut exprs: Vec<ExprNode>,
         lineinfo: (u32, u32),
-    ) {
+    ) -> Result<(), CodeGenErr> {
         debug_assert!(!names.is_empty());
         debug_assert!(!exprs.is_empty());
 
@@ -1105,15 +1171,15 @@ impl CodeGen {
             // TODO:
             // add attribute support
             for (idx, (def, _attr)) in names.into_iter().enumerate() {
-                let status = exprs
-                    .get_mut(idx)
-                    .map(|e| self.walk_common_expr(std::mem::take(e), 1))
-                    .unwrap_or(ExprStatus::LitNil);
+                let status = {
+                    let e = exprs.get_mut(idx).unwrap();
+                    self.walk_common_expr(std::mem::take(e), 1)?
+                    // .unwrap_or(ExprStatus::LitNil);}
+                };
                 self.emit_local_decl(def, status, lineinfo);
             }
-
             for extra in exprs.into_iter().skip(nvar) {
-                let _ = self.walk_common_expr(extra, 0);
+                self.walk_common_expr(extra, 0)?;
             }
         } else {
             // SAFETY:
@@ -1121,7 +1187,7 @@ impl CodeGen {
             let last = unsafe { exprs.pop().unwrap_unchecked() };
 
             for (idx, e) in exprs.into_iter().enumerate() {
-                let status = self.walk_common_expr(e, 1);
+                let status = self.walk_common_expr(e, 1)?;
                 // TODO:
                 // add attribute support
                 let desc = unsafe { &mut names.get_mut(idx).unwrap_unchecked() };
@@ -1131,7 +1197,7 @@ impl CodeGen {
 
             let remain = names.iter().skip(nexp).count();
             debug_assert!(remain > 0);
-            let last_sta = self.walk_common_expr(last, remain);
+            let last_sta = self.walk_common_expr(last, remain)?;
             if let ExprStatus::Call(reg) = last_sta {
                 for (idx, (name, _attr)) in names.into_iter().skip(nexp).enumerate() {
                     self.emit_local_decl(name, ExprStatus::Reg(reg + idx as RegIndex), lineinfo);
@@ -1147,9 +1213,10 @@ impl CodeGen {
                 }
             }
         }
+        Ok(())
     }
 
-    fn walk_return(&mut self, ret: Option<Vec<ExprNode>>) {
+    fn walk_return(&mut self, ret: Option<Vec<ExprNode>>) -> Result<(), CodeGenErr> {
         if let Some(mut rets) = ret {
             match rets.len() {
                 1 => {
@@ -1157,7 +1224,7 @@ impl CodeGen {
                     let ret_node = unsafe { rets.pop().unwrap_unchecked() };
                     let line = ret_node.lineinfo().0;
 
-                    let status = self.walk_common_expr(ret_node, usize::MAX);
+                    let status = self.walk_common_expr(ret_node, usize::MAX)?;
                     let mut gen_lit_template = |op| {
                         let reg = self.alloc_free_reg();
                         self.emit(Isc::iabc(op, reg, 0, 0), line);
@@ -1210,9 +1277,10 @@ impl CodeGen {
         } else {
             self.emit(Isc::iabc(OpCode::RETURN0, 0, 0, 0), 0);
         }
+        Ok(())
     }
 
-    fn walk_fncall(&mut self, call: FuncCall, exp_ret: usize) -> ExprStatus {
+    fn walk_fncall(&mut self, call: FuncCall, exp_ret: usize) -> Result<ExprStatus, CodeGenErr> {
         match call {
             FuncCall::MethodCall {
                 prefix: _,
@@ -1225,7 +1293,7 @@ impl CodeGen {
                 let nparam = args.namelist.len();
                 let lineinfo = prefix.lineinfo();
 
-                let fnreg = match self.walk_common_expr(*prefix, 1) {
+                let fnreg = match self.walk_common_expr(*prefix, 1)? {
                     ExprStatus::Reg(reg) => reg,
                     ExprStatus::Up(upidx) => {
                         let reg = self.alloc_free_reg();
@@ -1246,7 +1314,7 @@ impl CodeGen {
                 for (posi, param) in args.namelist.into_iter().enumerate() {
                     let penode = ExprNode::new(param, (lineinfo.0, lineinfo.1 + (posi + 1) as u32));
                     let expect = if posi == nparam - 1 { usize::MAX } else { 1 };
-                    match self.walk_common_expr(penode, expect) {
+                    match self.walk_common_expr(penode, expect)? {
                         ExprStatus::Kst(k) => {
                             self.load_const(k, lineinfo.0);
                         }
@@ -1270,12 +1338,16 @@ impl CodeGen {
                     }
                 }
 
-                ExprStatus::Reg(fnreg)
+                Ok(ExprStatus::Reg(fnreg))
             }
         }
     }
 
-    fn walk_assign_stmt(&mut self, vars: Vec<WithSrcLoc<Expr>>, mut exprs: Vec<WithSrcLoc<Expr>>) {
+    fn walk_assign_stmt(
+        &mut self,
+        vars: Vec<WithSrcLoc<Expr>>,
+        mut exprs: Vec<WithSrcLoc<Expr>>,
+    ) -> Result<(), CodeGenErr> {
         debug_assert!(!vars.is_empty());
         debug_assert!(!exprs.is_empty());
 
@@ -1283,8 +1355,8 @@ impl CodeGen {
         if nvar <= exprs.len() {
             for (_idx, (var, exp)) in vars.into_iter().zip(exprs.iter_mut()).enumerate() {
                 let line = var.lineinfo().0;
-                let var_status = self.walk_common_expr(var, 1);
-                let expr_status = self.walk_common_expr(std::mem::take(exp), 1);
+                let var_status = self.walk_common_expr(var, 1)?;
+                let expr_status = self.walk_common_expr(std::mem::take(exp), 1)?;
                 if let ExprStatus::Reg(reg) = var_status {
                     match expr_status {
                         ExprStatus::LitNil => {
@@ -1326,18 +1398,24 @@ impl CodeGen {
             }
 
             for extra in exprs.into_iter().skip(nvar) {
-                let _ = self.walk_common_expr(extra, 0);
+                let _ = self.walk_common_expr(extra, 0)?;
             }
         } else {
+            todo!()
         }
+        Ok(())
     }
 
-    fn walk_common_expr(&mut self, node: ExprNode, expect_return: usize) -> ExprStatus {
+    fn walk_common_expr(
+        &mut self,
+        node: ExprNode,
+        expect_return: usize,
+    ) -> Result<ExprStatus, CodeGenErr> {
         let ln = node.lineinfo().0;
         let unique = Self::take_expr_unique(&node);
 
         if let Some(status) = self.exprstate.get(&unique) {
-            status.clone()
+            Ok(status.clone())
         } else {
             let status = match node.into_inner() {
                 Expr::Nil => ExprStatus::LitNil,
@@ -1372,40 +1450,42 @@ impl CodeGen {
                 Expr::Ident(id) => {
                     // local variable ?
                     if let Some(regidx) = self.find_local(&id) {
-                        return ExprStatus::Reg(regidx);
-                    }
+                        ExprStatus::Reg(regidx)
+                    } else if let Some(upidx) = self.find_up(&id) {
+                        // upvalue occurred ?
+                        ExprStatus::Up(upidx)
+                    } else {
+                        let mut state = None;
+                        // find in hestory stack
+                        for frame in self.genstk.iter().rev() {
+                            if let Some(regidx) = frame.find_local(&id) {
+                                self.upvals.push(UpValue {
+                                    name: id.clone(),
+                                    stkidx: Some(regidx),
+                                    kind: None,
+                                });
+                                state = Some(ExprStatus::Up(self.upvals.len() as i32 - 1));
+                                break;
+                            }
+                        }
 
-                    // upvalue occurred ?
-                    if let Some(upidx) = self.find_up(&id) {
-                        return ExprStatus::Up(upidx);
-                    }
-
-                    // find in hestory stack
-                    for frame in self.genstk.iter().rev() {
-                        if let Some(regidx) = frame.find_local(&id) {
+                        // if not found, acquire _ENV table, record upvalue's name
+                        state.unwrap_or_else(|| {
+                            // TODO:
+                            // support for variable with attribute
                             self.upvals.push(UpValue {
-                                name: id,
-                                stkidx: Some(regidx),
+                                name: id.clone(),
+                                stkidx: None,
                                 kind: None,
                             });
-                            return ExprStatus::Up(self.upvals.len() as i32 - 1);
-                        }
+                            self.alloc_const_reg(LValue::from_wild(Gc::from(id)));
+                            ExprStatus::Up(self.upvals.len() as i32 - 1)
+                        })
                     }
-
-                    // if not found, acquire _ENV table, record upvalue's name
-                    // TODO:
-                    // support for variable with attribute
-                    self.upvals.push(UpValue {
-                        name: id.clone(),
-                        stkidx: None,
-                        kind: None,
-                    });
-                    self.alloc_const_reg(LValue::from_wild(Gc::from(id)));
-                    ExprStatus::Up(self.upvals.len() as i32 - 1)
                 }
 
                 Expr::UnaryOp { op, expr } => {
-                    let es = self.walk_common_expr(*expr, 1);
+                    let es = self.walk_common_expr(*expr, 1)?;
                     let unop_code = match op {
                         UnOp::Minus => OpCode::UNM,
                         UnOp::Not => OpCode::NOT,
@@ -1422,8 +1502,8 @@ impl CodeGen {
 
                 Expr::BinaryOp { lhs, op, rhs } => {
                     let (lst, rst) = (
-                        self.walk_common_expr(*lhs, 1),
-                        self.walk_common_expr(*rhs, 1),
+                        self.walk_common_expr(*lhs, 1)?,
+                        self.walk_common_expr(*rhs, 1)?,
                     );
                     let destreg = self.alloc_free_reg();
 
@@ -1483,7 +1563,7 @@ impl CodeGen {
                 }
 
                 Expr::FuncDefine(def) => {
-                    let pto = self.walk_fn_block(def.params, *def.body);
+                    let pto = self.walk_fn_body(def.params, *def.body, false)?;
                     let pidx = self.subproto.len();
                     self.subproto.push(pto);
                     let reg = self.alloc_free_reg();
@@ -1493,9 +1573,10 @@ impl CodeGen {
 
                 Expr::Index { prefix, key } => {
                     let ln = prefix.lineinfo().0;
-                    let keys = self.walk_common_expr(WithSrcLoc::new(*key, prefix.lineinfo()), 1);
+                    let keys =
+                        self.walk_common_expr(WithSrcLoc::new(*key, prefix.lineinfo()), 1)?;
 
-                    match self.walk_common_expr(*prefix, 1) {
+                    match self.walk_common_expr(*prefix, 1)? {
                         ExprStatus::Reg(preg) => self.emit_index_local(keys, ln, preg),
                         ExprStatus::Up(upidx) => {
                             let reg = self.load_upval(upidx);
@@ -1506,27 +1587,31 @@ impl CodeGen {
                     }
                 }
 
-                Expr::FuncCall(call) => self.walk_fncall(call, expect_return),
+                Expr::FuncCall(call) => self.walk_fncall(call, expect_return)?,
 
-                Expr::TableCtor(flist) => self.walk_table_ctor(ln, flist),
+                Expr::TableCtor(flist) => self.walk_table_ctor(ln, flist)?,
                 Expr::Dots => unreachable!(),
             };
             self.exprstate.insert(unique, status.clone());
-            status
+            Ok(status)
         }
     }
 
-    fn walk_table_ctor(&mut self, ln: u32, flist: Vec<crate::ast::Field>) -> ExprStatus {
+    fn walk_table_ctor(
+        &mut self,
+        ln: u32,
+        flist: Vec<crate::ast::Field>,
+    ) -> Result<ExprStatus, CodeGenErr> {
         let tbidx = self.alloc_free_reg();
         self.emit(Isc::iabc(OpCode::NEWTABLE, tbidx, 0, 0), ln);
         self.emit(Isc::iax(OpCode::EXTRAARG, 0), ln);
 
         let mut aryidx = 1;
         for field in flist.into_iter() {
-            let valstatus = self.walk_common_expr(*field.val, 1);
+            let valstatus = self.walk_common_expr(*field.val, 1)?;
 
             if let Some(key) = field.key {
-                let keystatus = self.walk_common_expr(*key, 1);
+                let keystatus = self.walk_common_expr(*key, 1)?;
                 match keystatus {
                     ExprStatus::Kst(kidx) => {
                         if let ExprStatus::Kst(valreg) = valstatus {
@@ -1570,7 +1655,7 @@ impl CodeGen {
             }
             aryidx += 1;
         }
-        ExprStatus::Reg(tbidx)
+        Ok(ExprStatus::Reg(tbidx))
     }
 
     /// Find upvalue and return its index in upvalue list
@@ -1610,7 +1695,7 @@ impl CodeGen {
 impl CodeGen {
     pub fn generate(ast_root: Block, strip: bool) -> Result<Proto, CodeGenErr> {
         let mut gen = Self::new(strip);
-        Ok(gen.consume(ast_root))
+        gen.consume(ast_root)
     }
 }
 
@@ -1636,9 +1721,15 @@ impl ChunkDumper {
     const LUA_VERSION: u8 = 0x54;
 
     const LUAC_MAGIC: [u8; 6] = [0x19, 0x93, 0x0d, 0x0a, 0x1a, 0x0a];
-    const LUAC_FORMAT: u8 = 0; // standard luac format
-    const LUAC_INT: u64 = 0x5678; // from luac 5.4
-    const LUAC_FLOAT: f64 = 370.5; // from luac 5.4
+
+    // standard luac format
+    const LUAC_FORMAT: u8 = 0;
+
+    // from luac 5.4
+    const LUAC_INT: u64 = 0x5678;
+
+    // from luac 5.4
+    const LUAC_FLOAT: f64 = 370.5;
 
     pub fn dump(chunk: &Proto, bw: &mut BufWriter<impl Write>) -> std::io::Result<()> {
         bw.write_all(Self::LUA_SIGNATURE.as_bytes())?;
