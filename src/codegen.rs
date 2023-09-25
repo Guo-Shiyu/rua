@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, LinkedList},
+    collections::{btree_map::Entry, BTreeMap, LinkedList},
     fmt::{Debug, Display},
     io::{BufReader, BufWriter, Read, Write},
     ops::{Deref, DerefMut},
@@ -616,6 +616,8 @@ pub enum ExprStatus {
 
 /// Code generation intermidiate state for each Proto
 pub struct GenState {
+    pub lables: BTreeMap<String, u32>,          // map lable -> pc
+    pub jumpbp: Vec<(u32, String)>,             // jump backpatch, used for `goto`
     pub exprstate: BTreeMap<usize, ExprStatus>, // map expr_address -> expr reg status
     pub regs: usize,                            // current register count (vm stack length)
     pub ksts: Vec<LValue>,                      // constants
@@ -639,6 +641,8 @@ type Isc = Instruction;
 impl GenState {
     pub fn new(srcfile: Rc<String>) -> Self {
         Self {
+            lables: BTreeMap::new(),
+            jumpbp: Vec::default(),
             exprstate: BTreeMap::new(),
             regs: 0,
             ksts: Vec::with_capacity(4),
@@ -985,6 +989,19 @@ impl CodeGen {
             self.absline.clear();
         }
 
+        // backpatch goto
+        while let Some((pc, lable)) = self.jumpbp.pop() {
+            let index = pc as usize;
+            if let Some(dest) = self.lables.get(&lable) {
+                let step = (*dest as i64) - pc as i64;
+                self.code[index].code = Isc::isj(OpCode::JMP, step as i32).code;
+            } else {
+                // TODO:
+                // throw an error
+                unimplemented!()
+            }
+        }
+
         // TODO:
         // Check <close> variable and generate CLOSE instruction
         // Check <const> variable
@@ -1018,8 +1035,26 @@ impl CodeGen {
             Stmt::FuncCall(call) => {
                 let _ = self.walk_fncall(call, 0);
             }
-            Stmt::Lable(_) => todo!(),
-            Stmt::Goto(_) => todo!(),
+            Stmt::Lable(lable) => {
+                let dest = self.cur_pc();
+                if self.lables.contains_key(&lable) {
+                    // TODO:
+                    // raise an error if lable repeated
+                } else {
+                    self.lables.insert(lable, dest);
+                }
+            }
+            Stmt::Goto(lable) => {
+                if let Some(dest) = self.lables.get(&lable) {
+                    let step = (*dest as i64) - self.cur_pc() as i64;
+                    self.emit(Isc::isj(OpCode::JMP, step as i32), lineinfo.0);
+                } else {
+                    // set a placeholder in code series
+                    self.emit(Isc::isj(OpCode::JMP, 0), lineinfo.0);
+                    let pc = self.cur_pc();
+                    self.jumpbp.push((pc, lable));
+                }
+            }
             Stmt::Break => todo!(),
             Stmt::DoEnd(_) => todo!(),
             Stmt::While { exp: _, block: _ } => todo!(),
