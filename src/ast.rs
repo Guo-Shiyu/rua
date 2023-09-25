@@ -70,6 +70,11 @@ impl Block {
             ret,
         }
     }
+
+    /// Check self weither a empty block. (Empty block was created by ConstantFold.)
+    pub fn is_empty(&self) -> bool {
+        self.stats.is_empty() && self.ret.is_none()
+    }
 }
 
 /// stat ::=  `;` |
@@ -880,9 +885,30 @@ impl ConstantFoldPass {
                 Stmt::DoEnd(block) => self.run_on_bolck(block),
                 Stmt::While { exp: _, block } => self.run_on_bolck(block),
                 Stmt::Repeat { block, exp: _ } => self.run_on_bolck(block),
-                Stmt::IfElse { exp: _, then, els } => {
-                    self.run_on_bolck(then);
-                    self.run_on_bolck(els);
+                Stmt::IfElse { exp, then, els } => {
+                    let status = self.try_fold(exp);
+                    if let AfterFoldStatus::StillConst = status {
+                        match exp.inner_mut() {
+                            // if (false), remove then block
+                            Expr::Nil | Expr::False => {
+                                let _ = std::mem::take(&mut then.chunk);
+                                let _ = std::mem::take(&mut then.stats);
+                                let _ = then.ret.take();
+                            }
+
+                            // if-true, remove else block
+                            Expr::True | Expr::Int(_) | Expr::Float(_) | Expr::Literal(_) => {
+                                let _ = std::mem::take(&mut els.chunk);
+                                let _ = std::mem::take(&mut els.chunk);
+                                let _ = els.ret.take();
+                            }
+
+                            _ => {
+                                self.run_on_bolck(then);
+                                self.run_on_bolck(els);
+                            }
+                        };
+                    };
                 }
                 Stmt::NumericFor {
                     iter: _,
