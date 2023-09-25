@@ -1,5 +1,5 @@
 use std::{
-    collections::{btree_map::Entry, BTreeMap, LinkedList},
+    collections::{BTreeMap, LinkedList},
     fmt::{Debug, Display},
     io::{BufReader, BufWriter, Read, Write},
     ops::{Deref, DerefMut},
@@ -907,6 +907,7 @@ impl GenState {
 
 #[derive(Debug)]
 pub enum CodeGenErr {
+    TooManyLocalVariable,
     RegisterOverflow,
 }
 

@@ -329,7 +329,7 @@ impl UserDataImpl {
 }
 
 // usize: stack size after call
-pub type RsFunc = fn(&mut State) -> Result<usize, RuntimeErr>;
+pub type RsFunc = fn(&mut State) -> Result<usize, Box<dyn RuntimeErr>>;
 
 #[derive(Clone, Copy, Default)]
 pub enum LValue {

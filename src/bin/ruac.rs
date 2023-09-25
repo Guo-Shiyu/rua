@@ -2,7 +2,7 @@ use rua::{
     ast::{AstDumper, ConstantFoldPass, DumpPrecison, TransformPass},
     codegen::{ChunkDumper, CodeGen},
     parser::Parser,
-    LuaErr, StaticErr,
+    RuaErr, StaticErr,
 };
 
 struct CliArg {
@@ -75,14 +75,13 @@ impl CliArg {
     }
 }
 
-fn main() -> Result<(), LuaErr> {
+fn main() -> Result<(), RuaErr> {
     let args = CliArg::parse();
 
-    let src = std::fs::read_to_string(&args.input).map_err(LuaErr::IOErr)?;
+    let src = std::fs::read_to_string(&args.input).map_err(RuaErr::IOErr)?;
 
-    let mut ast = Parser::parse(&src, Some(args.input))
-        .map_err(StaticErr::SyntaxErr)
-        .map_err(LuaErr::CompileErr)?;
+    let mut ast =
+        Parser::parse(&src, Some(args.input)).map_err(|se| StaticErr::SyntaxErr(Box::new(se)))?;
 
     if args.parse_only {
         return Ok(());
@@ -91,7 +90,7 @@ fn main() -> Result<(), LuaErr> {
     if args.dump_stmt {
         let mut outer = std::io::BufWriter::new(std::io::stdout());
         return AstDumper::dump(&ast, DumpPrecison::Statement, &mut outer, false)
-            .map_err(LuaErr::IOErr);
+            .map_err(RuaErr::IOErr);
     };
 
     if args.optimize {
@@ -103,8 +102,7 @@ fn main() -> Result<(), LuaErr> {
     }
 
     let chunk = CodeGen::generate(ast, args.strip_debug)
-        .map_err(StaticErr::CodeGenErr)
-        .map_err(LuaErr::CompileErr)?;
+        .map_err(|ce| StaticErr::CodeGenErr(Box::new(ce)))?;
 
     if args.list > 0 {
         if args.list == 1 {
@@ -115,8 +113,8 @@ fn main() -> Result<(), LuaErr> {
     }
 
     let mut ruacout =
-        std::io::BufWriter::new(std::fs::File::create(&args.output).map_err(LuaErr::IOErr)?);
-    ChunkDumper::dump(&chunk, &mut ruacout).map_err(LuaErr::IOErr)?;
+        std::io::BufWriter::new(std::fs::File::create(&args.output).map_err(RuaErr::IOErr)?);
+    ChunkDumper::dump(&chunk, &mut ruacout).map_err(RuaErr::IOErr)?;
 
     Ok(())
 }

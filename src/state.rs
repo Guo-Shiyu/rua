@@ -8,15 +8,15 @@ use std::{
 };
 
 use crate::{
-    codegen::{CodeGen, Instruction, Proto},
+    codegen::{CodeGen, Instruction, OpCode, Proto},
     ffi::StdLib,
     heap::{Heap, ManagedHeap, Tag},
     parser::Parser,
     value::{AsTableKey, LValue, RsFunc, TableImpl},
-    StaticErr,
+    InvalidRegisterAccess, RuntimeErr, StackOverflow, StaticErr,
 };
 
-use super::LuaErr;
+use super::RuaErr;
 
 pub type RegIndex = i32;
 
@@ -58,7 +58,7 @@ impl Frame {
         unsafe { self.upvalues.0.offset(idx as isize).read() }
     }
 
-    pub fn rget(&self, idx: RegIndex) -> Result<LValue, RuntimeErr> {
+    pub fn rget(&self, idx: RegIndex) -> Result<LValue, Box<dyn RuntimeErr>> {
         match idx.cmp(&0) {
             Ordering::Less => {
                 let absidx = self.reg_top + idx;
@@ -66,7 +66,10 @@ impl Frame {
                     let val = unsafe { self.stk_base.offset(absidx as isize).read() };
                     Ok(val)
                 } else {
-                    Err(RuntimeErr::InvalidStackIndex)
+                    Err(Box::new(InvalidRegisterAccess {
+                        target: idx,
+                        max: self.reg_top,
+                    }))
                 }
             }
             Ordering::Greater | Ordering::Equal => {
@@ -75,7 +78,10 @@ impl Frame {
                     let val = unsafe { self.stk_base.offset(absidx as isize).read() };
                     Ok(val)
                 } else {
-                    Err(RuntimeErr::InvalidStackIndex)
+                    Err(Box::new(InvalidRegisterAccess {
+                        target: idx,
+                        max: self.reg_top,
+                    }))
                 }
             }
         }
@@ -96,15 +102,6 @@ pub enum HookMask {
     One,
     Two,
     Three,
-}
-
-#[derive(Debug)]
-pub enum RuntimeErr {
-    RecursionLimit,
-    StackOverflow,
-    InvalidStackIndex,
-    TableIndexIsNil,
-    WrongCallFuncValue,
 }
 
 pub struct Rvm {
@@ -135,7 +132,7 @@ impl DerefMut for Rvm {
 }
 
 impl Rvm {
-    pub const MAX_CALL_NUM: usize = 200; // recursion limit
+    pub const MAX_CALL_DEPTH: usize = 200; // recursion limit
     pub const MIN_STACK_SPACE: usize = 32; //min stack size
     pub const MAX_STACK_SPACE: usize = 256; // max stack limit
     pub const EXTRA_STACK_SPACE: usize = 8; // extra slot for error handling
@@ -192,8 +189,9 @@ impl Rvm {
         self.globaltab.get(k)
     }
 
-    pub fn stk_push(&mut self, val: LValue) -> Result<(), RuntimeErr> {
-        self.try_extend_stack()?;
+    pub fn stk_push(&mut self, val: LValue) -> Result<(), Box<dyn RuntimeErr>> {
+        self.try_extend_stack()
+            .map_err(|e| e as Box<dyn RuntimeErr>)?;
         self.stack.push(val);
         self.reg_top += 1;
         Ok(())
@@ -257,11 +255,11 @@ impl Rvm {
         }
     }
 
-    fn try_extend_stack(&mut self) -> Result<(), RuntimeErr> {
+    fn try_extend_stack(&mut self) -> Result<(), Box<StackOverflow>> {
         if self.stack.len() + Self::EXTRA_STACK_SPACE >= self.stack.capacity() {
             let need = self.stack.capacity() * 2;
             if need > Self::MAX_STACK_SPACE {
-                return Err(RuntimeErr::StackOverflow);
+                return Err(Box::new(StackOverflow()));
             }
             self.stack.reserve(need + Self::EXTRA_STACK_SPACE);
             self.correct_callinfo();
@@ -336,9 +334,9 @@ impl State {
         Heap::new(self.vm.get_mut(), &mut self.heap)
     }
 
-    pub fn context<O>(&mut self, op: O) -> Result<(), RuntimeErr>
+    pub fn context<O>(&mut self, op: O) -> Result<(), Box<dyn RuntimeErr>>
     where
-        O: FnOnce(&mut Rvm, &mut Heap) -> Result<(), RuntimeErr>,
+        O: FnOnce(&mut Rvm, &mut Heap) -> Result<(), Box<dyn RuntimeErr>>,
     {
         unsafe {
             op(
@@ -348,9 +346,9 @@ impl State {
         }
     }
 
-    pub fn vm_with<O>(&mut self, op: O) -> Result<(), RuntimeErr>
+    pub fn vm_with<O>(&mut self, op: O) -> Result<(), Box<dyn RuntimeErr>>
     where
-        O: FnOnce(&mut Rvm) -> Result<(), RuntimeErr>,
+        O: FnOnce(&mut Rvm) -> Result<(), Box<dyn RuntimeErr>>,
     {
         op(self.vm_view())
     }
@@ -380,12 +378,12 @@ impl State {
         }
     }
 
-    pub fn safe_script(&mut self, _src: &str) -> Result<(), LuaErr> {
+    pub fn safe_script(&mut self, _src: &str) -> Result<(), RuaErr> {
         todo!()
     }
 
     // Return the retval count of the script, and the val has pushed on the stack in return order.
-    pub fn script(&mut self, src: &str) -> Result<usize, LuaErr> {
+    pub fn script(&mut self, src: &str) -> Result<usize, RuaErr> {
         let preidx = self.top();
 
         self.load_str(src, Some("main".to_string()))?;
@@ -395,20 +393,20 @@ impl State {
         Ok((postidx - preidx) as usize)
     }
 
-    pub fn script_file(&mut self, file: &str) -> Result<usize, LuaErr> {
+    pub fn script_file(&mut self, file: &str) -> Result<usize, RuaErr> {
         let src = std::fs::read_to_string(file)?;
         self.script(&src)
     }
 
     /// Loads a Lua chunk without running it. If there are no errors, `load` pushes the compiled chunk as a Lua function on top of the stack.
-    pub fn load_str(&mut self, src: &str, chunkname: Option<String>) -> Result<(), LuaErr> {
+    pub fn load_str(&mut self, src: &str, chunkname: Option<String>) -> Result<(), RuaErr> {
         let proto = Self::compile(src, chunkname)?;
         let luaf = self.heap_view().alloc(proto);
         self.vm_view().stk_push(luaf)?;
         Ok(())
     }
 
-    pub fn load_file(&mut self, _filepath: &str) -> Result<(), LuaErr> {
+    pub fn load_file(&mut self, _filepath: &str) -> Result<(), RuaErr> {
         Ok(())
     }
 
@@ -416,7 +414,12 @@ impl State {
     //     todo!()
     // }
 
-    pub fn do_call(&mut self, fnidx: RegIndex, nin: i32, _nout: i32) -> Result<(), RuntimeErr> {
+    pub fn do_call(
+        &mut self,
+        fnidx: RegIndex,
+        nin: i32,
+        _nout: i32,
+    ) -> Result<(), Box<dyn RuntimeErr>> {
         let f = self.rget(fnidx)?;
         assert!(f.is_callable());
 
@@ -428,10 +431,11 @@ impl State {
             }
             LValue::Function(p) => {
                 self.vm_with(|vm| {
-                    if vm.callchain.len() > Rvm::MAX_CALL_NUM {
-                        Err(RuntimeErr::RecursionLimit)
+                    if vm.callchain.len() > Rvm::MAX_CALL_DEPTH {
+                        Err(Box::new(StackOverflow()))
                     } else if vm.stk_remain() < nin as usize {
                         vm.try_extend_stack()
+                            .map_err(|so| so as Box<dyn RuntimeErr>)
                     } else {
                         Ok(())
                     }
@@ -487,16 +491,16 @@ impl State {
                 println!("try to call a nil value");
                 todo!("error report")
             }
-            LValue::Bool(_) => {
-                println!("try to call a bool value");
+            LValue::Bool(b) => {
+                println!("try to call a bool value: {}", b);
                 todo!("error report")
             }
-            LValue::Int(_) => {
-                println!("try to call a int value");
+            LValue::Int(i) => {
+                println!("try to call a int value: {}", i);
                 todo!("error report")
             }
-            LValue::Float(_) => {
-                println!("try to call a float value");
+            LValue::Float(f) => {
+                println!("try to call a float value: {}", f);
                 todo!("error report")
             }
             LValue::String(sw) => println!("try to call a string value: {}", sw.as_str()),
@@ -542,17 +546,17 @@ impl State {
 
     fn pos_call(&mut self) {}
 
-    fn interpret(&mut self) -> Result<(), RuntimeErr> {
+    fn interpret(&mut self) -> Result<(), Box<dyn RuntimeErr>> {
         use super::codegen::OpCode::*;
         use super::codegen::OpMode;
 
         loop {
             let code = self.ci.iget();
-            // println!("{:?}", code);
+            // println!("{}", code);
 
             match code.mode() {
                 OpMode::IABC => {
-                    let (op, a, b, c, k) = code.repr_abck();
+                    let (op, a, b, c, _k) = code.repr_abck();
                     match op {
                         VARARGPREP => {
                             // TODO:
@@ -564,7 +568,18 @@ impl State {
                         }
 
                         MOVE => self.ci.rset(a, self.ci.rget(b)?),
+
                         CALL => self.do_call(a, b - 1, c)?,
+
+                        NEWTABLE => {
+                            debug_assert!(b >= 0 && c >= 0);
+                            let _table = self
+                                .heap_view()
+                                .alloc(TableImpl::with_capacity((b as usize, c as usize)));
+                        }
+
+                        SETFIELD => {}
+
                         RETURN0 => {}
                         _ => unimplemented!("unimplemented opcode: {:?}", op),
                     }
@@ -576,8 +591,21 @@ impl State {
                         _ => unimplemented!("unimplemented opcode: {:?}", op),
                     }
                 }
-                OpMode::IAsBx => todo!(),
-                OpMode::IAx => todo!(),
+                OpMode::IAsBx => {
+                    let (op, a, sbx) = code.repr_asbx();
+                    match op {
+                        LOADI => self.ci.rset(a, LValue::Int(sbx as i64)),
+                        LOADF => todo!(),
+                        _ => unimplemented!("IASBX"),
+                    }
+                }
+                OpMode::IAx => {
+                    let (op, _) = code.repr_ax();
+                    match op {
+                        OpCode::EXTRAARG => {}
+                        _ => unreachable!(),
+                    };
+                }
                 OpMode::IsJ => todo!(),
             }
             self.ci.pc += 1;
@@ -594,10 +622,10 @@ fn init_metatable() -> BTreeMap<Tag, TableImpl> {
     BTreeMap::new()
 }
 
-fn default_panicfn(_vm: &mut State) -> Result<usize, RuntimeErr> {
+fn default_panicfn(_vm: &mut State) -> Result<usize, Box<dyn RuntimeErr>> {
     todo!()
 }
 
-pub fn default_warnfn(_vm: &mut State) -> Result<usize, RuntimeErr> {
+pub fn default_warnfn(_vm: &mut State) -> Result<usize, Box<dyn RuntimeErr>> {
     todo!()
 }
