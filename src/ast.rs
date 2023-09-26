@@ -883,8 +883,14 @@ impl ConstantFoldPass {
                     }
                 },
                 Stmt::DoEnd(block) => self.run_on_bolck(block),
-                Stmt::While { exp: _, block } => self.run_on_bolck(block),
-                Stmt::Repeat { block, exp: _ } => self.run_on_bolck(block),
+                Stmt::While { exp, block } => {
+                    self.try_fold(exp);
+                    self.run_on_bolck(block);
+                }
+                Stmt::Repeat { block, exp } => {
+                    self.try_fold(exp);
+                    self.run_on_bolck(block)
+                }
                 Stmt::IfElse { exp, then, els } => {
                     let status = self.try_fold(exp);
                     if let AfterFoldStatus::StillConst = status {
@@ -903,25 +909,34 @@ impl ConstantFoldPass {
                                 let _ = els.ret.take();
                             }
 
-                            _ => {
-                                self.run_on_bolck(then);
-                                self.run_on_bolck(els);
-                            }
+                            _ => {}
                         };
                     };
+                    self.run_on_bolck(then);
+                    self.run_on_bolck(els);
                 }
                 Stmt::NumericFor {
                     iter: _,
-                    init: _,
-                    limit: _,
-                    step: _,
+                    init,
+                    limit,
+                    step,
                     body,
-                } => self.run_on_bolck(body),
+                } => {
+                    self.try_fold(init);
+                    self.try_fold(limit);
+                    self.try_fold(step);
+                    self.run_on_bolck(body)
+                }
                 Stmt::GenericFor {
                     iters: _,
-                    exprs: _,
+                    exprs,
                     body,
-                } => self.run_on_bolck(body),
+                } => {
+                    for exp in exprs.iter_mut() {
+                        self.try_fold(exp);
+                    }
+                    self.run_on_bolck(body)
+                }
                 Stmt::FnDef {
                     pres: _,
                     method: _,
