@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, LinkedList},
+    collections::{btree_map::Entry, BTreeMap, LinkedList},
     fmt::{Debug, Display},
     io::{BufReader, BufWriter, Read, Write},
     ops::{Deref, DerefMut},
@@ -404,6 +404,10 @@ impl Instruction {
     pub fn repr_sj(&self) -> (OpCode, i32) {
         (self.get_op(), self.get_sj())
     }
+
+    pub fn placeholder() -> Self {
+        Instruction { code: 0 }
+    }
 }
 
 impl OpCode {
@@ -617,7 +621,8 @@ pub enum ExprStatus {
 /// Code generation intermidiate state for each Proto
 pub struct GenState {
     pub lables: BTreeMap<String, u32>,          // map lable -> pc
-    pub jumpbp: Vec<(u32, String)>,             // jump backpatch, used for `goto`
+    pub jumpbp: Vec<(u32, String)>,             // jump backpatch (iscidx, lable), used for `goto`
+    pub loopbp: LinkedList<Vec<(u32, u32)>>,    // loop backpatch (iscidx, pc), used for `break`
     pub exprstate: BTreeMap<usize, ExprStatus>, // map expr_address -> expr reg status
     pub regs: usize,                            // current register count (vm stack length)
     pub ksts: Vec<LValue>,                      // constants
@@ -643,6 +648,7 @@ impl GenState {
         Self {
             lables: BTreeMap::new(),
             jumpbp: Vec::default(),
+            loopbp: LinkedList::default(),
             exprstate: BTreeMap::new(),
             regs: 0,
             ksts: Vec::with_capacity(4),
@@ -657,6 +663,21 @@ impl GenState {
 
     fn cur_pc(&self) -> u32 {
         self.code.len() as u32
+    }
+
+    fn enter_loop(&mut self) {
+        self.loopbp.push_back(Vec::default());
+    }
+
+    fn leave_loop(&mut self) {
+        let loop_end = self.code.len();
+        if let Some(bps) = self.loopbp.pop_back() {
+            for (iscidx, pc) in bps.into_iter() {
+                debug_assert!(self.code.get_mut(iscidx as usize).is_some());
+                let step = loop_end as i32 - pc as i32;
+                self.emit_backpatch(iscidx as usize, Isc::isj(OpCode::JMP, step));
+            }
+        }
     }
 
     fn emit(&mut self, inst: Instruction, line: u32) {
@@ -801,6 +822,16 @@ impl GenState {
         });
     }
 
+    fn set_recover_point(&mut self, line: u32) -> (usize, u32) {
+        let (forprep_idx, pc) = (self.code.len(), self.cur_pc());
+        self.emit(Isc::placeholder(), line);
+        (forprep_idx, pc)
+    }
+
+    fn emit_backpatch(&mut self, iscidx: usize, isc: Isc) {
+        self.code[iscidx] = isc;
+    }
+
     fn emit_index_local(&mut self, keys: ExprStatus, ln: u32, preg: i32) -> ExprStatus {
         let dest = self.alloc_free_reg();
         match keys {
@@ -855,12 +886,8 @@ impl GenState {
             }
             ExprStatus::LitInt(i) => {
                 let free = self.alloc_free_reg();
-                if i < Isc::MASK_SBX as i64 {
-                    self.emit(Isc::iasbx(OpCode::LOADI, free, i as i32), ln);
-                    free
-                } else {
-                    todo!("load big number to reg")
-                }
+                self.emit(Isc::iasbx(OpCode::LOADI, free, i as i32), ln);
+                free
             }
             ExprStatus::LitFlt(_f) => {
                 // let free = self.alloc_free_reg();
@@ -874,18 +901,23 @@ impl GenState {
         }
     }
 
-    fn gen_unary_const(&mut self, _op: OpCode, kidx: RegIndex, line: u32) -> ExprStatus {
+    fn emit_unary_const(&mut self, _op: OpCode, kidx: RegIndex, line: u32) -> ExprStatus {
         let sidx = self.alloc_free_reg();
         self.emit(Isc::iabx(OpCode::LOADK, sidx, kidx), line);
         self.emit(Isc::iabc(OpCode::UNM, sidx, sidx, 0), line);
         ExprStatus::Reg(sidx)
     }
 
-    fn gen_unary_reg(&mut self, _op: OpCode, reg: RegIndex, line: u32) -> ExprStatus {
+    fn emit_unary_reg(&mut self, _op: OpCode, reg: RegIndex, line: u32) -> ExprStatus {
         let sidx = self.alloc_free_reg();
         self.emit(Isc::iabc(OpCode::UNM, sidx, reg, 0), line);
         ExprStatus::Reg(sidx)
     }
+}
+
+struct BranchBackPatchPoint {
+    if_to_else_entry: (u32, u32),         // (instruction index, pc of cond),
+    then_exit_to_end: Option<(u32, u32)>, // (instruction index, pc),  else block is optional
 }
 
 #[derive(Debug)]
@@ -894,6 +926,7 @@ pub enum CodeGenErr {
     RegisterOverflow,
     RepeatedLable { lable: String },
     NonexistedLable { lable: String },
+    BreakNotInLoopBlock,
 }
 
 /// Code generation pass
@@ -970,24 +1003,7 @@ impl CodeGen {
             self.emit_local_decl("self".to_string(), ExprStatus::Reg(free), (0, 0));
         }
 
-        // statements
-        for stmt in body.stats.into_iter() {
-            self.walk_stmt(stmt)?;
-        }
-
-        // return statement
-        self.walk_return(body.ret)?;
-
-        // strip debug infomation
-        if self.strip {
-            for loc in self.locals.iter_mut() {
-                let _ = std::mem::take(&mut loc.name);
-            }
-            for up in self.upvals.iter_mut() {
-                let _ = std::mem::take(&mut up.name);
-            }
-            self.absline.clear();
-        }
+        self.walk_basic_block(body)?;
 
         // backpatch goto
         while let Some((pc, lable)) = self.jumpbp.pop() {
@@ -1025,11 +1041,30 @@ impl CodeGen {
         Ok(res)
     }
 
+    /// Strip debug infomation in proto.
     fn strip_src_info(p: &mut Proto, anonymous: Rc<String>) {
+        p.begline = 0;
+        p.endline = 0;
+
+        for up in p.upvals.iter_mut() {
+            let _ = std::mem::take(&mut up.name);
+        }
+
+        let _ = std::mem::take(&mut p.locvars);
+        let _ = std::mem::take(&mut p.pcline);
+
         p.source = anonymous.clone();
         p.subfn
             .iter_mut()
             .for_each(|p| Self::strip_src_info(p, anonymous.clone()))
+    }
+
+    fn walk_basic_block(&mut self, body: Block) -> Result<(), CodeGenErr> {
+        for stmt in body.stats.into_iter() {
+            self.walk_stmt(stmt)?;
+        }
+        self.walk_return(body.ret)?;
+        Ok(())
     }
 
     fn walk_stmt(&mut self, stmt: StmtNode) -> Result<(), CodeGenErr> {
@@ -1060,27 +1095,39 @@ impl CodeGen {
                     self.jumpbp.push((pc, lable));
                 }
             }
-            Stmt::Break => todo!(),
-            Stmt::DoEnd(_) => todo!(),
-            Stmt::While { exp: _, block: _ } => todo!(),
-            Stmt::Repeat { block: _, exp: _ } => todo!(),
-            Stmt::IfElse {
-                exp: _,
-                then: _,
-                els: _,
-            } => {}
+            Stmt::Break => {
+                let (idx, pc) = (self.code.len(), self.cur_pc());
+                if let Some(lop) = self.loopbp.back_mut() {
+                    lop.push((idx as u32, pc));
+                    self.emit(Isc::placeholder(), 0);
+                } else {
+                    return Err(CodeGenErr::BreakNotInLoopBlock);
+                }
+            }
+            Stmt::DoEnd(block) => {
+                self.walk_basic_block(*block)?;
+            }
+            Stmt::While { exp, block } => {
+                self.walk_while_loop(exp, block)?;
+            }
+            Stmt::Repeat { block, exp } => {
+                self.walk_repeat_loop(exp, block)?;
+            }
+            Stmt::IfElse { exp, then, els } => {
+                self.walk_branch_stmt(exp, then, els)?;
+            }
             Stmt::NumericFor {
-                iter: _,
-                init: _,
-                limit: _,
-                step: _,
-                body: _,
-            } => todo!(),
-            Stmt::GenericFor {
-                iters: _,
-                exprs: _,
-                body: _,
-            } => todo!(),
+                iter,
+                init,
+                limit,
+                step,
+                body,
+            } => {
+                self.walk_numberic_loop(init, limit, step, lineinfo, body, iter)?;
+            }
+            Stmt::GenericFor { iters, exprs, body } => {
+                self.walk_generic_for(iters, exprs, body, lineinfo)?;
+            }
             Stmt::FnDef { pres, method, body } => {
                 self.walk_func_def(pres, method, body, lineinfo)?;
             }
@@ -1091,6 +1138,214 @@ impl CodeGen {
                 let _ = self.walk_common_expr(ExprNode::new(*exp, lineinfo), 0)?;
             }
         };
+        Ok(())
+    }
+
+    fn walk_repeat_loop(
+        &mut self,
+        exp: Box<WithSrcLoc<Expr>>,
+        block: Box<Block>,
+    ) -> Result<(), CodeGenErr> {
+        let ln = exp.lineinfo().0;
+        self.enter_loop();
+        self.walk_basic_block(*block)?;
+        self.leave_loop();
+        let cond_reg = {
+            let s = self.walk_common_expr(*exp, 1)?;
+            self.try_load_expr_to_local(s, ln)
+        };
+        self.emit(Isc::iabc(OpCode::TEST, cond_reg, true as i32, 0), ln);
+        Ok(())
+    }
+
+    fn walk_while_loop(
+        &mut self,
+        exp: Box<WithSrcLoc<Expr>>,
+        block: Box<Block>,
+    ) -> Result<(), CodeGenErr> {
+        let ln = exp.lineinfo().0;
+        self.enter_loop();
+        let cond_reg = {
+            let s = self.walk_common_expr(*exp, 1)?;
+            self.try_load_expr_to_local(s, ln)
+        };
+        self.emit(Isc::iabc(OpCode::TEST, cond_reg, false as i32, 0), ln);
+        let loop_begin = self.set_recover_point(ln);
+        self.walk_basic_block(*block)?;
+        self.leave_loop();
+        let step = (self.cur_pc() - loop_begin.1) as i32;
+        self.emit_backpatch(loop_begin.0, Isc::isj(OpCode::JMP, step));
+        Ok(())
+    }
+
+    fn walk_numberic_loop(
+        &mut self,
+        init: Box<Expr>,
+        limit: Box<Expr>,
+        step: Box<Expr>,
+        lineinfo: (u32, u32),
+        body: Box<Block>,
+        iter: String,
+    ) -> Result<(), CodeGenErr> {
+        let loopline = (0, 0);
+        let mut init_reg = {
+            let s = self.walk_common_expr(WithSrcLoc::new(*init, loopline), 1)?;
+            self.try_load_expr_to_local(s, loopline.0)
+        };
+        let mut limit_reg = {
+            let s = self.walk_common_expr(WithSrcLoc::new(*limit, loopline), 1)?;
+            self.try_load_expr_to_local(s, loopline.0)
+        };
+        let mut step_reg = {
+            let s = self.walk_common_expr(WithSrcLoc::new(*step, loopline), 1)?;
+            self.try_load_expr_to_local(s, loopline.0)
+        };
+        let diff = (limit_reg - init_reg, step_reg - limit_reg);
+        if diff.0 != diff.1 || diff.0 != 1 {
+            let new_init = self.alloc_free_reg();
+            let new_limit = self.alloc_free_reg();
+            let new_step = self.alloc_free_reg();
+
+            let mut reset_loop_reg = |dest, src| {
+                self.emit(Isc::iabc(OpCode::MOVE, dest, src, 0), loopline.0);
+            };
+            reset_loop_reg(new_init, init_reg);
+            reset_loop_reg(new_limit, limit_reg);
+            reset_loop_reg(new_step, step_reg);
+            init_reg = new_init;
+            limit_reg = new_limit;
+            step_reg = new_step;
+        }
+        debug_assert!(step_reg - init_reg == 2);
+
+        let (forprep_idx, recover_pc) = self.set_recover_point(lineinfo.0);
+        let iter_reg = self.alloc_free_reg();
+        let iter_begin_pc = self.cur_pc();
+
+        // loop block
+        self.enter_loop();
+        self.walk_basic_block(*body)?;
+        self.leave_loop();
+
+        // loop end
+        self.emit(
+            Isc::iabc(OpCode::FORLOOP, init_reg, limit_reg, 0),
+            lineinfo.0,
+        );
+
+        let step = (self.cur_pc() - recover_pc) as i32;
+        self.emit_backpatch(forprep_idx, Isc::iabx(OpCode::FORPREP, init_reg, step));
+
+        let iter_end_pc = self.cur_pc();
+        self.locals.push(LocVar {
+            name: iter,
+            reg: iter_reg,
+            start_pc: iter_begin_pc,
+            end_pc: iter_end_pc,
+        });
+        Ok(())
+    }
+
+    fn walk_generic_for(
+        &mut self,
+        iters: Vec<String>,
+        exprs: Vec<Expr>,
+        body: Box<Block>,
+        lineinfo: (u32, u32),
+    ) -> Result<(), CodeGenErr> {
+        let niter = iters.len();
+
+        // alloc 4 register to store loop state
+        let state_reg = self.alloc_free_reg();
+        for _ in 0..3 {
+            self.alloc_free_reg();
+        }
+        let (iscidx, recover_pc) = self.set_recover_point(lineinfo.0);
+
+        // treat iters as local var decl
+        let vars = iters.into_iter().map(|name| (name, None)).collect();
+        let exprs = exprs
+            .into_iter()
+            .map(|e| WithSrcLoc::new(e, lineinfo))
+            .collect();
+        self.walk_local_decl(vars, exprs, lineinfo)?;
+
+        // loop body
+        self.enter_loop();
+        self.walk_basic_block(*body)?;
+
+        self.emit(
+            Isc::iabc(OpCode::TFORCALL, state_reg, 0, niter as i32),
+            lineinfo.0,
+        );
+        let step = (self.cur_pc() - recover_pc) as i32;
+        self.emit(Isc::iabx(OpCode::TFORLOOP, state_reg, step), lineinfo.0);
+        self.emit_backpatch(iscidx, Isc::iabx(OpCode::TFORPREP, state_reg, step - 2));
+        self.leave_loop();
+
+        // TODO:
+        // miss a CLOSE isc here.
+        Ok(())
+    }
+
+    fn walk_branch_stmt(
+        &mut self,
+        exp: Box<WithSrcLoc<Expr>>,
+        then: Box<Block>,
+        els: Box<Block>,
+    ) -> Result<(), CodeGenErr> {
+        let ln = exp.lineinfo().0;
+        let cond = self.walk_common_expr(*exp, 1)?;
+        let reg = match cond {
+            ExprStatus::LitNil | ExprStatus::LitFalse => {
+                return self.walk_basic_block(*els);
+            }
+
+            ExprStatus::LitTrue
+            | ExprStatus::LitInt(_)
+            | ExprStatus::LitFlt(_)
+            | ExprStatus::Kst(_) => {
+                return self.walk_basic_block(*then);
+            }
+            ExprStatus::Call(creg) => creg,
+            ExprStatus::Up(upidx) => self.load_upval(upidx),
+            ExprStatus::Reg(reg) => reg,
+        };
+
+        self.emit(Isc::iabc(OpCode::TEST, reg, 0, 0), ln);
+
+        let mut bpoint = BranchBackPatchPoint {
+            if_to_else_entry: (self.code.len() as u32, self.cur_pc()),
+            then_exit_to_end: None,
+        };
+        self.emit(Isc::placeholder(), ln);
+
+        self.walk_basic_block(*then)?;
+        let else_entry_recover_point = self.cur_pc();
+
+        if !els.is_empty() {
+            bpoint.then_exit_to_end = Some((self.code.len() as u32, self.cur_pc()));
+            self.walk_basic_block(*els)?;
+        }
+        let if_end_recover_point = self.cur_pc();
+
+        // back patch OpCode::JMP
+        debug_assert!(bpoint.if_to_else_entry.0 <= self.code.len() as u32);
+        self.code
+            .get_mut(bpoint.if_to_else_entry.0 as usize)
+            .map(|isc| {
+                Isc::set_sj(
+                    &mut isc.code,
+                    (else_entry_recover_point - bpoint.if_to_else_entry.1) as i32,
+                );
+            });
+
+        if let Some(te) = bpoint.then_exit_to_end {
+            self.code.get_mut(te.0 as usize).map(|isc| {
+                Isc::set_sj(&mut isc.code, (if_end_recover_point - te.1) as i32);
+            });
+        }
+
         Ok(())
     }
 
@@ -1494,8 +1749,8 @@ impl CodeGen {
                     };
 
                     match es {
-                        ExprStatus::Kst(kidx) => self.gen_unary_const(unop_code, kidx, ln),
-                        ExprStatus::Reg(reg) => self.gen_unary_reg(unop_code, reg, ln),
+                        ExprStatus::Kst(kidx) => self.emit_unary_const(unop_code, kidx, ln),
+                        ExprStatus::Reg(reg) => self.emit_unary_reg(unop_code, reg, ln),
                         _ => unreachable!(),
                     }
                 }
