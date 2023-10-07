@@ -5,21 +5,28 @@ use std::{
 
 #[derive(Default)]
 /// Warpper for an ast-node to attach source location info
-pub struct WithSrcLoc<T> {
-    node: T,
+pub struct SrcLoc<T> {
+    node: Box<T>,
     // lineinfo: (begin, end)
-    lineinfo: (u32, u32),
+    pub lineinfo: (u32, u32),
 }
 
-impl<T> WithSrcLoc<T> {
+impl<T> SrcLoc<T> {
     pub fn new(n: T, lines: (u32, u32)) -> Self {
-        WithSrcLoc {
+        SrcLoc {
             lineinfo: lines,
-            node: n,
+            node: Box::new(n),
         }
     }
 
-    pub fn into_inner(self) -> T {
+    pub fn from(n: Box<T>, lines: (u32, u32)) -> Self {
+        SrcLoc {
+            node: n,
+            lineinfo: lines,
+        }
+    }
+
+    pub fn into_inner(self) -> Box<T> {
         self.node
     }
 
@@ -31,23 +38,27 @@ impl<T> WithSrcLoc<T> {
         &mut self.node
     }
 
-    pub fn lineinfo(&self) -> (u32, u32) {
-        self.lineinfo
+    pub fn def_begin(&self) -> u32 {
+        self.lineinfo.0
+    }
+
+    pub fn def_end(&self) -> u32 {
+        self.lineinfo.1
     }
 
     pub fn mem_address(&self) -> usize {
-        self as *const Self as usize
+        self.node.as_ref() as *const T as usize
     }
 }
 
-impl<T> Deref for WithSrcLoc<T> {
+impl<T> Deref for SrcLoc<T> {
     type Target = T;
     fn deref(&self) -> &Self::Target {
         &self.node
     }
 }
 
-impl<T> DerefMut for WithSrcLoc<T> {
+impl<T> DerefMut for SrcLoc<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.node
     }
@@ -108,50 +119,40 @@ pub enum Stmt {
 
     Break,
 
-    DoEnd(Box<Block>),
+    DoEnd(BasicBlock),
 
     While {
-        exp: Box<ExprNode>,
-        block: Box<Block>,
+        exp: ExprNode,
+        block: BasicBlock,
     },
 
     Repeat {
-        block: Box<Block>,
-        exp: Box<ExprNode>,
+        block: BasicBlock,
+        exp: ExprNode,
     },
 
     IfElse {
-        exp: Box<ExprNode>,
-        then: Box<Block>,
-        els: Box<Block>,
+        cond: ExprNode,
+        then: BasicBlock,
+        els: Option<BasicBlock>,
     },
 
-    NumericFor {
-        iter: String,
-        init: Box<Expr>,
-        limit: Box<Expr>,
-        step: Box<Expr>,
-        body: Box<Block>,
-    },
+    NumericFor(Box<NumericFor>),
 
-    GenericFor {
-        iters: Vec<String>,
-        exprs: Vec<Expr>,
-        body: Box<Block>,
-    },
+    GenericFor(Box<GenericFor>),
 
     FnDef {
-        pres: Vec<String>,
-        method: Option<String>,
-        body: Box<FuncBody>,
+        pres: Vec<SrcLoc<String>>,
+        method: Option<SrcLoc<String>>,
+        body: SrcLoc<FuncBody>,
     },
 
     LocalVarDecl {
-        names: Vec<(String, Option<Attribute>)>,
+        names: Vec<(SrcLoc<String>, Option<Attribute>)>,
         exprs: Vec<ExprNode>,
     },
 
-    Expr(Box<Expr>),
+    Expr(ExprNode),
 }
 
 /// functioncall ::=  prefixexp args | prefixexp `:` Name args
@@ -164,15 +165,15 @@ pub enum Stmt {
 pub enum FuncCall {
     // i.e: func(1, 2, 3, ...)
     FreeFnCall {
-        prefix: Box<ExprNode>,
-        args: ParaList,
+        prefix: ExprNode,
+        args: SrcLoc<ParaList>,
     },
 
     // i.e: class:func(1, 2, 3, ...)
     MethodCall {
-        prefix: Box<ExprNode>,
-        method: String,
-        args: ParaList,
+        prefix: ExprNode,
+        method: SrcLoc<String>,
+        args: SrcLoc<ParaList>,
     },
 }
 
@@ -181,9 +182,22 @@ pub enum FuncCall {
 /// paralist ::= namelist [`,` `...`] | `...`
 pub struct FuncBody {
     pub params: ParaList,
-    pub body: Box<Block>,
+    pub body: BasicBlock,
 }
 
+pub struct NumericFor {
+    pub iter: SrcLoc<String>,
+    pub init: ExprNode,
+    pub limit: ExprNode,
+    pub step: ExprNode,
+    pub body: BasicBlock,
+}
+
+pub struct GenericFor {
+    pub iters: Vec<SrcLoc<String>>,
+    pub exprs: Vec<ExprNode>,
+    pub body: BasicBlock,
+}
 /// exp ::=  nil | false | true | Numeral | LiteralString | `...` |
 ///     functiondef | prefixexp | tablector |
 ///     exp binop exp | unop exp
@@ -247,13 +261,7 @@ impl From<Attribute> for u8 {
 
 pub struct ParaList {
     pub vargs: bool,
-    pub namelist: Vec<Expr>,
-}
-
-impl ParaList {
-    pub fn new(vargs: bool, namelist: Vec<Expr>) -> Self {
-        ParaList { vargs, namelist }
-    }
+    pub namelist: Vec<ExprNode>,
 }
 
 /// field ::= `[` exp `]` `=` exp | Name `=` exp | exp
@@ -295,8 +303,9 @@ pub enum UnOp {
     BitNot,
 }
 
-pub type ExprNode = WithSrcLoc<Expr>;
-pub type StmtNode = WithSrcLoc<Stmt>;
+pub type ExprNode = SrcLoc<Expr>;
+pub type StmtNode = SrcLoc<Stmt>;
+pub type BasicBlock = SrcLoc<Block>;
 
 pub trait PassRunStatus {
     fn is_ok(&self) -> bool;
@@ -475,13 +484,13 @@ impl AstDumper {
 
             Stmt::Lable(name) => self.write_lable(buf, COLLAPSE).and_then(|_| {
                 self.write_name(buf, "Lable", this)?;
-                write!(buf, "name: {}", name,)?;
+                write!(buf, "name: {}", name.as_str(),)?;
                 self.write_lineinfo(buf, stmt.lineinfo.0)
             }),
 
             Stmt::Goto(lable) => self.write_lable(buf, COLLAPSE).and_then(|_| {
                 self.write_name(buf, "Goto", this)?;
-                write!(buf, "lable: {}", lable,)?;
+                write!(buf, "lable: {}", lable.as_str(),)?;
                 self.write_lineinfo(buf, stmt.lineinfo.0)
             }),
 
@@ -546,7 +555,7 @@ impl AstDumper {
                         buf,
                         "prefix: {}, method: {}, vararg:{}, positional-args-num: {:x}",
                         Self::inspect(prefix.inner()),
-                        method,
+                        method.as_str(),
                         args.vargs,
                         args.namelist.len(),
                     )?;
@@ -599,7 +608,11 @@ impl AstDumper {
                 Ok(())
             }
 
-            Stmt::IfElse { exp, then, els } => {
+            Stmt::IfElse {
+                cond: exp,
+                then,
+                els,
+            } => {
                 self.write_lable(buf, '+').and_then(|_| {
                     self.write_name(buf, "IfElseEnd", this)?;
                     write!(
@@ -619,52 +632,47 @@ impl AstDumper {
                     self.dec_indent();
                 }
 
-                if !els.stats.is_empty() {
+                if els.is_some() {
                     self.inc_indent();
-                    self.dump_block(els, buf)?;
+                    self.dump_block(&els.unwrap(), buf)?;
                     self.dec_indent();
                 }
 
                 Ok(())
             }
 
-            Stmt::NumericFor {
-                iter: name,
-                init,
-                limit,
-                step,
-                body,
-            } => {
+            Stmt::NumericFor(numfor) => {
                 self.write_lable(buf, '+')?;
                 self.write_name(buf, "NumericFor", this)?;
                 write!(
                     buf,
                     "name: {}, init: {}, limit: {}, step: {}",
-                    name,
-                    Self::inspect(init),
-                    Self::inspect(limit),
-                    Self::inspect(step),
+                    numfor.iter.as_str(),
+                    Self::inspect(&numfor.init),
+                    Self::inspect(&numfor.limit),
+                    Self::inspect(&numfor.step),
                 )?;
 
                 self.write_lineinfo(buf, stmt.lineinfo.0)?;
 
                 self.inc_indent();
-                self.dump_block(body, buf)?;
+                self.dump_block(&numfor.body, buf)?;
                 self.dec_indent();
                 Ok(())
             }
-            Stmt::GenericFor {
-                iters: names,
-                exprs,
-                body,
-            } => {
+            Stmt::GenericFor(genfor) => {
                 self.write_lable(buf, '+')?;
                 self.write_name(buf, "GenericFor", this)?;
-                write!(buf, "names: {:?}, exprs-num: {}", names, exprs.len(),)?;
+                write!(
+                    buf,
+                    "names: {:?}, exprs-num: {}",
+                    genfor.iters.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                    genfor.exprs.len(),
+                )?;
                 self.write_lineinfo(buf, stmt.lineinfo.0)?;
 
                 self.inc_indent();
-                self.dump_block(body, buf)?;
+                self.dump_block(&genfor.body, buf)?;
                 self.dec_indent();
                 Ok(())
             }
@@ -681,7 +689,7 @@ impl AstDumper {
                     buf,
                     "prefix:{:?}, method: {:?}, def: 0x{:x}",
                     prefixs,
-                    method,
+                    method.as_ref().map(|s| s.as_str()),
                     Self::mem_address(def),
                 )?;
                 self.write_lineinfo(buf, stmt.lineinfo.0)?;
@@ -860,7 +868,7 @@ impl ConstantFoldPass {
 
     fn run_on_bolck(&mut self, root: &mut Block) {
         for stmt in root.stats.iter_mut() {
-            match &mut stmt.node {
+            match stmt.inner_mut() {
                 Stmt::Assign { vars: _, exprs } => {
                     exprs.iter_mut().for_each(|e| {
                         self.try_fold(e);
@@ -891,7 +899,11 @@ impl ConstantFoldPass {
                     self.try_fold(exp);
                     self.run_on_bolck(block)
                 }
-                Stmt::IfElse { exp, then, els } => {
+                Stmt::IfElse {
+                    cond: exp,
+                    then,
+                    els,
+                } => {
                     let status = self.try_fold(exp);
                     if let AfterFoldStatus::StillConst = status {
                         match exp.inner_mut() {
@@ -904,38 +916,26 @@ impl ConstantFoldPass {
 
                             // if-true, remove else block
                             Expr::True | Expr::Int(_) | Expr::Float(_) | Expr::Literal(_) => {
-                                let _ = std::mem::take(&mut els.chunk);
-                                let _ = std::mem::take(&mut els.chunk);
-                                let _ = els.ret.take();
+                                *els = None;
                             }
 
                             _ => {}
                         };
                     };
                     self.run_on_bolck(then);
-                    self.run_on_bolck(els);
+                    els.map(|mut bk| self.run_on_bolck(&mut bk));
                 }
-                Stmt::NumericFor {
-                    iter: _,
-                    init,
-                    limit,
-                    step,
-                    body,
-                } => {
-                    self.try_fold(init);
-                    self.try_fold(limit);
-                    self.try_fold(step);
-                    self.run_on_bolck(body)
+                Stmt::NumericFor(num) => {
+                    self.try_fold(&mut num.init);
+                    self.try_fold(&mut num.limit);
+                    self.try_fold(&mut num.step);
+                    self.run_on_bolck(&mut num.body)
                 }
-                Stmt::GenericFor {
-                    iters: _,
-                    exprs,
-                    body,
-                } => {
-                    for exp in exprs.iter_mut() {
+                Stmt::GenericFor(gen) => {
+                    for exp in gen.exprs.iter_mut() {
                         self.try_fold(exp);
                     }
-                    self.run_on_bolck(body)
+                    self.run_on_bolck(&mut gen.body)
                 }
                 Stmt::FnDef {
                     pres: _,
