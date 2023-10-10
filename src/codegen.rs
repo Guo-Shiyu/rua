@@ -1,15 +1,14 @@
 use std::{
-    collections::{btree_map::Entry, BTreeMap, LinkedList},
+    collections::{BTreeMap, LinkedList},
     fmt::{Debug, Display},
     io::{BufReader, BufWriter, Read, Write},
     ops::{Deref, DerefMut},
-    rc::Rc,
 };
 
 use crate::{
     ast::{
-        Attribute, BinOp, Block, Expr, ExprNode, FuncCall, ParaList, Stmt, StmtNode, UnOp,
-        WithSrcLoc,
+        Attribute, BasicBlock, BinOp, Block, Expr, ExprNode, Field, FuncBody, FuncCall, GenericFor,
+        NumericFor, ParaList, SrcLoc, Stmt, UnOp,
     },
     heap::{Gc, Heap, HeapMemUsed},
     state::RegIndex,
@@ -110,7 +109,7 @@ pub struct Instruction {
 ///  metamethods.)
 
 #[repr(u8)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum OpCode {
     MOVE,       //  A B       R[A] := R[B]
     LOADI,      //  A sBx     R[A] := sBx
@@ -239,7 +238,7 @@ impl Instruction {
     const MASK_SJ: u32 = Self::MASK_AX;
 
     fn set_op(code: &mut u32, op: OpCode) {
-        debug_assert!(op as u8 <= OpCode::EXTRAARG as u8);
+        debug_assert!(op as u8 <= EXTRAARG as u8);
         *code |= (op as u32) << Self::OFFSET_OP;
     }
 
@@ -413,15 +412,10 @@ impl Instruction {
 impl OpCode {
     pub fn mode(&self) -> OpMode {
         match &self {
-            OpCode::LOADK
-            | OpCode::FORLOOP
-            | OpCode::FORPREP
-            | OpCode::TFORPREP
-            | OpCode::TFORLOOP
-            | OpCode::CLOSURE => OpMode::IABx,
-            OpCode::LOADI | OpCode::LOADF => OpMode::IAsBx,
-            OpCode::JMP => OpMode::IsJ,
-            OpCode::EXTRAARG => OpMode::IAx,
+            LOADK | FORLOOP | FORPREP | TFORPREP | TFORLOOP | CLOSURE => OpMode::IABx,
+            LOADI | LOADF => OpMode::IAsBx,
+            JMP => OpMode::IsJ,
+            EXTRAARG => OpMode::IAx,
             _ => OpMode::IABC,
         }
     }
@@ -462,11 +456,27 @@ impl Display for Instruction {
     }
 }
 
-/// Upval in _ENV table or stack.
-pub struct UpValue {
-    name: String,             // for debug infomation
-    stkidx: Option<RegIndex>, // stack index
-    kind: Option<Attribute>,  // close / const ...
+/// Upval information (in runtime)
+#[derive(Clone)]
+pub enum UpvalDecl {
+    // upvalue is outter function's local variable
+    OnStack { name: String, register: RegIndex },
+
+    // upvalue in outter function's upvalue list
+    InUpList { name: String, offset: RegIndex },
+
+    // _ENV itself
+    Env,
+}
+
+impl UpvalDecl {
+    fn name(&self) -> &str {
+        match self {
+            UpvalDecl::OnStack { name, register: _ } => name.as_str(),
+            UpvalDecl::InUpList { name, offset: _ } => name.as_str(),
+            UpvalDecl::Env => "_ENV",
+        }
+    }
 }
 
 /// Lua Function Prototype
@@ -482,10 +492,10 @@ pub struct Proto {
     code: Vec<Instruction>, // bytecodes
     subfn: Vec<Gc<Proto>>,  // sub functions
     pcline: Vec<u32>,       // line number of each instruction
+    updecl: Vec<UpvalDecl>, // upvalue information
 
-    source: Rc<String>,   // source file name, used for debug info
-    locvars: Vec<LocVar>, // local variable name, used for debug info
-    upvals: Vec<UpValue>, // upvalue name, used for debug info
+    source: LValue,           // source file name, used for debug info
+    locvars: Vec<LocVarDecl>, // local variable name, used for debug info
 }
 
 impl HeapMemUsed for Proto {
@@ -496,74 +506,55 @@ impl HeapMemUsed for Proto {
             + self.subfn.capacity()
             + self.pcline.capacity()
             + self.locvars.capacity()
-            + self.upvals.capacity()
-            + self.source.capacity()
+            + self.updecl.capacity()
     }
 }
 
 impl Display for Proto {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(
-            f,
-            "function <{}:{},{}> ({} instructions at 0x{:X})",
-            self.source.as_str(),
-            self.begline,
-            self.endline,
-            self.code.len(),
-            self as *const Proto as usize
-        )?;
-
-        if self.vararg {
-            f.write_str("0+ params, ")?;
-        } else {
-            write!(f, "{} params, ", self.nparam)?;
+        self.display_fmt(f)?;
+        for each in self.subfn.iter() {
+            writeln!(f)?;
+            each.display_fmt(f)?;
         }
-
-        writeln!(
-            f,
-            "{} slots, {} upvalue, {} locals, {}, constants, {} functions",
-            self.nreg,
-            self.upvals.len(),
-            self.locvars.len(),
-            self.kst.len(),
-            self.subfn.len()
-        )?;
-        for (idx, code) in self.code.iter().enumerate() {
-            let line = self.pcline.get(idx).unwrap_or(&0);
-            writeln!(f, "\t{idx}\t[{}]\t{:?>8} ;", line, code)?;
-        }
-
         Ok(())
     }
 }
 
 impl Debug for Proto {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "{}", self)?;
-        let self_addr = self as *const Proto as usize;
-        writeln!(f, "{} constants for 0x{:X}", self.kst.len(), self_addr)?;
-        for (idx, k) in self.kst.iter().enumerate() {
-            writeln!(f, "\t{idx}\t{k}")?;
+        self.debug_fmt(f)?;
+        for each in self.subfn.iter() {
+            writeln!(f)?;
+            each.debug_fmt(f)?;
         }
-
-        writeln!(f, "{} locals for 0x{:X}", self.locvars.len(), self_addr)?;
-        for (idx, loc) in self.locvars.iter().enumerate() {
-            writeln!(f, "\t{idx}\t\"{}\"", loc.name.as_str())?;
-        }
-
-        writeln!(f, "{} upvalues for 0x{:X}", self.upvals.len(), self_addr)?;
-        for (idx, up) in self.upvals.iter().enumerate() {
-            writeln!(f, "\t{idx}\t\"{}\"", up.name.as_str())?;
-        }
-
         Ok(())
     }
 }
 
 impl Proto {
     pub fn delegate_to(p: &mut Proto, heap: &mut Heap) {
-        for k in p.kst.iter_mut() {
-            heap.delegate(k);
+        heap.delegate(p.source);
+
+        // for up in p.updecl.iter().skip(1) {
+        //     match up {
+        //         UpvalDecl::OnStack {
+        //             name,
+        //             parent_upidx: _,
+        //         } => heap.delegate(*name),
+        //         UpvalDecl::InEnv {
+        //             name,
+        //             self_upidx: _,
+        //         } => heap.delegate(*name),
+        //         UpvalDecl::Env => {
+        //             unreachable!()
+        //         }
+        //     }
+        // }
+
+        for k in p.kst.iter() {
+            println!("{}", k);
+            heap.delegate(*k);
         }
 
         for sub in p.subfn.iter_mut() {
@@ -596,13 +587,74 @@ impl Proto {
         // self.upvals.as_ref().map_or(&[], |v| v.as_slice())
         &[]
     }
+
+    fn basic_fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+        debug_assert!(self.source.is_str());
+        writeln!(
+            f,
+            "function <{}:{},{}> ({} instructions at 0x{:X})",
+            self.source,
+            self.begline,
+            self.endline,
+            self.code.len(),
+            self as *const Proto as usize
+        )?;
+        if self.vararg {
+            f.write_str("vararg params, ")?;
+        } else {
+            write!(f, "{} params, ", self.nparam)?;
+        }
+        writeln!(
+            f,
+            "{} slots, {} upvalue, {} locals, {}, constants, {} functions",
+            self.nreg,
+            self.updecl.len(),
+            self.locvars.len(),
+            self.kst.len(),
+            self.subfn.len()
+        )?;
+
+        for (idx, code) in self.code.iter().enumerate() {
+            let line = self.pcline.get(idx).unwrap_or(&0);
+            writeln!(f, "\t{idx}\t[{}]\t{:?>8} ;", line, code)?;
+        }
+
+        Ok(())
+    }
+
+    fn debug_fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+        self.basic_fmt(f)?;
+
+        let self_addr = self as *const Proto as usize;
+        writeln!(f, "{} constants for 0x{:X}", self.kst.len(), self_addr)?;
+        for (idx, k) in self.kst.iter().enumerate() {
+            writeln!(f, "\t{idx}\t{k}")?;
+        }
+
+        writeln!(f, "{} locals for 0x{:X}", self.locvars.len(), self_addr)?;
+        for (idx, loc) in self.locvars.iter().enumerate() {
+            writeln!(f, "\t{idx}\t\"{}\"", loc.name.as_str())?;
+        }
+
+        writeln!(f, "{} upvalues for 0x{:X}", self.updecl.len(), self_addr)?;
+        for (idx, up) in self.updecl.iter().enumerate() {
+            writeln!(f, "\t{idx}\t\"{}\"", up.name())?;
+        }
+
+        Ok(())
+    }
+
+    fn display_fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+        self.basic_fmt(f)
+    }
 }
 
-pub struct LocVar {
+#[derive(Default)]
+pub struct LocVarDecl {
     name: String,
     reg: RegIndex, // register index on stack
-    start_pc: u32, // first point where variable is active
-    end_pc: u32,   // first point where variable is dead
+    start_pc: u32, // first pc where variable is active
+    end_pc: u32,   // first pc where variable is dead
 }
 
 #[derive(Clone)]
@@ -612,31 +664,32 @@ pub enum ExprStatus {
     LitFalse,
     LitInt(i64),
     LitFlt(f64),
-    Call(RegIndex), // function index in local register
-    Kst(RegIndex),  // index in constants (int / float / string)
-    Reg(RegIndex),  // result has stored in local register
-    Up(i32),        // expr refers to a upvalue (index in upvalue list)
+    Call(RegIndex), // register index of first return value
+    Kst(RegIndex),  // index of constants
+    Reg(RegIndex),  // index of local register
 }
+
+use OpCode::*;
 
 /// Code generation intermidiate state for each Proto
 pub struct GenState {
-    pub lables: BTreeMap<String, u32>,          // map lable -> pc
-    pub jumpbp: Vec<(u32, String)>,             // jump backpatch (iscidx, lable), used for `goto`
-    pub loopbp: LinkedList<Vec<(u32, u32)>>,    // loop backpatch (iscidx, pc), used for `break`
-    pub exprstate: BTreeMap<usize, ExprStatus>, // map expr_address -> expr reg status
-    pub regs: usize,                            // current register count (vm stack length)
-    pub ksts: Vec<LValue>,                      // constants
-    pub upvals: Vec<UpValue>,                   // upvalue name
-    pub code: Vec<Instruction>,                 // byte code
-    pub subproto: Vec<Proto>,                   // sub functions
-    pub locals: Vec<LocVar>,                    // local variable name
-    pub srcfile: Rc<String>,                    // source file name
-    pub absline: Vec<u32>,                      // line number of each bytecode
+    pub lables: BTreeMap<String, u32>,       // map lable -> pc
+    pub jumpbp: Vec<(u32, String)>,          // jump backpatch (iscidx, lable), used for `goto`
+    pub loopbp: LinkedList<Vec<(u32, u32)>>, // loop backpatch (iscidx, pc), used for `break`
+    pub regs: RegIndex,                      // current register count (vm stack length)
+    pub ksts: Vec<LValue>,                   // constants
+    pub upvals: Vec<UpvalDecl>,              // upvalue declration
+    pub code: Vec<Instruction>,              // byte code
+    pub subproto: Vec<Proto>,                // sub functions
+    pub locstate: Vec<Vec<LocVarDecl>>,      // local variable infomation for each basic block
+    pub local: Vec<LocVarDecl>,              // all local variable infomation
+    pub srcfile: LValue,                     // source file name
+    pub absline: Vec<u32>,                   // line number of each bytecode
 }
 
 impl Default for GenState {
     fn default() -> Self {
-        GenState::new(Rc::new("".to_string()))
+        GenState::new(CodeGen::ANONYMOUS.into())
     }
 }
 
@@ -644,21 +697,27 @@ impl Default for GenState {
 type Isc = Instruction;
 
 impl GenState {
-    pub fn new(srcfile: Rc<String>) -> Self {
+    pub fn new(srcfile: LValue) -> Self {
         Self {
             lables: BTreeMap::new(),
             jumpbp: Vec::default(),
             loopbp: LinkedList::default(),
-            exprstate: BTreeMap::new(),
             regs: 0,
             ksts: Vec::with_capacity(4),
             upvals: Vec::with_capacity(8),
             subproto: Vec::with_capacity(2),
             code: Vec::with_capacity(32),
-            locals: Vec::with_capacity(8),
+            locstate: Vec::with_capacity(4),
+            local: Vec::with_capacity(4),
             srcfile,
             absline: Vec::with_capacity(8),
         }
+    }
+
+    pub fn with_env(srcfile: LValue) -> Self {
+        let mut res = Self::new(srcfile);
+        res.upvals.push(UpvalDecl::Env);
+        res
     }
 
     fn cur_pc(&self) -> u32 {
@@ -675,7 +734,7 @@ impl GenState {
             for (iscidx, pc) in bps.into_iter() {
                 debug_assert!(self.code.get_mut(iscidx as usize).is_some());
                 let step = loop_end as i32 - pc as i32;
-                self.emit_backpatch(iscidx as usize, Isc::isj(OpCode::JMP, step));
+                self.emit_backpatch(iscidx as usize, Isc::isj(JMP, step));
             }
         }
     }
@@ -685,22 +744,25 @@ impl GenState {
         self.absline.push(line);
     }
 
+    fn emit_placeholder(&mut self, line: u32) {
+        self.emit(Isc::placeholder(), line);
+    }
+
+    fn next_free_reg(&self) -> RegIndex {
+        self.regs
+    }
+
     /// Allocate a free register on vm stack and return its index
     fn alloc_free_reg(&mut self) -> RegIndex {
         let idx = self.regs;
         self.regs += 1;
-        idx as i32
+        idx
     }
 
-    /// Free last allocated register on vm stack
-    fn free_reg(&mut self) {
+    /// Free last allocated register on vm stack, return next available register
+    fn free_reg(&mut self) -> RegIndex {
         self.regs -= 1;
-    }
-
-    fn with_free_reg(&mut self, generation: impl FnOnce(RegIndex)) {
-        let idx = self.alloc_free_reg();
-        generation(idx);
-        self.free_reg();
+        self.regs
     }
 
     // Allocate a constant register and return its index
@@ -710,33 +772,25 @@ impl GenState {
         idx as i32
     }
 
-    // /// Find value in constants and return its index
-    // fn find_const_reg(&self, k: &LValue) -> Option<i32> {
-    //     for (idx, v) in self.ksts.iter().enumerate() {
-    //         if v == k {
-    //             return Some(idx as i32);
-    //         }
-    //     }
-    //     None
-    // }
-
-    /// Find string in constants and return its index
-    fn find_const_str(&self, s: &str) -> Option<RegIndex> {
+    /// Find string in constants and return its index, this will alloc a const string if not found.
+    fn find_or_create_kstr(&mut self, s: &str) -> RegIndex {
         for (idx, v) in self.ksts.iter().enumerate() {
             if let LValue::String(sw) = v {
                 if sw.as_str() == s {
-                    return Some(idx as RegIndex);
+                    return idx as RegIndex;
                 }
             }
         }
-        None
+        self.alloc_const_reg(LValue::from(Gc::from(s)))
     }
 
     /// Find local variable and return its index
-    fn find_local(&self, name: &str) -> Option<RegIndex> {
-        for v in self.locals.iter().rev() {
-            if v.name == name {
-                return Some(v.reg);
+    fn find_local_decl(&self, name: &str) -> Option<RegIndex> {
+        for block in self.locstate.iter().rev() {
+            for var in block.iter().rev() {
+                if var.name == name {
+                    return Some(var.reg);
+                }
             }
         }
         None
@@ -745,49 +799,23 @@ impl GenState {
     /// Load constant to register
     fn load_const(&mut self, kidx: i32, ln: u32) -> i32 {
         let reg = self.alloc_free_reg();
-        self.emit(Isc::iabx(OpCode::LOADK, reg, kidx), ln);
+        self.emit(Isc::iabx(LOADK, reg, kidx), ln);
         reg
-    }
-
-    // /// Find constant in constants by its index
-    // fn find_constants(&self, k: &LValue) -> Option<&LValue> {
-    //     for (idx, v) in self.ksts.iter().enumerate() {
-    //         if v == k {
-    //             return Some(v);
-    //         }
-    //     }
-    //     None
-    // }
-
-    // /// load global to register
-    // fn load_global(&mut self, name: &str, line: u32) -> RegIndex {
-    //     let sidx = self.alloc_free_reg();
-    //     let cidx = self.find_const_str(name).unwrap(); // must be find
-    //     self.emit(Isc::iabc(OpCode::GETTABUP, sidx, 0, cidx), line);
-    //     sidx
-    // }
-
-    /// Load upval to register.
-    fn load_upval(&mut self, upidx: i32) -> RegIndex {
-        let _reg = self.alloc_free_reg();
-        debug_assert!((upidx as usize) < self.upvals.len());
-
-        todo!()
     }
 
     fn emit_local_decl(&mut self, name: String, status: ExprStatus, lineinfo: (u32, u32)) {
         let mut vreg = self.alloc_free_reg();
 
         match status {
-            ExprStatus::LitNil => self.emit(Isc::iabc(OpCode::LOADNIL, vreg, 0, 0), lineinfo.0),
-            ExprStatus::LitTrue => self.emit(Isc::iabc(OpCode::LOADTRUE, vreg, 0, 0), lineinfo.0),
-            ExprStatus::LitFalse => self.emit(Isc::iabc(OpCode::LOADFALSE, vreg, 0, 0), lineinfo.0),
+            ExprStatus::LitNil => self.emit(Isc::iabc(LOADNIL, vreg, 0, 0), lineinfo.0),
+            ExprStatus::LitTrue => self.emit(Isc::iabc(LOADTRUE, vreg, 0, 0), lineinfo.0),
+            ExprStatus::LitFalse => self.emit(Isc::iabc(LOADFALSE, vreg, 0, 0), lineinfo.0),
             ExprStatus::LitInt(i) => {
                 if i.abs() > Isc::MAX_SBX.abs() as i64 {
                     let kreg = self.alloc_const_reg(LValue::Int(i));
-                    self.emit(Isc::iabx(OpCode::LOADK, vreg, kreg), lineinfo.0)
+                    self.emit(Isc::iabx(LOADK, vreg, kreg), lineinfo.0)
                 } else {
-                    self.emit(Isc::iasbx(OpCode::LOADI, vreg, i as i32), lineinfo.0)
+                    self.emit(Isc::iasbx(LOADI, vreg, i as i32), lineinfo.0)
                 }
             }
             ExprStatus::LitFlt(f) => {
@@ -795,31 +823,25 @@ impl GenState {
                 // use LOADF for small float.
 
                 let kreg = self.alloc_const_reg(LValue::Float(f));
-                self.emit(Isc::iabx(OpCode::LOADK, vreg, kreg), lineinfo.0)
-            }
-            ExprStatus::Call(reg) => {
-                vreg = reg;
-                self.free_reg();
+                self.emit(Isc::iabx(LOADK, vreg, kreg), lineinfo.0)
             }
             ExprStatus::Kst(reg) => {
-                self.emit(Isc::iabx(OpCode::LOADK, vreg, reg), lineinfo.0);
+                self.emit(Isc::iabx(LOADK, vreg, reg), lineinfo.0);
             }
-            ExprStatus::Reg(reg) => {
+
+            ExprStatus::Call(reg) | ExprStatus::Reg(reg) => {
                 vreg = reg;
                 self.free_reg();
-            }
-            ExprStatus::Up(_ureg) => {
-                // self.load_upval(ureg);
-                todo!()
             }
         }
 
-        self.locals.push(LocVar {
+        let locdecl = LocVarDecl {
             name,
             reg: vreg,
             start_pc: self.cur_pc(),
             end_pc: self.cur_pc(),
-        });
+        };
+        self.locstate.last_mut().unwrap().push(locdecl);
     }
 
     fn set_recover_point(&mut self, line: u32) -> (usize, u32) {
@@ -832,18 +854,23 @@ impl GenState {
         self.code[iscidx] = isc;
     }
 
-    fn emit_index_local(&mut self, keys: ExprStatus, ln: u32, preg: i32) -> ExprStatus {
-        let dest = self.alloc_free_reg();
+    fn emit_index_local(
+        &mut self,
+        keys: ExprStatus,
+        ln: u32,
+        pre_reg: RegIndex,
+        dest: RegIndex,
+    ) -> ExprStatus {
         match keys {
             ExprStatus::Kst(kreg) => {
                 if let Some(imidiate) = self.try_emit_inmidiate_index(kreg) {
-                    self.emit(Isc::iabc(OpCode::GETI, dest, imidiate, 0), ln);
+                    self.emit(Isc::iabc(GETI, dest, imidiate, 0), ln);
                 } else {
-                    self.emit(Isc::iabck(OpCode::GETFIELD, dest, preg, kreg), ln)
+                    self.emit(Isc::iabck(GETFIELD, dest, pre_reg, kreg), ln)
                 };
             }
             ExprStatus::Reg(reg) => {
-                self.emit(Isc::iabc(OpCode::GETFIELD, dest, preg, reg), ln);
+                self.emit(Isc::iabc(GETFIELD, dest, pre_reg, reg), ln);
             }
             _ => unreachable!(),
         };
@@ -871,22 +898,22 @@ impl GenState {
         match es {
             ExprStatus::LitNil => {
                 let free = self.alloc_free_reg();
-                self.emit(Isc::iabc(OpCode::LOADNIL, free, 0, 0), ln);
+                self.emit(Isc::iabc(LOADNIL, free, 0, 0), ln);
                 free
             }
             ExprStatus::LitTrue => {
                 let free = self.alloc_free_reg();
-                self.emit(Isc::iabc(OpCode::LOADTRUE, free, 0, 0), ln);
+                self.emit(Isc::iabc(LOADTRUE, free, 0, 0), ln);
                 free
             }
             ExprStatus::LitFalse => {
                 let free = self.alloc_free_reg();
-                self.emit(Isc::iabc(OpCode::LOADFALSE, free, 0, 0), ln);
+                self.emit(Isc::iabc(LOADFALSE, free, 0, 0), ln);
                 free
             }
             ExprStatus::LitInt(i) => {
                 let free = self.alloc_free_reg();
-                self.emit(Isc::iasbx(OpCode::LOADI, free, i as i32), ln);
+                self.emit(Isc::iasbx(LOADI, free, i as i32), ln);
                 free
             }
             ExprStatus::LitFlt(_f) => {
@@ -897,23 +924,52 @@ impl GenState {
             ExprStatus::Call(c) => c,
             ExprStatus::Kst(kreg) => self.load_const(kreg, ln),
             ExprStatus::Reg(r) => r,
-            ExprStatus::Up(_) => todo!(),
         }
     }
 
-    fn emit_unary_const(&mut self, _op: OpCode, kidx: RegIndex, line: u32) -> ExprStatus {
-        let sidx = self.alloc_free_reg();
-        self.emit(Isc::iabx(OpCode::LOADK, sidx, kidx), line);
-        self.emit(Isc::iabc(OpCode::UNM, sidx, sidx, 0), line);
-        ExprStatus::Reg(sidx)
-    }
-
-    fn emit_unary_reg(&mut self, _op: OpCode, reg: RegIndex, line: u32) -> ExprStatus {
-        let sidx = self.alloc_free_reg();
-        self.emit(Isc::iabc(OpCode::UNM, sidx, reg, 0), line);
-        ExprStatus::Reg(sidx)
+    fn peek_const_expr(exp: &Expr) -> Option<ExprStatus> {
+        match exp {
+            Expr::Nil => Some(ExprStatus::LitNil),
+            Expr::True => Some(ExprStatus::LitTrue),
+            Expr::False => Some(ExprStatus::LitFalse),
+            Expr::Int(i) => {
+                if *i as i32 > Isc::MAX_SBX {
+                    None
+                } else {
+                    Some(ExprStatus::LitInt(*i))
+                }
+            }
+            Expr::Float(_f) => None, // TODO
+            _ => None,
+        }
     }
 }
+
+/// Expression generation context to optimize
+enum ExprGenCtx {
+    // extra expr in multi assignment
+    Ignore,
+
+    // expr needs to alloc 1 register to store result
+    Allocate,
+
+    // there is already a free register for expr to use (for function argument)
+    NonRealloc { dest: RegIndex },
+
+    // expr is the single value to be returned
+    PotentialTailCall,
+
+    // intermidiate table may be cached
+    MultiLevelTableIndex { depth: u32 },
+}
+
+impl ExprGenCtx {
+    fn must_use(reg: RegIndex) -> Self {
+        Self::NonRealloc { dest: reg }
+    }
+}
+
+type Ctx = ExprGenCtx;
 
 struct BranchBackPatchPoint {
     if_to_else_entry: (u32, u32),         // (instruction index, pc of cond),
@@ -951,6 +1007,8 @@ impl DerefMut for CodeGen {
 }
 
 impl CodeGen {
+    const ANONYMOUS: &'static str = "?";
+
     fn new(strip: bool) -> Self {
         Self {
             strip,
@@ -959,48 +1017,57 @@ impl CodeGen {
         }
     }
 
-    fn consume(&mut self, mut ast_root: Block) -> Result<Proto, CodeGenErr> {
+    fn consume(&mut self, ast_root: SrcLoc<Block>) -> Result<Proto, CodeGenErr> {
         debug_assert_eq!(self.genstk.len(), 0);
 
         // take chunk name, construct an empty para list
-        let name = Rc::new(std::mem::take(&mut ast_root.chunk));
-        let plist = ParaList::new(true, Vec::new());
+        let name = LValue::from(ast_root.chunk.as_str());
+        let plist = ParaList {
+            vargs: true,
+            namelist: Vec::new(),
+        };
 
-        let mut main = GenState::new(name);
-        std::mem::swap(&mut main, &mut self.cgs);
-        let mut res = self.walk_fn_body(plist, ast_root, false)?;
+        let mut res = self.walk_fn_body(name, plist, ast_root, false, true)?;
 
         if self.strip {
-            Self::strip_src_info(&mut res, Rc::new("?".to_string()))
+            Self::strip_src_info(&mut res, Self::ANONYMOUS.into())
         }
 
+        debug_assert!(!res.updecl.is_empty());
+        debug_assert_eq!(self.cgs.locstate.len(), 0);
         debug_assert_eq!(self.genstk.len(), 0);
         Ok(res)
     }
 
     fn walk_fn_body(
         &mut self,
+        name: LValue,
         params: ParaList,
-        body: Block,
+        body: SrcLoc<Block>,
         selfcall: bool,
+        is_main_chunk: bool,
     ) -> Result<Proto, CodeGenErr> {
+        // prepare another GenState
+        let mut new_state = GenState::new(name);
+        std::mem::swap(&mut self.cgs, &mut new_state);
+        self.genstk.push_back(new_state);
+
         // vararg
         if params.vargs {
             let nparam = params.namelist.len();
-            self.emit(Isc::iabc(OpCode::VARARGPREP, nparam as i32, 0, 0), 0);
+            self.emit(Isc::iabc(VARARGPREP, nparam as i32, 0, 0), body.def_begin());
         }
-
-        // set _ENV
-        self.upvals.push(UpValue {
-            name: "_ENV".to_string(),
-            stkidx: None,
-            kind: None,
-        });
 
         // reserve space for self call
         if selfcall {
-            let free = self.alloc_free_reg();
-            self.emit_local_decl("self".to_string(), ExprStatus::Reg(free), (0, 0));
+            todo!("self call ")
+            // let free = self.alloc_free_reg();
+            // self.emit_local_decl("self".to_string(), ExprStatus::Reg(free), (0, 0));
+        }
+
+        // init _ENV upvalue
+        if is_main_chunk {
+            self.upvals.push(UpvalDecl::Env);
         }
 
         self.walk_basic_block(body)?;
@@ -1010,7 +1077,7 @@ impl CodeGen {
             let index = pc as usize;
             if let Some(dest) = self.lables.get(&lable) {
                 let step = (*dest as i64) - pc as i64;
-                self.code[index].code = Isc::isj(OpCode::JMP, step as i32).code;
+                self.code[index].code = Isc::isj(JMP, step as i32).code;
             } else {
                 return Err(CodeGenErr::NonexistedLable { lable });
             }
@@ -1020,10 +1087,11 @@ impl CodeGen {
         // Check <close> variable and generate CLOSE instruction
         // Check <const> variable
 
-        let subfns = std::mem::take(&mut self.subproto)
+        let subfn = std::mem::take(&mut self.subproto)
             .into_iter()
             .map(Gc::from)
             .collect();
+
         let res = Proto {
             vararg: params.vargs,
             nparam: params.namelist.len() as u8,
@@ -1032,53 +1100,79 @@ impl CodeGen {
             endline: self.absline.last().copied().unwrap_or(0),
             kst: std::mem::take(&mut self.ksts),
             code: std::mem::take(&mut self.code),
-            subfn: subfns,
-            source: std::mem::take(&mut self.srcfile),
+            subfn,
+            source: self.srcfile,
             pcline: std::mem::take(&mut self.absline),
-            locvars: std::mem::take(&mut self.locals),
-            upvals: std::mem::take(&mut self.upvals),
+            locvars: std::mem::take(&mut self.local),
+            updecl: std::mem::take(&mut self.upvals),
         };
+
+        // reset to previous GenState
+        if let Some(prev) = self.genstk.pop_back() {
+            let _ = std::mem::replace(&mut self.cgs, prev);
+        } else {
+            unreachable!()
+        }
+
         Ok(res)
     }
 
     /// Strip debug infomation in proto.
-    fn strip_src_info(p: &mut Proto, anonymous: Rc<String>) {
+    fn strip_src_info(p: &mut Proto, anonymous: LValue) {
         p.begline = 0;
         p.endline = 0;
 
-        for up in p.upvals.iter_mut() {
-            let _ = std::mem::take(&mut up.name);
+        for up in p.updecl.iter_mut() {
+            match up {
+                UpvalDecl::OnStack { name, register: _ } => {
+                    let _ = std::mem::take(name);
+                }
+                UpvalDecl::InUpList { name, offset: _ } => {
+                    let _ = std::mem::take(name);
+                }
+                UpvalDecl::Env => {}
+            }
         }
-
         let _ = std::mem::take(&mut p.locvars);
         let _ = std::mem::take(&mut p.pcline);
 
-        p.source = anonymous.clone();
+        p.source = anonymous;
         p.subfn
             .iter_mut()
-            .for_each(|p| Self::strip_src_info(p, anonymous.clone()))
+            .for_each(|p| Self::strip_src_info(p, anonymous))
     }
 
-    fn walk_basic_block(&mut self, body: Block) -> Result<(), CodeGenErr> {
+    fn walk_basic_block(&mut self, body: SrcLoc<Block>) -> Result<(), CodeGenErr> {
+        self.locstate.push(Vec::with_capacity(4));
+
+        let (body_def_end, body) = (body.def_end(), body.into_inner());
         for stmt in body.stats.into_iter() {
-            self.walk_stmt(stmt)?;
+            self.walk_stmt(*stmt)?;
         }
-        self.walk_return(body.ret)?;
+        self.walk_return(body.ret, body_def_end)?;
+
+        if let Some(ls) = self.locstate.pop() {
+            self.local.extend(ls);
+        } else {
+            unreachable!()
+        }
         Ok(())
     }
 
-    fn walk_stmt(&mut self, stmt: StmtNode) -> Result<(), CodeGenErr> {
-        let lineinfo = stmt.lineinfo();
+    fn walk_stmt(&mut self, stmt: SrcLoc<Stmt>) -> Result<(), CodeGenErr> {
+        let lineinfo = stmt.lineinfo;
         match stmt.into_inner() {
             Stmt::Assign { vars, exprs } => {
                 self.walk_assign_stmt(vars, exprs)?;
             }
             Stmt::FuncCall(call) => {
-                let _ = self.walk_fncall(call, 0);
+                let next = self.alloc_free_reg();
+                let _ = self.walk_fn_call(call, next, 0, false);
+                self.free_reg();
             }
             Stmt::Lable(lable) => {
                 let dest = self.cur_pc();
-                if self.lables.contains_key(&lable) {
+                if self.lables.contains_key(lable.as_str()) {
                     return Err(CodeGenErr::RepeatedLable { lable });
                 } else {
                     self.lables.insert(lable, dest);
@@ -1087,10 +1181,10 @@ impl CodeGen {
             Stmt::Goto(lable) => {
                 if let Some(dest) = self.lables.get(&lable) {
                     let step = (*dest as i64) - self.cur_pc() as i64;
-                    self.emit(Isc::isj(OpCode::JMP, step as i32), lineinfo.0);
+                    self.emit(Isc::isj(JMP, step as i32), lineinfo.0);
                 } else {
                     // set a placeholder in code series
-                    self.emit(Isc::isj(OpCode::JMP, 0), lineinfo.0);
+                    self.emit(Isc::isj(JMP, 0), lineinfo.0);
                     let pc = self.cur_pc();
                     self.jumpbp.push((pc, lable));
                 }
@@ -1108,34 +1202,32 @@ impl CodeGen {
                 self.walk_basic_block(*block)?;
             }
             Stmt::While { exp, block } => {
-                self.walk_while_loop(exp, block)?;
+                self.walk_while_loop(*exp, *block)?;
             }
             Stmt::Repeat { block, exp } => {
-                self.walk_repeat_loop(exp, block)?;
+                self.walk_repeat_loop(*exp, *block)?;
             }
-            Stmt::IfElse { exp, then, els } => {
-                self.walk_branch_stmt(exp, then, els)?;
-            }
-            Stmt::NumericFor {
-                iter,
-                init,
-                limit,
-                step,
-                body,
+            Stmt::IfElse {
+                cond: exp,
+                then,
+                els,
             } => {
-                self.walk_numberic_loop(init, limit, step, lineinfo, body, iter)?;
+                self.walk_branch_stmt(*exp, *then, els)?;
             }
-            Stmt::GenericFor { iters, exprs, body } => {
-                self.walk_generic_for(iters, exprs, body, lineinfo)?;
+            Stmt::NumericFor(num) => {
+                self.walk_numberic_loop(*num)?;
+            }
+            Stmt::GenericFor(gen) => {
+                self.walk_generic_for(*gen)?;
             }
             Stmt::FnDef { pres, method, body } => {
-                self.walk_func_def(pres, method, body, lineinfo)?;
+                self.walk_fn_def(pres, method, *body)?;
             }
             Stmt::LocalVarDecl { names, exprs } => {
                 self.walk_local_decl(names, exprs, lineinfo)?;
             }
             Stmt::Expr(exp) => {
-                let _ = self.walk_common_expr(ExprNode::new(*exp, lineinfo), 0)?;
+                let _ = self.walk_common_expr(*exp, Ctx::Ignore)?;
             }
         };
         Ok(())
@@ -1143,71 +1235,68 @@ impl CodeGen {
 
     fn walk_repeat_loop(
         &mut self,
-        exp: Box<WithSrcLoc<Expr>>,
-        block: Box<Block>,
+        cond: SrcLoc<Expr>,
+        block: SrcLoc<Block>,
     ) -> Result<(), CodeGenErr> {
-        let ln = exp.lineinfo().0;
+        let def = cond.lineinfo.0;
         self.enter_loop();
-        self.walk_basic_block(*block)?;
+        self.walk_basic_block(block)?;
         self.leave_loop();
         let cond_reg = {
-            let s = self.walk_common_expr(*exp, 1)?;
-            self.try_load_expr_to_local(s, ln)
+            let s = self.walk_common_expr(cond, Ctx::Allocate)?;
+            self.try_load_expr_to_local(s, def)
         };
-        self.emit(Isc::iabc(OpCode::TEST, cond_reg, true as i32, 0), ln);
+        self.emit(Isc::iabc(TEST, cond_reg, true as i32, 0), def);
         Ok(())
     }
 
     fn walk_while_loop(
         &mut self,
-        exp: Box<WithSrcLoc<Expr>>,
-        block: Box<Block>,
+        cond: SrcLoc<Expr>,
+        block: SrcLoc<Block>,
     ) -> Result<(), CodeGenErr> {
-        let ln = exp.lineinfo().0;
         self.enter_loop();
+        let ln = cond.lineinfo.0;
         let cond_reg = {
-            let s = self.walk_common_expr(*exp, 1)?;
+            let s = self.walk_common_expr(cond, Ctx::Allocate)?;
             self.try_load_expr_to_local(s, ln)
         };
-        self.emit(Isc::iabc(OpCode::TEST, cond_reg, false as i32, 0), ln);
+        self.emit(Isc::iabc(TEST, cond_reg, false as i32, 0), ln);
         let loop_begin = self.set_recover_point(ln);
-        self.walk_basic_block(*block)?;
+        self.walk_basic_block(block)?;
         self.leave_loop();
+
         let step = (self.cur_pc() - loop_begin.1) as i32;
-        self.emit_backpatch(loop_begin.0, Isc::isj(OpCode::JMP, step));
+        self.emit_backpatch(loop_begin.0, Isc::isj(JMP, step));
         Ok(())
     }
 
-    fn walk_numberic_loop(
-        &mut self,
-        init: Box<Expr>,
-        limit: Box<Expr>,
-        step: Box<Expr>,
-        lineinfo: (u32, u32),
-        body: Box<Block>,
-        iter: String,
-    ) -> Result<(), CodeGenErr> {
-        let loopline = (0, 0);
+    fn walk_numberic_loop(&mut self, n: NumericFor) -> Result<(), CodeGenErr> {
         let mut init_reg = {
-            let s = self.walk_common_expr(WithSrcLoc::new(*init, loopline), 1)?;
-            self.try_load_expr_to_local(s, loopline.0)
+            let line = n.init.def_begin();
+            let s = self.walk_common_expr(*n.init, Ctx::Allocate)?;
+            self.try_load_expr_to_local(s, line)
         };
         let mut limit_reg = {
-            let s = self.walk_common_expr(WithSrcLoc::new(*limit, loopline), 1)?;
-            self.try_load_expr_to_local(s, loopline.0)
+            let line = n.limit.def_begin();
+            let s = self.walk_common_expr(*n.limit, Ctx::Allocate)?;
+            self.try_load_expr_to_local(s, line)
         };
         let mut step_reg = {
-            let s = self.walk_common_expr(WithSrcLoc::new(*step, loopline), 1)?;
-            self.try_load_expr_to_local(s, loopline.0)
+            let line = n.step.def_begin();
+            let s = self.walk_common_expr(*n.step, Ctx::Allocate)?;
+            self.try_load_expr_to_local(s, line)
         };
-        let diff = (limit_reg - init_reg, step_reg - limit_reg);
-        if diff.0 != diff.1 || diff.0 != 1 {
+
+        let loopdef = n.body.lineinfo;
+        let offset = (limit_reg - init_reg, step_reg - limit_reg);
+        if offset.0 != offset.1 || offset.0 != 1 {
             let new_init = self.alloc_free_reg();
             let new_limit = self.alloc_free_reg();
             let new_step = self.alloc_free_reg();
 
             let mut reset_loop_reg = |dest, src| {
-                self.emit(Isc::iabc(OpCode::MOVE, dest, src, 0), loopline.0);
+                self.emit(Isc::iabc(MOVE, dest, src, 0), loopdef.0);
             };
             reset_loop_reg(new_init, init_reg);
             reset_loop_reg(new_limit, limit_reg);
@@ -1218,69 +1307,52 @@ impl CodeGen {
         }
         debug_assert!(step_reg - init_reg == 2);
 
-        let (forprep_idx, recover_pc) = self.set_recover_point(lineinfo.0);
-        let iter_reg = self.alloc_free_reg();
-        let iter_begin_pc = self.cur_pc();
+        let (forprep_idx, recover_pc) = self.set_recover_point(loopdef.0);
+
+        // let iter_reg = self.alloc_free_reg();
+        // let iter_begin_pc = self.cur_pc();
 
         // loop block
         self.enter_loop();
-        self.walk_basic_block(*body)?;
+        self.walk_basic_block(*n.body)?;
         self.leave_loop();
 
         // loop end
-        self.emit(
-            Isc::iabc(OpCode::FORLOOP, init_reg, limit_reg, 0),
-            lineinfo.0,
-        );
+        self.emit(Isc::iabc(FORLOOP, init_reg, limit_reg, 0), loopdef.1);
 
         let step = (self.cur_pc() - recover_pc) as i32;
-        self.emit_backpatch(forprep_idx, Isc::iabx(OpCode::FORPREP, init_reg, step));
+        self.emit_backpatch(forprep_idx, Isc::iabx(FORPREP, init_reg, step));
 
-        let iter_end_pc = self.cur_pc();
-        self.locals.push(LocVar {
-            name: iter,
-            reg: iter_reg,
-            start_pc: iter_begin_pc,
-            end_pc: iter_end_pc,
-        });
+        // TODO:
+        // iter is upvalue?
+        // let iter_end_pc = self.cur_pc();
+
         Ok(())
     }
 
-    fn walk_generic_for(
-        &mut self,
-        iters: Vec<String>,
-        exprs: Vec<Expr>,
-        body: Box<Block>,
-        lineinfo: (u32, u32),
-    ) -> Result<(), CodeGenErr> {
-        let niter = iters.len();
+    fn walk_generic_for(&mut self, g: GenericFor) -> Result<(), CodeGenErr> {
+        let def = g.body.lineinfo;
 
+        let niter = g.iters.len();
         // alloc 4 register to store loop state
         let state_reg = self.alloc_free_reg();
         for _ in 0..3 {
             self.alloc_free_reg();
         }
-        let (iscidx, recover_pc) = self.set_recover_point(lineinfo.0);
+        let (iscidx, recover_pc) = self.set_recover_point(def.0);
 
         // treat iters as local var decl
-        let vars = iters.into_iter().map(|name| (name, None)).collect();
-        let exprs = exprs
-            .into_iter()
-            .map(|e| WithSrcLoc::new(e, lineinfo))
-            .collect();
-        self.walk_local_decl(vars, exprs, lineinfo)?;
+        let vars = g.iters.into_iter().map(|name| (name, None)).collect();
+        self.walk_local_decl(vars, g.exprs, g.body.lineinfo)?;
 
         // loop body
         self.enter_loop();
-        self.walk_basic_block(*body)?;
+        self.walk_basic_block(*g.body)?;
 
-        self.emit(
-            Isc::iabc(OpCode::TFORCALL, state_reg, 0, niter as i32),
-            lineinfo.0,
-        );
+        self.emit(Isc::iabc(TFORCALL, state_reg, 0, niter as i32), def.1);
         let step = (self.cur_pc() - recover_pc) as i32;
-        self.emit(Isc::iabx(OpCode::TFORLOOP, state_reg, step), lineinfo.0);
-        self.emit_backpatch(iscidx, Isc::iabx(OpCode::TFORPREP, state_reg, step - 2));
+        self.emit(Isc::iabx(TFORLOOP, state_reg, step), def.1);
+        self.emit_backpatch(iscidx, Isc::iabx(TFORPREP, state_reg, step - 2));
         self.leave_loop();
 
         // TODO:
@@ -1290,123 +1362,99 @@ impl CodeGen {
 
     fn walk_branch_stmt(
         &mut self,
-        exp: Box<WithSrcLoc<Expr>>,
-        then: Box<Block>,
-        els: Box<Block>,
+        exp: SrcLoc<Expr>,
+        then: SrcLoc<Block>,
+        els: Option<BasicBlock>,
     ) -> Result<(), CodeGenErr> {
-        let ln = exp.lineinfo().0;
-        let cond = self.walk_common_expr(*exp, 1)?;
-        let reg = match cond {
-            ExprStatus::LitNil | ExprStatus::LitFalse => {
-                return self.walk_basic_block(*els);
-            }
+        let conddef = exp.def_begin();
+        let cond = self.walk_common_expr(exp, Ctx::Allocate)?;
+        let reg = self.try_load_expr_to_local(cond, conddef);
 
-            ExprStatus::LitTrue
-            | ExprStatus::LitInt(_)
-            | ExprStatus::LitFlt(_)
-            | ExprStatus::Kst(_) => {
-                return self.walk_basic_block(*then);
-            }
-            ExprStatus::Call(creg) => creg,
-            ExprStatus::Up(upidx) => self.load_upval(upidx),
-            ExprStatus::Reg(reg) => reg,
-        };
-
-        self.emit(Isc::iabc(OpCode::TEST, reg, 0, 0), ln);
+        self.emit(Isc::iabc(TEST, reg, 0, 0), conddef);
 
         let mut bpoint = BranchBackPatchPoint {
             if_to_else_entry: (self.code.len() as u32, self.cur_pc()),
             then_exit_to_end: None,
         };
-        self.emit(Isc::placeholder(), ln);
+        self.emit_placeholder(conddef);
 
-        self.walk_basic_block(*then)?;
+        self.walk_basic_block(then)?;
         let else_entry_recover_point = self.cur_pc();
-
-        if !els.is_empty() {
+        if let Some(bk) = els {
             bpoint.then_exit_to_end = Some((self.code.len() as u32, self.cur_pc()));
-            self.walk_basic_block(*els)?;
+            self.walk_basic_block(*bk)?;
         }
         let if_end_recover_point = self.cur_pc();
 
-        // back patch OpCode::JMP
+        // back patch JMP
         debug_assert!(bpoint.if_to_else_entry.0 <= self.code.len() as u32);
-        self.code
-            .get_mut(bpoint.if_to_else_entry.0 as usize)
-            .map(|isc| {
-                Isc::set_sj(
-                    &mut isc.code,
-                    (else_entry_recover_point - bpoint.if_to_else_entry.1) as i32,
-                );
-            });
+        if let Some(isc) = self.code.get_mut(bpoint.if_to_else_entry.0 as usize) {
+            Isc::set_sj(
+                &mut isc.code,
+                (else_entry_recover_point - bpoint.if_to_else_entry.1) as i32,
+            );
+        }
 
         if let Some(te) = bpoint.then_exit_to_end {
-            self.code.get_mut(te.0 as usize).map(|isc| {
+            if let Some(isc) = self.code.get_mut(te.0 as usize) {
                 Isc::set_sj(&mut isc.code, (if_end_recover_point - te.1) as i32);
-            });
+            } else {
+                unreachable!()
+            }
         }
 
         Ok(())
     }
 
-    fn walk_func_def(
+    fn walk_fn_def(
         &mut self,
-        pres: Vec<String>,
-        method: Option<String>,
-        body: Box<crate::ast::FuncBody>,
-        lineinfo: (u32, u32),
+        pres: Vec<SrcLoc<String>>,
+        method: Option<Box<SrcLoc<String>>>,
+        body: SrcLoc<FuncBody>,
     ) -> Result<(), CodeGenErr> {
-        let kstidx = pres
+        let (defln, body) = (body.def_begin(), body.into_inner());
+
+        let mut fnname = pres
             .iter()
-            .map(|s| {
-                self.find_const_str(s).unwrap_or_else(|| {
-                    self.alloc_const_reg(LValue::from_wild(Gc::from(s.as_str())))
-                })
-            })
+            .fold(String::with_capacity(32), |mut acc, next| {
+                acc.extend(next.chars());
+                acc
+            });
+
+        if let Some(ref metd) = method {
+            fnname.extend(metd.chars())
+        }
+
+        let pre_name_kregs = pres
+            .iter()
+            .map(|s| self.find_or_create_kstr(s))
             .collect::<Vec<_>>();
 
-        let rootreg = if !pres.is_empty() {
-            // SAFETY: Length of pres has been checked
-            let root = unsafe { pres.first().unwrap_unchecked() };
-            let rootreg = if let Some(locidx) = self.find_local(root) {
-                locidx
-            } else if let Some(upidx) = self.find_up(root) {
-                let free = self.alloc_free_reg();
-                // SAFETY: Length of kstidx is same with pres
-                let kreg = unsafe { *kstidx.first().unwrap_unchecked() };
-                self.emit(Isc::iabc(OpCode::GETTABUP, free, upidx, kreg), lineinfo.0);
-                free
-            } else {
-                unreachable!()
-            };
-
-            // skip root index
-            for idx in kstidx.into_iter().skip(1) {
-                self.emit(
-                    Isc::iabc(OpCode::GETFIELD, rootreg, rootreg, idx),
-                    lineinfo.0,
-                );
+        let mut prefix_iter = pres.into_iter();
+        let rootreg = if let Some(root) = prefix_iter.next() {
+            let rootdef = root.def_begin();
+            let r = self.try_load_variable(root.into_inner(), None, rootdef);
+            for idx in pre_name_kregs.into_iter().skip(1) {
+                self.emit(Isc::iabc(GETFIELD, r, r, idx), defln);
             }
-            Some(rootreg)
+            Some(r)
         } else {
             None
         };
 
         let fnreg = self.alloc_free_reg();
         let pirdx = self.subproto.len();
-        let pro = self.walk_fn_body(body.params, *body.body, false)?;
+        let pro = self.walk_fn_body(fnname.into(), body.params, *body.body, false, false)?;
         self.subproto.push(pro);
-        self.emit(Isc::iabx(OpCode::CLOSURE, fnreg, pirdx as i32), lineinfo.0);
+        self.emit(Isc::iabx(CLOSURE, fnreg, pirdx as i32), defln);
 
         // method call, set field
-        if let Some(metd) = method {
+        if let Some(metd_name) = method {
             debug_assert!(rootreg.is_some());
-            let metdkidx = self
-                .find_const_str(&metd)
-                .unwrap_or_else(|| self.alloc_const_reg(LValue::from_wild(Gc::from(metd))));
+            let metdkidx = self.find_or_create_kstr(&metd_name);
             self.emit(
-                Isc::iabck(OpCode::SETFIELD, rootreg.unwrap(), metdkidx, metdkidx),
-                lineinfo.0,
+                Isc::iabck(SETFIELD, rootreg.unwrap(), metdkidx, metdkidx),
+                defln,
             );
         }
         Ok(())
@@ -1414,7 +1462,7 @@ impl CodeGen {
 
     fn walk_local_decl(
         &mut self,
-        mut names: Vec<(String, Option<Attribute>)>,
+        mut names: Vec<(SrcLoc<String>, Option<Attribute>)>,
         mut exprs: Vec<ExprNode>,
         lineinfo: (u32, u32),
     ) -> Result<(), CodeGenErr> {
@@ -1425,16 +1473,12 @@ impl CodeGen {
         if nvar <= exprs.len() {
             // TODO:
             // add attribute support
-            for (idx, (def, _attr)) in names.into_iter().enumerate() {
-                let status = {
-                    let e = exprs.get_mut(idx).unwrap();
-                    self.walk_common_expr(std::mem::take(e), 1)?
-                    // .unwrap_or(ExprStatus::LitNil);}
-                };
-                self.emit_local_decl(def, status, lineinfo);
+            for ((def, _attr), exp) in names.into_iter().zip(exprs.iter_mut()) {
+                let status = self.walk_common_expr(std::mem::take(exp), Ctx::Allocate)?;
+                self.emit_local_decl(def.into_inner(), status, lineinfo);
             }
             for extra in exprs.into_iter().skip(nvar) {
-                self.walk_common_expr(extra, 0)?;
+                self.walk_common_expr(*extra, Ctx::Ignore)?;
             }
         } else {
             // SAFETY:
@@ -1442,84 +1486,81 @@ impl CodeGen {
             let last = unsafe { exprs.pop().unwrap_unchecked() };
 
             for (idx, e) in exprs.into_iter().enumerate() {
-                let status = self.walk_common_expr(e, 1)?;
+                let status = self.walk_common_expr(*e, Ctx::Allocate)?;
                 // TODO:
                 // add attribute support
                 let desc = unsafe { &mut names.get_mut(idx).unwrap_unchecked() };
                 let name = std::mem::take(&mut desc.0);
-                self.emit_local_decl(name, status, lineinfo);
+                self.emit_local_decl(name.into_inner(), status, lineinfo);
             }
 
             let remain = names.iter().skip(nexp).count();
             debug_assert!(remain > 0);
-            let last_sta = self.walk_common_expr(last, remain)?;
+            let last_sta = self.walk_common_expr(*last, Ctx::Allocate)?;
             if let ExprStatus::Call(reg) = last_sta {
                 for (idx, (name, _attr)) in names.into_iter().skip(nexp).enumerate() {
-                    self.emit_local_decl(name, ExprStatus::Reg(reg + idx as RegIndex), lineinfo);
+                    self.emit_local_decl(
+                        name.into_inner(),
+                        ExprStatus::Reg(reg + idx as RegIndex),
+                        lineinfo,
+                    );
                 }
             } else {
                 let mut iter = names.into_iter().skip(nexp);
                 // SAFETY: there are must at least 1 remain variable
-                let next = unsafe { iter.next().unwrap_unchecked() };
-                self.emit_local_decl(next.0, last_sta, lineinfo);
+                // let next = unsafe { iter.next().unwrap_unchecked() };
+                let next = iter.next().unwrap();
+                self.emit_local_decl(next.0.into_inner(), last_sta, lineinfo);
 
                 for (name, _attr) in iter {
-                    self.emit_local_decl(name, ExprStatus::LitNil, lineinfo);
+                    self.emit_local_decl(name.into_inner(), ExprStatus::LitNil, lineinfo);
                 }
             }
         }
         Ok(())
     }
 
-    fn walk_return(&mut self, ret: Option<Vec<ExprNode>>) -> Result<(), CodeGenErr> {
+    fn walk_return(
+        &mut self,
+        ret: Option<Vec<ExprNode>>,
+        line_of_on_empty_ret: u32,
+    ) -> Result<(), CodeGenErr> {
         if let Some(mut rets) = ret {
             match rets.len() {
                 1 => {
                     // SAFETY: rets.len() == 1
                     let ret_node = unsafe { rets.pop().unwrap_unchecked() };
-                    let line = ret_node.lineinfo().0;
+                    let ln = ret_node.lineinfo.0;
 
-                    let status = self.walk_common_expr(ret_node, usize::MAX)?;
+                    let status = self.walk_common_expr(*ret_node, Ctx::PotentialTailCall)?;
+
                     let mut gen_lit_template = |op| {
                         let reg = self.alloc_free_reg();
-                        self.emit(Isc::iabc(op, reg, 0, 0), line);
-                        self.emit(Isc::iabc(OpCode::RETURN1, reg, 0, 0), 0);
+                        self.emit(Isc::iabc(op, reg, 0, 0), ln);
+                        self.emit(Isc::iabc(RETURN1, reg, 0, 0), 0);
                     };
 
                     match status {
-                        ExprStatus::LitNil => gen_lit_template(OpCode::LOADNIL),
-                        ExprStatus::LitTrue => gen_lit_template(OpCode::LOADTRUE),
-                        ExprStatus::LitFalse => gen_lit_template(OpCode::LOADFALSE),
+                        ExprStatus::LitNil => gen_lit_template(LOADNIL),
+                        ExprStatus::LitTrue => gen_lit_template(LOADTRUE),
+                        ExprStatus::LitFalse => gen_lit_template(LOADFALSE),
                         ExprStatus::LitInt(i) => {
                             let reg = self.alloc_free_reg();
-                            self.emit(Isc::iasbx(OpCode::LOADI, reg, i as i32), line);
-                            self.emit(Isc::iabc(OpCode::RETURN1, reg, 0, 0), line);
+                            self.emit(Isc::iasbx(LOADI, reg, i as i32), ln);
+                            self.emit(Isc::iabc(RETURN1, reg, 0, 0), ln);
                         }
                         ExprStatus::LitFlt(f) => {
                             let reg = self.alloc_free_reg();
-                            self.emit(Isc::iabx(OpCode::LOADF, reg, f as i32), line);
-                            self.emit(Isc::iabc(OpCode::RETURN1, reg, 0, 0), line);
+                            self.emit(Isc::iabx(LOADF, reg, f as i32), ln);
+                            self.emit(Isc::iabc(RETURN1, reg, 0, 0), ln);
                         }
-                        ExprStatus::Call(_) => todo!("tail call"),
+                        ExprStatus::Call(ret) => self.emit(Isc::iabc(RETURN, ret, 0, 0), ln),
                         ExprStatus::Kst(k) => {
-                            let reg = self.load_const(k, line);
-                            self.emit(Isc::iabc(OpCode::RETURN1, reg, 0, 0), line);
+                            let reg = self.load_const(k, ln);
+                            self.emit(Isc::iabc(RETURN1, reg, 0, 0), ln);
                         }
                         ExprStatus::Reg(r) => {
-                            self.emit(Isc::iabc(OpCode::RETURN1, r, 0, 0), line);
-                        }
-                        ExprStatus::Up(_upidx) => {
-                            // let up = self.upvals.get(upidx as usize).unwrap();
-                            // let reg = self.alloc_free_reg();
-                            // let c = self.find_const_str(up.name.as_str()).unwrap(); // must be find
-                            // if let Some(stkidx) = up.stkidx {
-                            //     let b = stkidx;
-                            //     todo!("move fn to stk top");
-                            //     Isc::iabc(OpCode::CALL, reg, (nparam + 1) as i32, 0)
-                            // } else {
-                            //     Isc::iabc(OpCode::GETTABUP, reg, 0, c)
-                            // }
-                            todo!()
+                            self.emit(Isc::iabc(RETURN1, r, 0, 0), ln);
                         }
                     }
                 }
@@ -1530,12 +1571,18 @@ impl CodeGen {
                 _ => unreachable!(),
             }
         } else {
-            self.emit(Isc::iabc(OpCode::RETURN0, 0, 0, 0), 0);
+            self.emit(Isc::iabc(RETURN0, 0, 0, 0), line_of_on_empty_ret);
         }
         Ok(())
     }
 
-    fn walk_fncall(&mut self, call: FuncCall, exp_ret: usize) -> Result<ExprStatus, CodeGenErr> {
+    fn walk_fn_call(
+        &mut self,
+        call: FuncCall,
+        fnreg: RegIndex,
+        exp_ret: u32,
+        tail_call: bool,
+    ) -> Result<ExprStatus, CodeGenErr> {
         match call {
             FuncCall::MethodCall {
                 prefix: _,
@@ -1546,49 +1593,31 @@ impl CodeGen {
             }
             FuncCall::FreeFnCall { prefix, args } => {
                 let nparam = args.namelist.len();
-                let lineinfo = prefix.lineinfo();
+                let callln = prefix.def_begin();
 
-                let fnreg = match self.walk_common_expr(*prefix, 1)? {
+                let fnreg_real = match self.walk_common_expr(*prefix, Ctx::must_use(fnreg))? {
                     ExprStatus::Reg(reg) => reg,
-                    ExprStatus::Up(upidx) => {
-                        let reg = self.alloc_free_reg();
-                        let up = self.upvals.get(upidx as usize).unwrap();
-                        let c = self.find_const_str(up.name.as_str()).unwrap(); // must be find
-                        if let Some(stkidx) = up.stkidx {
-                            let _b = stkidx;
-                            Isc::iabc(OpCode::CALL, reg, (nparam + 1) as i32, 0);
-                            todo!("move fn to stk top");
-                        } else {
-                            self.emit(Isc::iabc(OpCode::GETTABUP, reg, 0, c), lineinfo.0);
-                            reg
-                        }
-                    }
                     _ => unreachable!(),
                 };
 
-                for (posi, param) in args.namelist.into_iter().enumerate() {
-                    let penode = ExprNode::new(param, (lineinfo.0, lineinfo.1 + (posi + 1) as u32));
-                    let expect = if posi == nparam - 1 { usize::MAX } else { 1 };
-                    match self.walk_common_expr(penode, expect)? {
-                        ExprStatus::Kst(k) => {
-                            self.load_const(k, lineinfo.0);
-                        }
-                        ExprStatus::Reg(r) => {
-                            let reg = self.alloc_free_reg();
-                            self.emit(Isc::iabc(OpCode::MOVE, reg, r, 0), lineinfo.0)
-                        }
-                        _ => unreachable!(),
-                    }
+                // if fnreg_real != fnreg {
+                //     self.emit(Isc::iabc(MOVE, fnreg, fnreg_real, 0), callln);
+                // }
+                debug_assert_eq!(fnreg, fnreg_real);
+
+                for (n, param) in args.into_inner().namelist.into_iter().enumerate() {
+                    let _ = self.walk_common_expr(*param, Ctx::must_use(1 + fnreg + n as i32));
                 }
 
+                let callisc = if tail_call { TAILCALL } else { CALL };
                 self.emit(
-                    Isc::iabc(OpCode::CALL, fnreg, (nparam + 1) as i32, exp_ret as i32 + 1),
-                    lineinfo.0,
+                    Isc::iabc(callisc, fnreg, (nparam + 1) as i32, exp_ret as i32 + 1),
+                    callln,
                 );
 
                 // reserve enuogh space for return value
-                if exp_ret > nparam {
-                    for _ in nparam..exp_ret {
+                if exp_ret as usize > nparam {
+                    for _ in nparam..exp_ret as usize {
                         self.alloc_free_reg();
                     }
                 }
@@ -1600,52 +1629,41 @@ impl CodeGen {
 
     fn walk_assign_stmt(
         &mut self,
-        vars: Vec<WithSrcLoc<Expr>>,
-        mut exprs: Vec<WithSrcLoc<Expr>>,
+        vars: Vec<ExprNode>,
+        mut exprs: Vec<ExprNode>,
     ) -> Result<(), CodeGenErr> {
         debug_assert!(!vars.is_empty());
         debug_assert!(!exprs.is_empty());
 
-        let (nvar, _nexp) = (vars.len(), exprs.len());
-        if nvar <= exprs.len() {
-            for (_idx, (var, exp)) in vars.into_iter().zip(exprs.iter_mut()).enumerate() {
-                let line = var.lineinfo().0;
-                let var_status = self.walk_common_expr(var, 1)?;
-                let expr_status = self.walk_common_expr(std::mem::take(exp), 1)?;
-                if let ExprStatus::Reg(reg) = var_status {
-                    match expr_status {
-                        ExprStatus::LitNil => {
-                            self.emit(Isc::iabc(OpCode::LOADNIL, reg, 0, 0), line)
-                        }
-                        ExprStatus::LitTrue => {
-                            self.emit(Isc::iabc(OpCode::LOADTRUE, reg, 0, 0), line)
-                        }
-                        ExprStatus::LitFalse => {
-                            self.emit(Isc::iabc(OpCode::LOADFALSE, reg, 0, 0), line)
-                        }
+        let (nvar, nexp) = (vars.len(), exprs.len());
+        if nvar <= nexp {
+            for (var, exp) in vars.into_iter().zip(exprs.iter_mut()) {
+                let vardef = var.def_begin();
+
+                let var_s = self.walk_common_expr(*var, Ctx::Allocate)?;
+
+                if let ExprStatus::Reg(vreg) = var_s {
+                    let value_s =
+                        self.walk_common_expr(*std::mem::take(exp), Ctx::must_use(vreg))?;
+                    match value_s {
+                        ExprStatus::LitNil => self.emit(Isc::iabc(LOADNIL, vreg, 0, 0), vardef),
+                        ExprStatus::LitTrue => self.emit(Isc::iabc(LOADTRUE, vreg, 0, 0), vardef),
+                        ExprStatus::LitFalse => self.emit(Isc::iabc(LOADFALSE, vreg, 0, 0), vardef),
                         ExprStatus::LitInt(i) => {
-                            if i.abs() > Isc::MAX_SBX.abs() as i64 {
-                                let kreg = self.alloc_const_reg(LValue::Int(i));
-                                self.emit(Isc::iabx(OpCode::LOADK, reg, kreg), line)
-                            } else {
-                                self.emit(Isc::iasbx(OpCode::LOADI, reg, i as i32), line)
-                            }
+                            self.emit(Isc::iasbx(LOADI, vreg, i as i32), vardef)
                         }
                         ExprStatus::LitFlt(f) => {
                             // FIX ME:
                             // use LOADF for small float.
 
                             let kreg = self.alloc_const_reg(LValue::Float(f));
-                            self.emit(Isc::iabx(OpCode::LOADK, reg, kreg), line);
+                            self.emit(Isc::iabx(LOADK, vreg, kreg), vardef);
                         }
-                        ExprStatus::Call(creg) => {
-                            self.emit(Isc::iabc(OpCode::MOVE, reg, creg, 0), line)
+                        ExprStatus::Kst(kreg) => self.emit(Isc::iabx(LOADK, vreg, kreg), vardef),
+                        ExprStatus::Call(creg) | ExprStatus::Reg(creg) => {
+                            debug_assert_eq!(creg, vreg);
+                            // self.emit(Isc::iabc(MOVE, vreg, creg, 0), vardef)
                         }
-                        ExprStatus::Kst(kreg) => {
-                            self.emit(Isc::iabx(OpCode::LOADK, reg, kreg), line)
-                        }
-                        ExprStatus::Reg(r) => self.emit(Isc::iabc(OpCode::MOVE, reg, r, 0), line),
-                        ExprStatus::Up(_up) => todo!(),
                     }
                 } else {
                     unreachable!()
@@ -1653,7 +1671,7 @@ impl CodeGen {
             }
 
             for extra in exprs.into_iter().skip(nvar) {
-                let _ = self.walk_common_expr(extra, 0)?;
+                let _ = self.walk_common_expr(*extra, Ctx::Ignore)?;
             }
         } else {
             todo!()
@@ -1663,236 +1681,370 @@ impl CodeGen {
 
     fn walk_common_expr(
         &mut self,
-        node: ExprNode,
-        expect_return: usize,
+        node: SrcLoc<Expr>,
+        ctx: ExprGenCtx,
     ) -> Result<ExprStatus, CodeGenErr> {
-        let ln = node.lineinfo().0;
-        let unique = Self::take_expr_unique(&node);
+        let (def, node) = (node.lineinfo, node.into_inner());
 
-        if let Some(status) = self.exprstate.get(&unique) {
-            Ok(status.clone())
-        } else {
-            let status = match node.into_inner() {
-                Expr::Nil => ExprStatus::LitNil,
-                Expr::True => ExprStatus::LitTrue,
-                Expr::False => ExprStatus::LitFalse,
+        let status = match ctx {
+            // case that the value of expression will be ignored,
+            // but sub expr may make an side effect
+            ExprGenCtx::Ignore => {
+                let pre_state = self.next_free_reg();
+                let status = match node {
+                    Expr::Index { prefix, key } => {
+                        let _ = self.walk_common_expr(*prefix, Ctx::Ignore);
+                        let _ = self.walk_common_expr(*key, Ctx::Ignore);
+                        ExprStatus::Reg(RegIndex::MAX)
+                    }
+                    Expr::FuncCall(call) => {
+                        let next = self.alloc_free_reg();
+                        let _ = self.walk_fn_call(call, next, 0, false);
+                        self.free_reg();
+                        ExprStatus::Reg(RegIndex::MAX)
+                    }
+                    Expr::TableCtor(ctor) => {
+                        for field in ctor {
+                            let _ = self.walk_common_expr(**field.val, Ctx::Ignore);
+                        }
+                        ExprStatus::Reg(RegIndex::MAX)
+                    }
+                    Expr::BinaryOp {
+                        lhs: l,
+                        op: _,
+                        rhs: r,
+                    } => {
+                        let _ = self.walk_common_expr(*l, Ctx::Ignore);
+                        let _ = self.walk_common_expr(*r, Ctx::Ignore);
+                        ExprStatus::Reg(RegIndex::MAX)
+                    }
+                    Expr::UnaryOp { op: _, expr } => {
+                        let _ = self.walk_common_expr(*expr, Ctx::Ignore);
+                        ExprStatus::Reg(RegIndex::MAX)
+                    }
+                    _ => ExprStatus::Reg(RegIndex::MAX),
+                };
 
-                Expr::Int(i) => {
-                    if i as i32 > Isc::MAX_SBX {
-                        let kreg = self.alloc_const_reg(i.into());
-                        ExprStatus::Kst(kreg)
-                    } else {
-                        ExprStatus::LitInt(i)
+                // recover register state
+                let mut try_recover = self.next_free_reg();
+                debug_assert!(try_recover >= pre_state);
+                while try_recover != pre_state {
+                    try_recover = self.free_reg();
+                }
+                status
+            }
+
+            ExprGenCtx::Allocate => {
+                let free = self.alloc_free_reg();
+                let status = self.emit_expr(node, free, def)?;
+                if let ExprStatus::Reg(ref r) = status {
+                    if *r < free {
+                        self.free_reg();
+                        debug_assert_eq!(self.next_free_reg(), free);
                     }
                 }
-                Expr::Float(f) => {
-                    // TODO:
-                    // Fix float check loggic
-                    if f as i32 > Isc::MAX_SBX {
-                        let kreg = self.alloc_const_reg(f.into());
-                        ExprStatus::Kst(kreg)
-                    } else {
-                        ExprStatus::LitFlt(f)
+                status
+            }
+
+            ExprGenCtx::NonRealloc { dest } => {
+                let mut status = self.emit_expr(node, dest, def)?;
+                if let ExprStatus::Reg(real) = status {
+                    if real != dest {
+                        self.emit(Isc::iabc(MOVE, dest, real, 0), def.0);
+                        status = ExprStatus::Reg(dest)
                     }
                 }
-                Expr::Literal(s) => {
-                    let kreg = self.find_const_str(&s).unwrap_or_else(|| {
-                        let strval = LValue::from(Gc::from(s));
-                        self.alloc_const_reg(strval)
-                    }); // lazyly
-                    ExprStatus::Kst(kreg)
-                }
-                Expr::Ident(id) => {
-                    // local variable ?
-                    if let Some(regidx) = self.find_local(&id) {
-                        ExprStatus::Reg(regidx)
-                    } else if let Some(upidx) = self.find_up(&id) {
-                        // upvalue occurred ?
-                        ExprStatus::Up(upidx)
-                    } else {
-                        let mut state = None;
-                        // find in hestory stack
-                        for frame in self.genstk.iter().rev() {
-                            if let Some(regidx) = frame.find_local(&id) {
-                                self.upvals.push(UpValue {
-                                    name: id.clone(),
-                                    stkidx: Some(regidx),
-                                    kind: None,
-                                });
-                                state = Some(ExprStatus::Up(self.upvals.len() as i32 - 1));
-                                break;
-                            }
-                        }
+                status
+            }
 
-                        // if not found, acquire _ENV table, record upvalue's name
-                        state.unwrap_or_else(|| {
-                            // TODO:
-                            // support for variable with attribute
-                            self.upvals.push(UpValue {
-                                name: id.clone(),
-                                stkidx: None,
-                                kind: None,
-                            });
-                            self.alloc_const_reg(LValue::from_wild(Gc::from(id)));
-                            ExprStatus::Up(self.upvals.len() as i32 - 1)
-                        })
+            ExprGenCtx::PotentialTailCall => {
+                let reg = self.alloc_free_reg();
+                match node {
+                    Expr::FuncCall(call) => self.walk_fn_call(call, reg, 1, true)?,
+                    _ => self.emit_expr(node, reg, def)?,
+                }
+            }
+
+            ExprGenCtx::MultiLevelTableIndex { depth: _ } => {
+                todo!("expr codegen: multi level Table Index optimize")
+            }
+        };
+
+        Ok(status)
+    }
+
+    fn emit_expr(
+        &mut self,
+        exp: Expr,
+        dest: RegIndex,
+        def: (u32, u32),
+    ) -> Result<ExprStatus, CodeGenErr> {
+        let status = match exp {
+            Expr::Nil => {
+                self.emit(Isc::iabc(LOADNIL, dest, 0, 0), def.0);
+                ExprStatus::Reg(dest)
+            }
+            Expr::False => {
+                self.emit(Isc::iabc(LOADFALSE, dest, 0, 0), def.0);
+                ExprStatus::Reg(dest)
+            }
+            Expr::True => {
+                self.emit(Isc::iabc(LOADTRUE, dest, 0, 0), def.0);
+                ExprStatus::Reg(dest)
+            }
+            Expr::Int(i) => {
+                if i as i32 > Isc::MAX_SBX {
+                    let kreg = self.alloc_const_reg(i.into());
+                    self.emit(Isc::iabx(LOADK, dest, kreg), def.0);
+                } else {
+                    self.emit(Isc::iasbx(LOADI, dest, i as i32), def.0);
+                }
+                ExprStatus::Reg(dest)
+            }
+
+            Expr::Float(f) => {
+                if f as i32 > Isc::MAX_SBX {
+                    let kreg = self.alloc_const_reg(f.into());
+                    self.emit(Isc::iabx(LOADK, dest, kreg), def.0);
+                } else {
+                    todo!("load small float to register")
+                }
+                ExprStatus::Reg(dest)
+            }
+
+            Expr::Literal(s) => {
+                let kreg = self.find_or_create_kstr(&s);
+                self.emit(Isc::iabx(LOADK, dest, kreg), def.0);
+                ExprStatus::Reg(dest)
+            }
+
+            Expr::Ident(id) => {
+                let reg = self.try_load_variable(id, Some(dest), def.0);
+                ExprStatus::Reg(reg)
+            }
+
+            Expr::UnaryOp { op, expr } => self.emit_unary_expr(*expr, op, dest)?,
+
+            Expr::BinaryOp { lhs, op, rhs } => self.emit_binary_expr(*lhs, *rhs, def, op, dest)?,
+
+            Expr::FuncDefine(fnbody) => {
+                let pto = self.walk_fn_body(
+                    CodeGen::ANONYMOUS.into(),
+                    fnbody.params,
+                    *fnbody.body,
+                    false,
+                    false,
+                )?;
+                self.subproto.push(pto);
+                let pidx = self.subproto.len();
+
+                self.emit(Isc::iabx(CLOSURE, dest, pidx as i32), def.0);
+                ExprStatus::Reg(dest)
+            }
+
+            Expr::Index { prefix, key } => {
+                let key_status = self.walk_common_expr(*key, Ctx::Allocate)?;
+                match self.walk_common_expr(*prefix, Ctx::MultiLevelTableIndex { depth: 1 })? {
+                    ExprStatus::Reg(pre) | ExprStatus::Call(pre) => {
+                        self.emit_index_local(key_status, def.0, pre, dest)
                     }
+                    _ => unreachable!(),
                 }
+            }
 
-                Expr::UnaryOp { op, expr } => {
-                    let es = self.walk_common_expr(*expr, 1)?;
-                    let unop_code = match op {
-                        UnOp::Minus => OpCode::UNM,
-                        UnOp::Not => OpCode::NOT,
-                        UnOp::Length => OpCode::LEN,
-                        UnOp::BitNot => OpCode::BNOT,
-                    };
+            Expr::TableCtor(fields) => self.walk_table_ctor(fields, dest, def)?,
+            Expr::FuncCall(call) => {
+                let free = self.alloc_free_reg();
+                self.walk_fn_call(call, free, 1, false)?
+            }
+            Expr::Dots => unreachable!(),
+        };
+        Ok(status)
+    }
 
-                    match es {
-                        ExprStatus::Kst(kidx) => self.emit_unary_const(unop_code, kidx, ln),
-                        ExprStatus::Reg(reg) => self.emit_unary_reg(unop_code, reg, ln),
-                        _ => unreachable!(),
-                    }
-                }
-
-                Expr::BinaryOp { lhs, op, rhs } => {
-                    let (lst, rst) = (
-                        self.walk_common_expr(*lhs, 1)?,
-                        self.walk_common_expr(*rhs, 1)?,
-                    );
-                    let destreg = self.alloc_free_reg();
-
-                    let select_arithmetic_kop = |bop: BinOp| -> OpCode {
-                        match bop {
-                            BinOp::Add => OpCode::ADDK,
-                            BinOp::Minus => OpCode::SUBK,
-                            BinOp::Mul => OpCode::MULK,
-                            BinOp::Mod => OpCode::MODK,
-                            BinOp::Pow => OpCode::POWK,
-                            BinOp::Div => OpCode::DIVK,
-                            BinOp::IDiv => OpCode::IDIVK,
-                            BinOp::BitAnd => OpCode::BANDK,
-                            BinOp::BitOr => OpCode::BORK,
-                            BinOp::BitXor => OpCode::BXORK,
-                            _ => unreachable!(),
-                        }
-                    };
-
-                    let select_arithemic_op = |bop: BinOp| -> OpCode {
-                        match bop {
-                            BinOp::Add => OpCode::ADD,
-                            BinOp::Minus => OpCode::SUB,
-                            BinOp::Mul => OpCode::MUL,
-                            BinOp::Mod => OpCode::MOD,
-                            BinOp::Pow => OpCode::POW,
-                            BinOp::Div => OpCode::DIV,
-                            BinOp::IDiv => OpCode::IDIV,
-                            BinOp::BitAnd => OpCode::BAND,
-                            BinOp::BitOr => OpCode::BOR,
-                            BinOp::BitXor => OpCode::BXOR,
-                            _ => unreachable!(),
-                        }
-                    };
-
-                    match (lst, rst) {
-                        (ExprStatus::Kst(lk), ExprStatus::Kst(rk)) => {
-                            // load left to dest reg and cover dest reg
-                            self.emit(Isc::iabx(OpCode::LOADK, destreg, lk), ln);
-                            self.emit(
-                                Isc::iabc(select_arithmetic_kop(op), destreg, destreg, rk),
-                                ln,
-                            );
-                        }
-                        (ExprStatus::Kst(lk), ExprStatus::Reg(rk)) => {
-                            self.emit(Isc::iabc(select_arithmetic_kop(op), destreg, rk, lk), ln);
-                        }
-                        (ExprStatus::Reg(lk), ExprStatus::Kst(rk)) => {
-                            self.emit(Isc::iabc(select_arithmetic_kop(op), destreg, lk, rk), ln);
-                        }
-                        (ExprStatus::Reg(lk), ExprStatus::Reg(rk)) => {
-                            self.emit(Isc::iabc(select_arithemic_op(op), destreg, lk, rk), ln);
-                        }
-                        _ => unreachable!(),
-                    };
-                    ExprStatus::Reg(destreg)
-                }
-
-                Expr::FuncDefine(def) => {
-                    let pto = self.walk_fn_body(def.params, *def.body, false)?;
-                    let pidx = self.subproto.len();
-                    self.subproto.push(pto);
-                    let reg = self.alloc_free_reg();
-                    self.emit(Isc::iabx(OpCode::CLOSURE, reg, pidx as i32), ln);
-                    ExprStatus::Reg(reg)
-                }
-
-                Expr::Index { prefix, key } => {
-                    let ln = prefix.lineinfo().0;
-                    let keys =
-                        self.walk_common_expr(WithSrcLoc::new(*key, prefix.lineinfo()), 1)?;
-
-                    match self.walk_common_expr(*prefix, 1)? {
-                        ExprStatus::Reg(preg) => self.emit_index_local(keys, ln, preg),
-                        ExprStatus::Up(upidx) => {
-                            let reg = self.load_upval(upidx);
-                            self.emit_index_local(keys, ln, reg)
-                        }
-                        ExprStatus::Call(reg) => self.emit_index_local(keys, ln, reg),
-                        _ => unreachable!(),
-                    }
-                }
-
-                Expr::FuncCall(call) => self.walk_fncall(call, expect_return)?,
-
-                Expr::TableCtor(flist) => self.walk_table_ctor(ln, flist)?,
-                Expr::Dots => unreachable!(),
+    fn emit_binary_expr(
+        &mut self,
+        lhs: SrcLoc<Expr>,
+        rhs: SrcLoc<Expr>,
+        def: (u32, u32),
+        op: BinOp,
+        destreg: RegIndex,
+    ) -> Result<ExprStatus, CodeGenErr> {
+        let (lst, rst) = {
+            let l = if let Some(ls) = GenState::peek_const_expr(&lhs) {
+                ls
+            } else {
+                self.walk_common_expr(lhs, Ctx::must_use(destreg))?
             };
-            self.exprstate.insert(unique, status.clone());
-            Ok(status)
+
+            let right_reg = self.alloc_free_reg();
+            let r = if let Some(rs) = GenState::peek_const_expr(&rhs) {
+                rs
+            } else {
+                self.walk_common_expr(rhs, Ctx::must_use(right_reg))?
+            };
+            self.free_reg(); // free right reg
+            (l, r)
+        };
+
+        let select_arithmetic_kop = |bop: BinOp| -> OpCode {
+            match bop {
+                BinOp::Add => ADDK,
+                BinOp::Minus => SUBK,
+                BinOp::Mul => MULK,
+                BinOp::Mod => MODK,
+                BinOp::Pow => POWK,
+                BinOp::Div => DIVK,
+                BinOp::IDiv => IDIVK,
+                BinOp::BitAnd => BANDK,
+                BinOp::BitOr => BORK,
+                BinOp::BitXor => BXORK,
+                _ => unreachable!(),
+            }
+        };
+        let select_arithemic_op = |bop: BinOp| -> OpCode {
+            match bop {
+                BinOp::Add => ADD,
+                BinOp::Minus => SUB,
+                BinOp::Mul => MUL,
+                BinOp::Mod => MOD,
+                BinOp::Pow => POW,
+                BinOp::Div => DIV,
+                BinOp::IDiv => IDIV,
+                BinOp::BitAnd => BAND,
+                BinOp::BitOr => BOR,
+                BinOp::BitXor => BXOR,
+                _ => unreachable!(),
+            }
+        };
+
+        let select_immediate_op = |bop: BinOp| -> OpCode {
+            match bop {
+                BinOp::Add => ADDI,
+                BinOp::Shl => SHLI,
+                BinOp::Shr => SHRI,
+                _ => unreachable!(),
+            }
+        };
+
+        const IMMEDIATE_OP: [BinOp; 3] = [BinOp::Add, BinOp::Shl, BinOp::Shr];
+
+        match (lst, rst) {
+            // both of [l, r] is kst, fallthrough
+            (ExprStatus::Kst(lk), ExprStatus::Kst(rk)) => {
+                // load left to dest reg and cover dest reg
+                self.emit(Isc::iabx(LOADK, destreg, lk), def.0);
+                self.emit(
+                    Isc::iabc(select_arithmetic_kop(op), destreg, destreg, rk),
+                    def.0,
+                );
+            }
+
+            // one of [l, r] is kst
+            (ExprStatus::Kst(lk), ExprStatus::Reg(rk))
+            | (ExprStatus::Reg(lk), ExprStatus::Kst(rk)) => {
+                self.emit(Isc::iabc(select_arithmetic_kop(op), destreg, lk, rk), def.0);
+            }
+
+            // one of [l, r] is imidiate oprand
+            (ExprStatus::LitInt(i), other) | (other, ExprStatus::LitInt(i))
+                if IMMEDIATE_OP.contains(&op) =>
+            {
+                let reg = self.try_load_expr_to_local(other, def.0);
+                self.emit(
+                    Isc::iabc(select_immediate_op(op), destreg, reg, i as i32),
+                    def.0,
+                );
+            }
+
+            // both of [l, r] is active variable
+            (ExprStatus::Reg(lk), ExprStatus::Reg(rk)) => {
+                self.emit(Isc::iabc(select_arithemic_op(op), destreg, lk, rk), def.0);
+            }
+
+            _ => unreachable!(),
+        };
+        Ok(ExprStatus::Reg(destreg))
+    }
+
+    fn emit_unary_expr(
+        &mut self,
+        expr: SrcLoc<Expr>,
+        op: UnOp,
+        freg: RegIndex,
+    ) -> Result<ExprStatus, CodeGenErr> {
+        let ln = expr.def_begin();
+        let oprand = self.walk_common_expr(expr, ExprGenCtx::Allocate)?;
+
+        let unop_code = match op {
+            UnOp::Minus => UNM,
+            UnOp::Not => NOT,
+            UnOp::Length => LEN,
+            UnOp::BitNot => BNOT,
+        };
+
+        match oprand {
+            ExprStatus::Kst(kreg) => {
+                self.emit(Isc::iabx(LOADK, freg, kreg), ln);
+                self.emit(Isc::iabc(unop_code, freg, freg, 0), ln);
+                Ok(ExprStatus::Reg(freg))
+            }
+
+            ExprStatus::Reg(reg) => {
+                self.emit(Isc::iabc(unop_code, freg, reg, 0), ln);
+                Ok(ExprStatus::Reg(freg))
+            }
+
+            ExprStatus::Call(reg) => {
+                self.emit(Isc::iabc(unop_code, reg, reg, 0), ln);
+                Ok(ExprStatus::Reg(reg))
+            }
+
+            _ => unreachable!(),
         }
     }
 
     fn walk_table_ctor(
         &mut self,
-        ln: u32,
-        flist: Vec<crate::ast::Field>,
+        flist: Vec<Field>,
+        dest: RegIndex,
+        def: (u32, u32),
     ) -> Result<ExprStatus, CodeGenErr> {
-        let tbidx = self.alloc_free_reg();
-        self.emit(Isc::iabc(OpCode::NEWTABLE, tbidx, 0, 0), ln);
-        self.emit(Isc::iax(OpCode::EXTRAARG, 0), ln);
+        self.emit(Isc::iabc(NEWTABLE, dest, 0, 0), def.0);
+        self.emit(Isc::iax(EXTRAARG, 0), def.0);
 
         let mut aryidx = 1;
         for field in flist.into_iter() {
-            let valstatus = self.walk_common_expr(*field.val, 1)?;
+            let fdefloc = field.val.def_begin();
+            let valstatus = self.walk_common_expr(**field.val, Ctx::Allocate)?;
 
             if let Some(key) = field.key {
-                let keystatus = self.walk_common_expr(*key, 1)?;
+                let keystatus = self.walk_common_expr(**key, Ctx::Allocate)?;
                 match keystatus {
                     ExprStatus::Kst(kidx) => {
                         if let ExprStatus::Kst(valreg) = valstatus {
-                            self.emit(Isc::iabck(OpCode::SETFIELD, tbidx, kidx, valreg), ln)
+                            self.emit(Isc::iabck(SETFIELD, dest, kidx, valreg), fdefloc)
                         } else {
-                            let valreg = self.try_load_expr_to_local(valstatus, ln);
-                            self.emit(Isc::iabck(OpCode::SETFIELD, tbidx, kidx, valreg), ln)
+                            let valreg = self.try_load_expr_to_local(valstatus, fdefloc);
+                            self.emit(Isc::iabck(SETFIELD, dest, kidx, valreg), fdefloc)
                         }
                     }
 
                     ExprStatus::Reg(reg) => {
                         if let ExprStatus::Kst(valreg) = valstatus {
-                            self.emit(Isc::iabck(OpCode::SETTABLE, tbidx, reg, valreg), ln)
+                            self.emit(Isc::iabck(SETTABLE, dest, reg, valreg), fdefloc)
                         } else {
-                            let valreg = self.try_load_expr_to_local(valstatus, ln);
-                            self.emit(Isc::iabc(OpCode::SETTABLE, tbidx, reg, valreg), ln)
+                            let valreg = self.try_load_expr_to_local(valstatus, fdefloc);
+                            self.emit(Isc::iabc(SETTABLE, dest, reg, valreg), fdefloc)
                         }
                     }
+
                     ExprStatus::LitInt(i) => {
-                        // TODO:
-                        // if i > Isc::MAX_B
                         if let ExprStatus::Kst(valreg) = valstatus {
-                            self.emit(Isc::iabck(OpCode::SETI, tbidx, i as i32, valreg), ln);
+                            self.emit(Isc::iabck(SETI, dest, i as i32, valreg), fdefloc);
                         } else {
-                            let valreg = self.try_load_expr_to_local(valstatus, ln);
-                            self.emit(Isc::iabc(OpCode::SETI, tbidx, i as i32, valreg), ln);
+                            let valreg = self.try_load_expr_to_local(valstatus, fdefloc);
+                            self.emit(Isc::iabc(SETI, dest, i as i32, valreg), fdefloc);
                         }
                     }
 
@@ -1903,52 +2055,107 @@ impl CodeGen {
 
             // array field
             if let ExprStatus::Kst(valreg) = valstatus {
-                self.emit(Isc::iabck(OpCode::SETI, tbidx, aryidx, valreg), ln);
+                self.emit(Isc::iabck(SETI, dest, aryidx, valreg), fdefloc);
             } else {
-                let valreg = self.try_load_expr_to_local(valstatus, ln);
-                self.emit(Isc::iabc(OpCode::SETI, tbidx, aryidx, valreg), ln);
+                let valreg = self.try_load_expr_to_local(valstatus, fdefloc);
+                self.emit(Isc::iabc(SETI, dest, aryidx, valreg), fdefloc);
             }
             aryidx += 1;
         }
-        Ok(ExprStatus::Reg(tbidx))
+        Ok(ExprStatus::Reg(dest))
     }
 
-    /// Find upvalue and return its index in upvalue list
-    fn find_up(&self, name: &str) -> Option<RegIndex> {
-        let find_in_frame = |frame: &GenState| -> Option<RegIndex> {
-            for (idx, v) in frame.upvals.iter().enumerate() {
-                if v.name == name {
-                    return Some(idx as RegIndex);
+    /// Load an variable to local register by name.
+    fn try_load_variable(&mut self, id: String, dest: Option<RegIndex>, ln: u32) -> RegIndex {
+        enum SearchState {
+            Local { reg: RegIndex },
+            UpList { idx: RegIndex },
+        }
+        use SearchState::*;
+
+        let find_in_frame = |f: &GenState| -> Option<SearchState> {
+            if let Some(reg) = f.find_local_decl(&id) {
+                return Some(SearchState::Local { reg });
+            }
+            for (idx, up) in f.upvals.iter().enumerate() {
+                if up.name() == id {
+                    return Some(SearchState::UpList {
+                        idx: idx as RegIndex,
+                    });
                 }
             }
             None
         };
 
-        let incur = find_in_frame(self);
-        if incur.is_some() {
-            incur
-        } else {
-            for (_idx, frame) in self.genstk.iter().rev().enumerate() {
-                if let Some(_idx) = find_in_frame(frame) {
-                    // TODO:
-                    // accumulate and copy upvalue to local
-                    todo!()
+        let reg = dest.unwrap_or_else(|| self.alloc_free_reg());
+        // try find in current frame
+        if let Some(s) = find_in_frame(&self.cgs) {
+            match s {
+                Local { reg } => reg,
+                UpList { idx } => {
+                    self.emit(Isc::iabc(GETUPVAL, reg, idx, 0), ln);
+                    reg
                 }
             }
+        } else {
+            // find in outter function upvalue list
+            if let Some((nrev, peek)) = self.genstk.iter().rev().enumerate().fold(
+                None,
+                |state, (idx, frame)| -> Option<(usize, SearchState)> {
+                    if state.is_none() {
+                        find_in_frame(frame).map(|s| (idx, s))
+                    } else {
+                        state
+                    }
+                },
+            ) {
+                // add upvalue decl for all intermidiate function during search
+                let fin = self.genstk.iter_mut().rev().take(nrev).rev().fold(
+                    peek,
+                    |prev_frame_state, gs| {
+                        // set _ENV
+                        let pos = if gs.upvals.is_empty() {
+                            gs.upvals.push(UpvalDecl::Env);
+                            1
+                        } else {
+                            gs.upvals.len()
+                        };
+                        let updecl = match prev_frame_state {
+                            Local { reg } => UpvalDecl::OnStack {
+                                name: id.clone(),
+                                register: reg,
+                            },
+                            UpList { idx } => UpvalDecl::InUpList {
+                                name: id.clone(),
+                                offset: idx,
+                            },
+                        };
+                        gs.upvals.push(updecl);
 
-            None
+                        SearchState::UpList {
+                            idx: pos as RegIndex,
+                        }
+                    },
+                );
+
+                let upidx = match fin {
+                    UpList { idx } => idx,
+                    Local { reg: _ } => unreachable!(),
+                };
+
+                self.emit(Isc::iabc(GETUPVAL, reg, upidx as RegIndex, 0), ln);
+            } else {
+                // not found in all protos, get  from _ENV
+                let name_kreg = self.find_or_create_kstr(&id);
+                self.emit(Isc::iabc(GETTABUP, reg, 0, name_kreg), ln);
+            }
+            reg
         }
-    }
-
-    /// use (line, col) as unique id
-    fn take_expr_unique(node: &ExprNode) -> usize {
-        let line = node.lineinfo().0 as usize;
-        line << (16 + node.lineinfo().1 as usize)
     }
 }
 
 impl CodeGen {
-    pub fn generate(ast_root: Block, strip: bool) -> Result<Proto, CodeGenErr> {
+    pub fn generate(ast_root: SrcLoc<Block>, strip: bool) -> Result<Proto, CodeGenErr> {
         let mut gen = Self::new(strip);
         gen.consume(ast_root)
     }
@@ -2055,8 +2262,8 @@ impl ChunkDumper {
     }
 
     fn dump_proto(chunk: &Proto, bw: &mut BufWriter<impl Write>) -> std::io::Result<()> {
-        Self::dump_varint(chunk.upvals.len(), bw)?;
-        Self::dump_string(&chunk.source, bw)?;
+        Self::dump_varint(chunk.updecl.len(), bw)?;
+        Self::dump_string(unsafe { chunk.source.as_str_unchecked() }, bw)?;
         Self::dump_varint(chunk.begline as usize, bw)?;
         Self::dump_varint(chunk.endline as usize, bw)?;
         bw.write_all(&[chunk.nparam, chunk.vararg as u8, chunk.nreg])?;
@@ -2071,17 +2278,17 @@ impl ChunkDumper {
             Self::dump_const(k, bw)?;
         }
 
-        Self::dump_varint(chunk.upvals.len(), bw)?;
-        for up in chunk.upvals.iter() {
-            let (onstk, stkid) = if let Some(idx) = up.stkidx {
-                (true, idx)
-            } else {
-                (false, 0)
+        Self::dump_varint(chunk.updecl.len(), bw)?;
+        for up in chunk.updecl.iter() {
+            let (onstk, stkid) = match up {
+                UpvalDecl::OnStack { name: _, register } => (true, *register),
+
+                UpvalDecl::InUpList { name: _, offset } => (false, *offset),
+                UpvalDecl::Env => (false, 0),
             };
-            let attr: u8 = if let Some(a) = up.kind { a as u8 } else { 0 };
+            // let attr: u8 = if let Some(a) = up.kind { a as u8 } else { 0 };
             Self::dump_varint(onstk as usize, bw)?;
             Self::dump_varint(stkid as usize, bw)?;
-            Self::dump_varint(attr as usize, bw)?;
         }
 
         Self::dump_varint(chunk.subfn.len(), bw)?;
@@ -2101,9 +2308,9 @@ impl ChunkDumper {
             Self::dump_varint(loc.end_pc as usize, bw)?;
         }
 
-        Self::dump_varint(chunk.upvals.len(), bw)?;
-        for up in chunk.upvals.iter() {
-            Self::dump_string(&up.name, bw)?;
+        Self::dump_varint(chunk.updecl.len(), bw)?;
+        for up in chunk.updecl.iter() {
+            Self::dump_string(up.name(), bw)?;
         }
 
         Ok(())
@@ -2111,7 +2318,7 @@ impl ChunkDumper {
 
     pub fn undump_proto(r: &mut BufReader<impl Read>) -> Result<Proto, BinLoadErr> {
         let nupval = Self::undump_varint(r)?;
-        let src = Rc::new(Self::undump_string(r)?);
+        let src = LValue::from(Self::undump_string(r)?);
         let begline = Self::undump_varint(r)?;
         let endline = Self::undump_varint(r)?;
 
@@ -2143,28 +2350,34 @@ impl ChunkDumper {
         let mut ups = Vec::with_capacity(up_size);
         for _ in 0..up_size {
             r.read_exact(&mut byte)?;
-            let onstk = u8::from_ne_bytes(byte) != 0;
+            let _onstk = u8::from_ne_bytes(byte) != 0;
 
             r.read_exact(&mut byte)?;
-            let stkid = u8::from_ne_bytes(byte);
+            let _stkid = u8::from_ne_bytes(byte);
 
             r.read_exact(&mut byte)?;
             // TODO:
             // support attribute dump
             // let attr = ...
-
-            ups.push(UpValue {
-                name: String::new(),
-                stkidx: if onstk { Some(stkid as RegIndex) } else { None },
-                kind: None,
-            })
+            // let updecl = match (onstk, stkid) {
+            //     (false, 0) => UpvalDecl::Env,
+            //     (false, _) => UpvalDecl::InEnv {
+            //         name: LValue::Nil,
+            //         self_upidx: stkid as usize,
+            //     },
+            //     (true, _) => UpvalDecl::OnStack {
+            //         name: LValue::Nil,
+            //         parent_upidx: stkid as usize,
+            //     },
+            // };
+            // ups.push(updecl);
         }
 
         let proto_size = Self::undump_varint(r)?;
         let mut subfn = Vec::with_capacity(proto_size);
         for _ in 0..proto_size {
             let mut p = Self::undump_proto(r)?;
-            p.source = src.clone();
+            p.source = src;
             subfn.push(Gc::new(p));
         }
 
@@ -2191,22 +2404,27 @@ impl ChunkDumper {
         let upval_num = Self::undump_varint(r)?;
         debug_assert_eq!(upval_num, nupval);
         for up in ups.iter_mut().take(upval_num) {
-            up.name = Self::undump_string(r)?;
+            let upname = Self::undump_string(r)?;
+            match up {
+                UpvalDecl::OnStack { name, register: _ } => *name = upname,
+                UpvalDecl::InUpList { name, offset: _ } => *name = upname,
+                UpvalDecl::Env => {}
+            }
         }
 
         Ok(Proto {
             vararg: is_vararg,
-            nparam: nparam,
-            nreg: nreg,
+            nparam,
+            nreg,
             begline: begline as u32,
             endline: endline as u32,
-            kst: kst,
-            code: code,
-            subfn: subfn,
+            kst,
+            code,
+            subfn,
             pcline: Vec::new(),
             source: src,
             locvars: Vec::new(),
-            upvals: ups,
+            updecl: ups,
         })
     }
 
@@ -2340,7 +2558,7 @@ mod test {
         use crate::codegen::OpMode;
 
         for signed in [0, 1, 123, 999, -1, -999] {
-            let i = Isc::iasbx(super::OpCode::LOADI, 0, signed);
+            let i = Isc::iasbx(super::LOADI, 0, signed);
             assert_eq!(i.mode(), OpMode::IAsBx);
             let (_, a, sbx) = i.repr_asbx();
             assert_eq!(a, 0);
@@ -2354,6 +2572,7 @@ mod test {
         assert_eq!(std::mem::size_of::<Instruction>(), 4);
     }
 
+    #[allow(dead_code)]
     fn dump_and_undump<W, R, T>(filename: &str, to_test: &[T], wop: W, rop: R)
     where
         W: Fn(&T, &mut BufWriter<File>),
@@ -2404,7 +2623,7 @@ mod test {
         "#;
 
         let ast = Parser::parse(src, None).unwrap();
-        let origin = super::CodeGen::generate(ast, false).unwrap();
+        let origin = super::CodeGen::generate(*ast, false).unwrap();
         // println!("{:?}", origin);
 
         let tmp_file = std::fs::File::create(tmpfile.clone()).unwrap();

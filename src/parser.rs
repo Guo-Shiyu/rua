@@ -75,7 +75,10 @@ impl Parser<'_> {
         };
 
         let end = self.lex.line();
-        Ok(BasicBlock::new(Block::new(None, stats, ret), (beg, end)))
+        Ok(Box::new(SrcLoc::new(
+            Block::new(None, stats, ret),
+            (beg, end),
+        )))
     }
 
     fn is_block_end(&self) -> bool {
@@ -135,24 +138,24 @@ impl Parser<'_> {
         };
 
         let end = self.lex.line();
-        Ok(StmtNode::new(stmt, (begin, end)))
+        Ok(Box::new(SrcLoc::new(stmt, (begin, end))))
     }
 
     /// single expr as statememt|
     fn expr_stat(&mut self) -> Result<StmtNode, SyntaxError> {
         let expr = self.expr()?;
-        let (lineinfo, inner) = (expr.lineinfo, *expr.into_inner());
+        let (lineinfo, inner) = (expr.lineinfo, expr.into_inner());
 
         let stmt = if let Expr::FuncCall(call) = inner {
-            StmtNode::new(Stmt::FuncCall(call), lineinfo)
+            SrcLoc::new(Stmt::FuncCall(call), lineinfo)
         } else {
-            let first = ExprNode::new(inner, lineinfo);
+            let first = Box::new(SrcLoc::new(inner, lineinfo));
             if self.test(Token::Comma) {
                 // multi assignment
                 let varlist = self.exprlist(Some(first))?;
                 self.check_and_next(Token::Assign)?;
                 let exprlist = self.exprlist(None)?;
-                StmtNode::new(
+                SrcLoc::new(
                     Stmt::Assign {
                         vars: varlist,
                         exprs: exprlist,
@@ -162,7 +165,7 @@ impl Parser<'_> {
             } else if self.test_and_next(Token::Assign)? {
                 // single assignment
                 let exprlist = self.exprlist(None)?;
-                StmtNode::new(
+                SrcLoc::new(
                     Stmt::Assign {
                         vars: vec![first],
                         exprs: exprlist,
@@ -171,10 +174,10 @@ impl Parser<'_> {
                 )
             } else {
                 // single expr as statememt
-                StmtNode::new(Stmt::Expr(first), lineinfo)
+                SrcLoc::new(Stmt::Expr(first), lineinfo)
             }
         };
-        Ok(stmt)
+        Ok(Box::new(stmt))
     }
 
     /// label ::= `::` Name `::`
@@ -196,14 +199,11 @@ impl Parser<'_> {
     fn goto(&mut self) -> Result<Stmt, SyntaxError> {
         self.next()?; // skip `goto`
 
-        let mut lable = if let Token::Ident(lable) = &mut self.current {
-            let line = self.lex.line();
-            std::mem::take(lable)
+        if let Token::Ident(lable) = &mut self.current {
+            Ok(Stmt::Goto(std::mem::take(lable)))
         } else {
-            return Err(self.unexpected("identifier"));
-        };
-
-        Ok(Stmt::Goto(lable))
+            Err(self.unexpected("identifier"))
+        }
     }
 
     /// do ::= `do` block `end`
@@ -245,35 +245,36 @@ impl Parser<'_> {
 
         let then = self.block()?;
 
-        // if-else-end
         if self.test_and_next(Token::Else)? {
+            // if-else-end
             let els = self.block()?;
             self.check_and_next(Token::End)?;
-            Ok(Stmt::IfElse {
-                cond: cond,
-                then: then,
-                els: Some(els),
-            })
-        } else
-        // if-elseif-...-end
-        if self.test(Token::Elseif) {
-            let begin = self.lex.line();
-            let else_stmt = self.if_else()?;
-            let end = self.lex.line();
-
-            let node = SrcLoc::new(else_stmt, (begin, end));
-            let els = BasicBlock::new(
-                Block::new(None, vec![node], None),
-                (node.def_begin(), node.def_end()),
-            );
             Ok(Stmt::IfElse {
                 cond,
                 then,
                 els: Some(els),
             })
-        }
-        // if-then-end
-        else {
+        } else if self.test(Token::Elseif) {
+            // if-elseif-...-end
+            let begin = self.lex.line();
+            let else_stmt = {
+                let stmt = self.if_else()?;
+                let end = self.lex.line();
+                Box::new(SrcLoc::new(stmt, (begin, end)))
+            };
+
+            let els = Box::new(SrcLoc::new(
+                Block::new(None, vec![else_stmt], None),
+                (begin, self.lex.line()),
+            ));
+
+            Ok(Stmt::IfElse {
+                cond,
+                then,
+                els: Some(els),
+            })
+        } else {
+            // if-then-end
             self.check_and_next(Token::End)?;
             Ok(Stmt::IfElse {
                 cond,
@@ -288,7 +289,7 @@ impl Parser<'_> {
     fn for_stmt(&mut self) -> Result<Stmt, SyntaxError> {
         self.next()?; // skip `for`
 
-        let mut iter = if let Token::Ident(first) = &mut self.current {
+        let iter = if let Token::Ident(first) = &mut self.current {
             let line = self.lex.line();
             SrcLoc::new(std::mem::take(first), (line, line))
         } else {
@@ -354,7 +355,10 @@ impl Parser<'_> {
                 self.next()?;
                 self.expr()?
             }
-            _ => ExprNode::new(Expr::Int(1), (self.lex.line(), self.lex.line())),
+            _ => {
+                let ln = self.lex.line();
+                Box::new(SrcLoc::new(Expr::Int(1), (ln, ln)))
+            }
         };
         self.check_and_next(Token::Do)?;
         let body = self.block()?;
@@ -373,11 +377,13 @@ impl Parser<'_> {
     fn global_fndef(&mut self) -> Result<Stmt, SyntaxError> {
         self.next()?; // skip `function`
         let (pres, method) = self.func_name()?;
+        let beg = self.lex.line();
         let body = self.func_body()?;
+        let end = self.lex.line();
         Ok(Stmt::FnDef {
             pres,
             method,
-            body: body,
+            body: Box::new(SrcLoc::new(body, (beg, end))),
         })
     }
 
@@ -392,14 +398,13 @@ impl Parser<'_> {
 
         self.next()?; // eat func name
 
+        let beg = self.lex.line();
         let fndef = self.func_body()?;
-        let fndef = ExprNode::new(
-            Expr::FuncDefine(*fndef.into_inner()),
-            (fndef.def_begin(), fndef.def_end()),
-        );
+        let end = self.lex.line();
+        let fndef = SrcLoc::new(Expr::FuncDefine(fndef), (beg, end));
         Ok(Stmt::LocalVarDecl {
             names: vec![(func_name, None)],
-            exprs: vec![fndef],
+            exprs: vec![Box::new(fndef)],
         })
     }
 
@@ -457,7 +462,9 @@ impl Parser<'_> {
     }
 
     /// funcname ::= Name {`.` Name} [`:` Name]
-    fn func_name(&mut self) -> Result<(Vec<SrcLoc<String>>, Option<SrcLoc<String>>), SyntaxError> {
+    fn func_name(
+        &mut self,
+    ) -> Result<(Vec<SrcLoc<String>>, Option<Box<SrcLoc<String>>>), SyntaxError> {
         const DOT: bool = true;
         const COLON: bool = false;
         let mut pres = Vec::with_capacity(4);
@@ -494,20 +501,17 @@ impl Parser<'_> {
             }
         }
 
-        Ok((pres, method))
+        Ok((pres, method.map(Box::new)))
     }
 
     /// funcbody ::= `(` [parlist] `)` block `end`
-    fn func_body(&mut self) -> Result<SrcLoc<FuncBody>, SyntaxError> {
-        let begin = self.lex.line();
+    fn func_body(&mut self) -> Result<FuncBody, SyntaxError> {
         self.check_and_next(Token::LP)?;
         let params = self.param_list()?;
         self.check_and_next(Token::RP)?;
         let body = self.block()?;
         self.check_and_next(Token::End)?;
-        let end = self.lex.line();
-
-        Ok(SrcLoc::new(FuncBody { params, body }, (begin, end)))
+        Ok(FuncBody { params, body })
     }
 
     /// paralist ::= namelist [`,` `...`] | `...`
@@ -579,29 +583,29 @@ impl Parser<'_> {
     }
 
     /// exp ::=  `nil` |
-    ///	    `false` |
-    ///	    `true` |
-    ///	    Numeral |
-    ///	    LiteralString |
-    ///	    `...` |
-    ///	    functiondef |
-    ///	    prefixexp |
-    ///	    tablector |
-    ///	    exp binop exp |
-    ///	    unop exp
+    ///  `false` |
+    ///  `true` |
+    ///  Numeral |
+    ///  LiteralString |
+    ///  `...` |
+    ///  functiondef |
+    ///  prefixexp |
+    ///  tablector |
+    ///  exp binop exp |
+    ///  unop exp
     fn subexpr(&mut self, limit: usize) -> Result<ExprNode, SyntaxError> {
         let begin = self.lex.line();
         let mut lhs = if let Some(uniop) = self.unary_op() {
             self.next()?;
             let sub = self.subexpr(Self::UNARY_PRIORITY)?;
             let end = self.lex.line();
-            ExprNode::new(
+            Box::new(SrcLoc::new(
                 Expr::UnaryOp {
                     op: uniop,
-                    expr: Box::new(sub),
+                    expr: sub,
                 },
                 (begin, end),
-            )
+            ))
         } else {
             self.simple_expr()?
         };
@@ -615,14 +619,14 @@ impl Parser<'_> {
                 // parse rhs with right associativity poritity
                 let rhs = self.subexpr(Self::BINARY_PRIORITY[binop as usize].1)?;
                 let end = self.lex.line();
-                lhs = ExprNode::new(
+                lhs = Box::new(SrcLoc::new(
                     Expr::BinaryOp {
-                        lhs: Box::new(lhs),
+                        lhs,
                         op: binop,
-                        rhs: Box::new(rhs),
+                        rhs,
                     },
                     (begin, end),
-                );
+                ));
             } else {
                 break;
             }
@@ -645,18 +649,16 @@ impl Parser<'_> {
         } {
             let line_info = (self.lex.line(), self.lex.line());
             self.next()?;
-            return Ok(ExprNode::new(exp, line_info));
+            return Ok(Box::new(SrcLoc::new(exp, line_info)));
         };
 
-        let begin = self.lex.line();
         match &self.current {
             Token::Function => {
                 self.next()?;
+                let beg = self.lex.line();
                 let body = self.func_body()?;
-                Ok(ExprNode::new(
-                    Expr::FuncDefine(*body.into_inner()),
-                    (body.def_begin(), body.def_end()),
-                ))
+                let end = self.lex.line();
+                Ok(Box::new(SrcLoc::new(Expr::FuncDefine(body), (beg, end))))
             }
             Token::LB => Ok(self.table_constructor()?),
 
@@ -734,7 +736,11 @@ impl Parser<'_> {
         }
         self.next()?;
         let end = self.lex.line();
-        Ok(ExprNode::new(Expr::TableCtor(fieldlist), (beg, end)))
+
+        Ok(Box::new(SrcLoc::new(
+            Expr::TableCtor(fieldlist),
+            (beg, end),
+        )))
     }
 
     /// field ::= `[` exp `]` `=` exp | Name `=` exp | exp
@@ -764,7 +770,7 @@ impl Parser<'_> {
             self.next()?; // skip name
             self.next()?; // skip '='
             let line = self.lex.line();
-            let expr = ExprNode::new(Expr::Ident(holder), (line, line));
+            let expr = Box::new(SrcLoc::new(Expr::Ident(holder), (line, line)));
             Ok(Field::new(Some(Box::new(expr)), Box::new(self.expr()?)))
         } else {
             // expr
@@ -792,7 +798,10 @@ impl Parser<'_> {
 
         let begin = self.lex.line();
         self.next()?;
-        Ok(ExprNode::new(Expr::Ident(holder), (begin, self.lex.line())))
+        Ok(Box::new(SrcLoc::new(
+            Expr::Ident(holder),
+            (begin, self.lex.line()),
+        )))
     }
 
     /// suffixedexp ->
@@ -813,14 +822,10 @@ impl Parser<'_> {
                     };
 
                     let attr = Expr::Literal(holder);
+                    let curln = self.lex.line();
+                    let key = Box::new(SrcLoc::new(attr, (curln, curln)));
                     self.next()?;
-                    ExprNode::new(
-                        Expr::Index {
-                            prefix: Box::new(prefix),
-                            key: Box::new(attr),
-                        },
-                        (begin, self.lex.line()),
-                    )
+                    SrcLoc::new(Expr::Index { prefix, key }, (begin, self.lex.line()))
                 }
 
                 Token::LS => {
@@ -828,13 +833,7 @@ impl Parser<'_> {
                     let key = self.expr()?;
                     self.check_and_next(Token::RS)?;
 
-                    ExprNode::new(
-                        Expr::Index {
-                            prefix: Box::new(prefix),
-                            key: key.into_inner(),
-                        },
-                        (begin, self.lex.line()),
-                    )
+                    SrcLoc::new(Expr::Index { prefix, key }, (begin, self.lex.line()))
                 }
 
                 // method call
@@ -851,19 +850,19 @@ impl Parser<'_> {
                     self.next()?; // skip name
 
                     let args = self.func_args()?;
-                    ExprNode::new(
+                    SrcLoc::new(
                         Expr::FuncCall(FuncCall::MethodCall {
-                            prefix: prefix,
-                            method: SrcLoc::new(holder, (line, line)),
+                            prefix,
+                            method: Box::new(SrcLoc::new(holder, (line, line))),
                             args,
                         }),
                         (begin, self.lex.line()),
                     )
                 }
 
-                Token::Literal(_) | Token::LB | Token::LP => ExprNode::new(
+                Token::Literal(_) | Token::LB | Token::LP => SrcLoc::new(
                     Expr::FuncCall(FuncCall::FreeFnCall {
-                        prefix: prefix,
+                        prefix,
                         args: self.func_args()?,
                     }),
                     (begin, self.lex.line()),
@@ -872,7 +871,7 @@ impl Parser<'_> {
                 _ => return Ok(prefix),
             };
 
-            prefix = expr_node;
+            prefix = Box::new(expr_node);
         }
     }
 
@@ -901,13 +900,15 @@ impl Parser<'_> {
 
             Token::Literal(s) => {
                 std::mem::swap(s, &mut holder);
-                self.next()?; // skip string literal
 
                 let line = self.lex.line();
+                let litnode = Box::new(SrcLoc::new(Expr::Literal(holder), (line, line)));
+                self.next()?; // skip string literal
+
                 Ok(SrcLoc::new(
                     ParaList {
                         vargs: false,
-                        namelist: vec![ExprNode::new(Expr::Literal(holder), (line, line))],
+                        namelist: vec![litnode],
                     },
                     (beg, self.lex.line()),
                 ))
@@ -976,16 +977,16 @@ impl Parser<'_> {
         parser.next()?;
 
         // parse statements
-        let block = parser.block()?;
+        let mut block = parser.block()?;
 
         debug_assert!(block.chunk.as_str() == Block::NAMELESS_CHUNK);
         debug_assert!(parser.current.is_eof());
         debug_assert!(parser.ahead.is_eof());
 
-        Ok(SrcLoc::new(
-            Block::new(chunkname, block.stats, block.ret),
-            (0, parser.lex.line()),
-        ))
+        if let Some(cn) = chunkname {
+            block.chunk = cn;
+        }
+        Ok(block)
     }
 }
 

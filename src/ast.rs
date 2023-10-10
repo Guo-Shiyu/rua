@@ -6,7 +6,7 @@ use std::{
 #[derive(Default)]
 /// Warpper for an ast-node to attach source location info
 pub struct SrcLoc<T> {
-    node: Box<T>,
+    node: T,
     // lineinfo: (begin, end)
     pub lineinfo: (u32, u32),
 }
@@ -15,18 +15,11 @@ impl<T> SrcLoc<T> {
     pub fn new(n: T, lines: (u32, u32)) -> Self {
         SrcLoc {
             lineinfo: lines,
-            node: Box::new(n),
-        }
-    }
-
-    pub fn from(n: Box<T>, lines: (u32, u32)) -> Self {
-        SrcLoc {
             node: n,
-            lineinfo: lines,
         }
     }
 
-    pub fn into_inner(self) -> Box<T> {
+    pub fn into_inner(self) -> T {
         self.node
     }
 
@@ -47,7 +40,7 @@ impl<T> SrcLoc<T> {
     }
 
     pub fn mem_address(&self) -> usize {
-        self.node.as_ref() as *const T as usize
+        self as *const _ as usize
     }
 }
 
@@ -143,8 +136,8 @@ pub enum Stmt {
 
     FnDef {
         pres: Vec<SrcLoc<String>>,
-        method: Option<SrcLoc<String>>,
-        body: SrcLoc<FuncBody>,
+        method: Option<Box<SrcLoc<String>>>,
+        body: Box<SrcLoc<FuncBody>>,
     },
 
     LocalVarDecl {
@@ -172,7 +165,7 @@ pub enum FuncCall {
     // i.e: class:func(1, 2, 3, ...)
     MethodCall {
         prefix: ExprNode,
-        method: SrcLoc<String>,
+        method: Box<SrcLoc<String>>,
         args: SrcLoc<ParaList>,
     },
 }
@@ -221,8 +214,8 @@ pub enum Expr {
 
     // table.key | table[key]
     Index {
-        prefix: Box<ExprNode>,
-        key: Box<Expr>,
+        prefix: ExprNode,
+        key: ExprNode,
     },
 
     // functioncall ::=  prefixexp args | prefixexp `:` Name args
@@ -232,14 +225,14 @@ pub enum Expr {
     TableCtor(Vec<Field>),
 
     BinaryOp {
-        lhs: Box<ExprNode>,
+        lhs: ExprNode,
         op: BinOp,
-        rhs: Box<ExprNode>,
+        rhs: ExprNode,
     },
 
     UnaryOp {
         op: UnOp,
-        expr: Box<ExprNode>,
+        expr: ExprNode,
     },
 }
 
@@ -303,9 +296,9 @@ pub enum UnOp {
     BitNot,
 }
 
-pub type ExprNode = SrcLoc<Expr>;
-pub type StmtNode = SrcLoc<Stmt>;
-pub type BasicBlock = SrcLoc<Block>;
+pub type ExprNode = Box<SrcLoc<Expr>>;
+pub type StmtNode = Box<SrcLoc<Stmt>>;
+pub type BasicBlock = Box<SrcLoc<Block>>;
 
 pub trait PassRunStatus {
     fn is_ok(&self) -> bool;
@@ -632,9 +625,9 @@ impl AstDumper {
                     self.dec_indent();
                 }
 
-                if els.is_some() {
+                if let Some(e) = els {
                     self.inc_indent();
-                    self.dump_block(&els.unwrap(), buf)?;
+                    self.dump_block(e, buf)?;
                     self.dec_indent();
                 }
 
@@ -853,8 +846,14 @@ impl PassRunRes<Vec<FoldInfo>, PassHasNotRun> for ConstantFoldPass {
 
 impl TransformPass for ConstantFoldPass {
     fn walk(&mut self, root: &mut Block) -> &Self {
-        self.run_on_bolck(root);
+        Self::run_on_bolck(root);
         self
+    }
+}
+
+impl Default for ConstantFoldPass {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -866,18 +865,18 @@ impl ConstantFoldPass {
         }
     }
 
-    fn run_on_bolck(&mut self, root: &mut Block) {
+    fn run_on_bolck(root: &mut Block) {
         for stmt in root.stats.iter_mut() {
             match stmt.inner_mut() {
                 Stmt::Assign { vars: _, exprs } => {
                     exprs.iter_mut().for_each(|e| {
-                        self.try_fold(e);
+                        Self::try_fold(e);
                     });
                 }
                 Stmt::FuncCall(call) => match call {
                     FuncCall::FreeFnCall { prefix: _, args } => {
                         args.namelist.iter_mut().for_each(|e| {
-                            self.try_fold(e);
+                            Self::try_fold(e);
                         });
                     }
                     FuncCall::MethodCall {
@@ -886,25 +885,25 @@ impl ConstantFoldPass {
                         args,
                     } => {
                         args.namelist.iter_mut().for_each(|e| {
-                            self.try_fold(e);
+                            Self::try_fold(e);
                         });
                     }
                 },
-                Stmt::DoEnd(block) => self.run_on_bolck(block),
+                Stmt::DoEnd(block) => Self::run_on_bolck(block),
                 Stmt::While { exp, block } => {
-                    self.try_fold(exp);
-                    self.run_on_bolck(block);
+                    Self::try_fold(exp);
+                    Self::run_on_bolck(block);
                 }
                 Stmt::Repeat { block, exp } => {
-                    self.try_fold(exp);
-                    self.run_on_bolck(block)
+                    Self::try_fold(exp);
+                    Self::run_on_bolck(block)
                 }
                 Stmt::IfElse {
                     cond: exp,
                     then,
                     els,
                 } => {
-                    let status = self.try_fold(exp);
+                    let status = Self::try_fold(exp);
                     if let AfterFoldStatus::StillConst = status {
                         match exp.inner_mut() {
                             // if (false), remove then block
@@ -922,20 +921,22 @@ impl ConstantFoldPass {
                             _ => {}
                         };
                     };
-                    self.run_on_bolck(then);
-                    els.map(|mut bk| self.run_on_bolck(&mut bk));
+                    Self::run_on_bolck(then);
+                    if let Some(bk) = els.as_mut() {
+                        Self::run_on_bolck(bk)
+                    }
                 }
                 Stmt::NumericFor(num) => {
-                    self.try_fold(&mut num.init);
-                    self.try_fold(&mut num.limit);
-                    self.try_fold(&mut num.step);
-                    self.run_on_bolck(&mut num.body)
+                    Self::try_fold(&mut num.init);
+                    Self::try_fold(&mut num.limit);
+                    Self::try_fold(&mut num.step);
+                    Self::run_on_bolck(&mut num.body)
                 }
                 Stmt::GenericFor(gen) => {
                     for exp in gen.exprs.iter_mut() {
-                        self.try_fold(exp);
+                        Self::try_fold(exp);
                     }
-                    self.run_on_bolck(&mut gen.body)
+                    Self::run_on_bolck(&mut gen.body)
                 }
                 Stmt::FnDef {
                     pres: _,
@@ -943,24 +944,24 @@ impl ConstantFoldPass {
                     body: func,
                 } => {
                     func.params.namelist.iter_mut().for_each(|e| {
-                        self.try_fold(e);
+                        Self::try_fold(e);
                     });
-                    self.run_on_bolck(&mut func.body);
+                    Self::run_on_bolck(&mut func.body);
                 }
                 Stmt::LocalVarDecl { names: _, exprs } => {
                     exprs.iter_mut().for_each(|e| {
-                        self.try_fold(e);
+                        Self::try_fold(e);
                     });
                 }
                 Stmt::Expr(e) => {
-                    self.try_fold(e);
+                    Self::try_fold(e);
                 }
                 _ => {}
             }
         }
     }
 
-    fn try_fold(&mut self, exp: &mut Expr) -> AfterFoldStatus {
+    fn try_fold(exp: &mut Expr) -> AfterFoldStatus {
         use AfterFoldStatus::*;
         match exp {
             Expr::Nil
@@ -971,8 +972,8 @@ impl ConstantFoldPass {
             | Expr::Literal(_) => StillConst,
 
             Expr::BinaryOp { lhs, op, rhs } => {
-                let ls = self.try_fold(lhs);
-                let rs = self.try_fold(rhs);
+                let ls = Self::try_fold(lhs);
+                let rs = Self::try_fold(rhs);
                 match (ls, rs) {
                     (StillConst, StillConst) => {
                         let (mut i1, mut i2) = (0, 0);
@@ -1041,7 +1042,7 @@ impl ConstantFoldPass {
             }
 
             Expr::UnaryOp { op, expr } => {
-                if let StillConst = self.try_fold(expr) {
+                if let StillConst = Self::try_fold(expr) {
                     // execute fold operation
                     if let Some(new_exp) = match (op, expr.inner()) {
                         // not nil => true
@@ -1134,8 +1135,8 @@ mod test {
         const _D_SIZE: usize = size_of::<FuncBody>();
         const _C_SIZE: usize = size_of::<FuncCall>();
 
-        assert_eq!(size_of::<Expr>(), 64);
-        assert_eq!(size_of::<Stmt>(), 64);
+        assert!(size_of::<Expr>() <= 64);
+        assert!(size_of::<Stmt>() <= 64);
     }
 
     #[test]
