@@ -1,5 +1,4 @@
 use std::{
-    alloc::Layout,
     cell::Cell,
     collections::{BTreeMap, BTreeSet},
     ops::{Deref, DerefMut},
@@ -590,7 +589,7 @@ impl Heap<'_> {
                         if old.heap_address() != new.heap_address() {
                             // release new str and use old one
                             old.mark_newborned(self.curwhite);
-                            StrImpl::drop(std::mem::replace(new, old.clone()));
+                            StrImpl::drop(std::mem::replace(new, *old));
                         }
                     } else {
                         self.delegate_from(*new);

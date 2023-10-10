@@ -1,8 +1,8 @@
 use std::env;
 
-use rua::{ffi::StdLib, state::State, LuaErr};
+use rua::{ffi::StdLib, state::State, RuaErr};
 
-fn main() -> Result<(), LuaErr> {
+fn main() -> Result<(), RuaErr> {
     let mut vm = State::with_libs(&[StdLib::Base]);
     if let Some(file) = env::args().nth(1) {
         vm.script_file(&file)?;

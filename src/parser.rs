@@ -20,7 +20,7 @@ impl SyntaxError {
     }
 }
 
-/// An LL(1) parser for Lua 5.4       
+/// An LL(2) parser for Lua 5.4       
 ///
 /// Full syntax of [Lua 5.4](https://github.com/Guo-Shiyu/luac-rs/blob/a84ea7bbcfcc05028865f2ea04cf294d94acdb40/doc/lua54%20syntax.ebnf)
 /// can be find here.
@@ -50,10 +50,11 @@ impl Parser<'_> {
     }
 
     /// block ::= {stat} [retstat]
-    fn block(&mut self) -> Result<Block, SyntaxError> {
+    fn block(&mut self) -> Result<BasicBlock, SyntaxError> {
         const DEFAULT_BLOCK_SIZE: usize = 64;
         let mut stats = Vec::with_capacity(DEFAULT_BLOCK_SIZE);
 
+        let beg = self.lex.line();
         loop {
             // ';' after each statement is optional
             while self.test_and_next(Token::Semi)? {}
@@ -73,7 +74,11 @@ impl Parser<'_> {
             None
         };
 
-        Ok(Block::new(None, stats, ret))
+        let end = self.lex.line();
+        Ok(Box::new(SrcLoc::new(
+            Block::new(None, stats, ret),
+            (beg, end),
+        )))
     }
 
     fn is_block_end(&self) -> bool {
@@ -128,45 +133,51 @@ impl Parser<'_> {
                 }
 
                 // expr as statment
-                _ => self.expr_stat()?,
+                _ => return self.expr_stat(),
             }
         };
 
         let end = self.lex.line();
-        Ok(StmtNode::new(stmt, (begin, end)))
+        Ok(Box::new(SrcLoc::new(stmt, (begin, end))))
     }
 
     /// single expr as statememt|
-    fn expr_stat(&mut self) -> Result<Stmt, SyntaxError> {
+    fn expr_stat(&mut self) -> Result<StmtNode, SyntaxError> {
         let expr = self.expr()?;
-        let (lineinfo, inner) = (expr.lineinfo(), expr.into_inner());
+        let (lineinfo, inner) = (expr.lineinfo, expr.into_inner());
 
         let stmt = if let Expr::FuncCall(call) = inner {
-            Stmt::FuncCall(call)
+            SrcLoc::new(Stmt::FuncCall(call), lineinfo)
         } else {
-            let first = ExprNode::new(inner, lineinfo);
+            let first = Box::new(SrcLoc::new(inner, lineinfo));
             if self.test(Token::Comma) {
                 // multi assignment
                 let varlist = self.exprlist(Some(first))?;
                 self.check_and_next(Token::Assign)?;
                 let exprlist = self.exprlist(None)?;
-                Stmt::Assign {
-                    vars: varlist,
-                    exprs: exprlist,
-                }
+                SrcLoc::new(
+                    Stmt::Assign {
+                        vars: varlist,
+                        exprs: exprlist,
+                    },
+                    lineinfo,
+                )
             } else if self.test_and_next(Token::Assign)? {
                 // single assignment
                 let exprlist = self.exprlist(None)?;
-                Stmt::Assign {
-                    vars: vec![first],
-                    exprs: exprlist,
-                }
+                SrcLoc::new(
+                    Stmt::Assign {
+                        vars: vec![first],
+                        exprs: exprlist,
+                    },
+                    lineinfo,
+                )
             } else {
                 // single expr as statememt
-                Stmt::Expr(Box::new(first.into_inner()))
+                SrcLoc::new(Stmt::Expr(first), lineinfo)
             }
         };
-        Ok(stmt)
+        Ok(Box::new(stmt))
     }
 
     /// label ::= `::` Name `::`
@@ -174,10 +185,7 @@ impl Parser<'_> {
         self.next()?;
 
         let ret = match &mut self.current {
-            Token::Ident(id) => {
-                let inner = std::mem::take(id);
-                Ok(Stmt::Lable(inner))
-            }
+            Token::Ident(id) => Ok(Stmt::Lable(std::mem::take(id))),
             _ => Err(self.unexpected("::")),
         };
         if ret.is_ok() {
@@ -191,14 +199,11 @@ impl Parser<'_> {
     fn goto(&mut self) -> Result<Stmt, SyntaxError> {
         self.next()?; // skip `goto`
 
-        let mut holder = String::new();
         if let Token::Ident(lable) = &mut self.current {
-            std::mem::swap(&mut holder, lable);
+            Ok(Stmt::Goto(std::mem::take(lable)))
         } else {
-            return Err(self.unexpected("identifier"));
-        };
-
-        Ok(Stmt::Goto(holder))
+            Err(self.unexpected("identifier"))
+        }
     }
 
     /// do ::= `do` block `end`
@@ -206,7 +211,7 @@ impl Parser<'_> {
         self.next()?; // skip 'do'
         let block = self.block()?;
         self.test_and_next(Token::End)?;
-        Ok(Stmt::DoEnd(Box::new(block)))
+        Ok(Stmt::DoEnd(block))
     }
 
     /// while ::= `while` exp `do` block `end`
@@ -217,10 +222,7 @@ impl Parser<'_> {
         let block = self.block()?;
         self.check_and_next(Token::End)?;
 
-        Ok(Stmt::While {
-            exp: Box::new(exp),
-            block: Box::new(block),
-        })
+        Ok(Stmt::While { exp, block })
     }
 
     /// repeat ::= `repeat` block `until` exp
@@ -232,10 +234,7 @@ impl Parser<'_> {
         self.test_and_next(Token::Until)?;
         let exp = self.expr()?;
 
-        Ok(Stmt::Repeat {
-            block: Box::new(block),
-            exp: Box::new(exp),
-        })
+        Ok(Stmt::Repeat { block, exp })
     }
 
     /// if ::= `if` exp `then` block {`elseif` exp `then` block} [`else` block] `end`
@@ -246,38 +245,41 @@ impl Parser<'_> {
 
         let then = self.block()?;
 
-        // if-else-end
         if self.test_and_next(Token::Else)? {
+            // if-else-end
             let els = self.block()?;
             self.check_and_next(Token::End)?;
             Ok(Stmt::IfElse {
-                exp: Box::new(cond),
-                then: Box::new(then),
-                els: Box::new(els),
+                cond,
+                then,
+                els: Some(els),
             })
-        } else
-        // if-elseif-...-end
-        if self.test(Token::Elseif) {
+        } else if self.test(Token::Elseif) {
+            // if-elseif-...-end
             let begin = self.lex.line();
-            let else_stmt = self.if_else()?;
-            let end = self.lex.line();
+            let else_stmt = {
+                let stmt = self.if_else()?;
+                let end = self.lex.line();
+                Box::new(SrcLoc::new(stmt, (begin, end)))
+            };
 
-            let node = WithSrcLoc::new(else_stmt, (begin, end));
-            let els = Block::new(None, vec![node], None);
+            let els = Box::new(SrcLoc::new(
+                Block::new(None, vec![else_stmt], None),
+                (begin, self.lex.line()),
+            ));
+
             Ok(Stmt::IfElse {
-                exp: Box::new(cond),
-                then: Box::new(then),
-                els: Box::new(els),
+                cond,
+                then,
+                els: Some(els),
             })
-        }
-        // if-then-end
-        else {
+        } else {
+            // if-then-end
             self.check_and_next(Token::End)?;
-            let empty = Block::new(None, vec![], None);
             Ok(Stmt::IfElse {
-                exp: Box::new(cond),
-                then: Box::new(then),
-                els: Box::new(empty),
+                cond,
+                then,
+                els: None,
             })
         }
     }
@@ -287,17 +289,17 @@ impl Parser<'_> {
     fn for_stmt(&mut self) -> Result<Stmt, SyntaxError> {
         self.next()?; // skip `for`
 
-        let mut holder = String::new();
-        if let Token::Ident(first) = &mut self.current {
-            std::mem::swap(&mut holder, first);
+        let iter = if let Token::Ident(first) = &mut self.current {
+            let line = self.lex.line();
+            SrcLoc::new(std::mem::take(first), (line, line))
         } else {
             return Err(self.unexpected("identifier"));
         };
 
         self.next()?;
         let stmt = match &self.current {
-            Token::Comma | Token::In => self.generic_for(holder)?,
-            Token::Assign => self.numeric_for(holder)?,
+            Token::Comma | Token::In => self.generic_for(iter)?,
+            Token::Assign => self.numeric_for(iter)?,
             _ => return Err(self.unexpected("'=' or ','")),
         };
 
@@ -305,15 +307,16 @@ impl Parser<'_> {
     }
 
     /// generic_for ::= `for` namelist `in` explist `do` block `end`    
-    fn generic_for(&mut self, first: String) -> Result<Stmt, SyntaxError> {
+    fn generic_for(&mut self, iter: SrcLoc<String>) -> Result<Stmt, SyntaxError> {
         // "for k, v in ..." is most common senario
-        let mut names = Vec::with_capacity(2);
-        names.push(first);
+        let mut iters = Vec::with_capacity(2);
+        iters.push(iter);
 
         loop {
             match &mut self.current {
                 Token::Ident(id) => {
-                    names.push(std::mem::take(id));
+                    let line = self.lex.line();
+                    iters.push(SrcLoc::new(std::mem::take(id), (line, line)));
                     self.next()?;
                 }
                 Token::Comma => self.next()?,
@@ -327,42 +330,46 @@ impl Parser<'_> {
             match &self.current {
                 Token::Comma => self.next()?,
                 Token::Do => break,
-                _ => exprs.push(self.expr()?.into_inner()),
+                _ => exprs.push(self.expr()?),
             }
         }
         self.check_and_next(Token::Do)?;
         let body = self.block()?;
         self.check_and_next(Token::End)?;
-        Ok(Stmt::GenericFor {
-            iters: names,
+
+        Ok(Stmt::GenericFor(Box::new(GenericFor {
+            iters,
             exprs,
-            body: Box::new(body),
-        })
+            body,
+        })))
     }
 
     /// numerical_for ::= `for` Name `=` exp `,` exp [`,` exp] `do` block `end`
-    fn numeric_for(&mut self, var: String) -> Result<Stmt, SyntaxError> {
+    fn numeric_for(&mut self, iter: SrcLoc<String>) -> Result<Stmt, SyntaxError> {
         self.next()?;
-        let init = self.expr()?.into_inner();
+        let init = self.expr()?;
         self.check_and_next(Token::Comma)?;
-        let limit = self.expr()?.into_inner();
+        let limit = self.expr()?;
         let step = match &self.current {
             Token::Comma => {
                 self.next()?;
-                self.expr()?.into_inner()
+                self.expr()?
             }
-            _ => Expr::Int(1),
+            _ => {
+                let ln = self.lex.line();
+                Box::new(SrcLoc::new(Expr::Int(1), (ln, ln)))
+            }
         };
         self.check_and_next(Token::Do)?;
         let body = self.block()?;
         self.check_and_next(Token::End)?;
-        Ok(Stmt::NumericFor {
-            iter: var,
-            init: Box::new(init),
-            limit: Box::new(limit),
-            step: Box::new(step),
-            body: Box::new(body),
-        })
+        Ok(Stmt::NumericFor(Box::new(NumericFor {
+            iter,
+            init,
+            limit,
+            step,
+            body,
+        })))
     }
 
     /// function ::= `function` funcname funcbody
@@ -370,32 +377,34 @@ impl Parser<'_> {
     fn global_fndef(&mut self) -> Result<Stmt, SyntaxError> {
         self.next()?; // skip `function`
         let (pres, method) = self.func_name()?;
+        let beg = self.lex.line();
         let body = self.func_body()?;
+        let end = self.lex.line();
         Ok(Stmt::FnDef {
             pres,
             method,
-            body: Box::new(body),
+            body: Box::new(SrcLoc::new(body, (beg, end))),
         })
     }
 
     /// local_function ::= `local` `function` Name funcbody
     fn local_fndef(&mut self) -> Result<Stmt, SyntaxError> {
-        let mut func_name = String::new();
-        if let Token::Ident(name) = &mut self.current {
-            std::mem::swap(&mut func_name, name);
+        let func_name = if let Token::Ident(name) = &mut self.current {
+            let line = self.lex.line();
+            SrcLoc::new(std::mem::take(name), (line, line))
         } else {
             return Err(self.unexpected("identifier"));
         };
 
         self.next()?; // eat func name
-        let begin = self.lex.line();
+
+        let beg = self.lex.line();
         let fndef = self.func_body()?;
         let end = self.lex.line();
-        let node = ExprNode::new(Expr::FuncDefine(fndef), (begin, end));
-
+        let fndef = SrcLoc::new(Expr::FuncDefine(fndef), (beg, end));
         Ok(Stmt::LocalVarDecl {
             names: vec![(func_name, None)],
-            exprs: vec![node],
+            exprs: vec![Box::new(fndef)],
         })
     }
 
@@ -404,20 +413,16 @@ impl Parser<'_> {
     fn local_assign(&mut self) -> Result<Stmt, SyntaxError> {
         let mut names = Vec::with_capacity(4);
         loop {
-            let (mut decl_holder, mut is_id) = (String::new(), false);
+            let line = self.lex.line();
             if let Token::Ident(id) = &mut self.current {
-                std::mem::swap(id, &mut decl_holder);
-                is_id = true;
-            };
-
-            if is_id {
+                let name = SrcLoc::new(std::mem::take(id), (line, line));
                 self.next()?;
 
                 // optional attribute
                 let attribute = if self.test_and_next(Token::Less)? {
                     let mut attr_holder = String::new();
-                    if let Token::Ident(id) = &mut self.current {
-                        std::mem::swap(id, &mut attr_holder);
+                    if let Token::Ident(attrid) = &mut self.current {
+                        std::mem::swap(attrid, &mut attr_holder);
                     } else {
                         return Err(self.unexpected("attribute"));
                     };
@@ -436,7 +441,7 @@ impl Parser<'_> {
                     None
                 };
 
-                names.push((decl_holder, attribute));
+                names.push((name, attribute));
             }
 
             if let Token::Comma = self.current {
@@ -457,7 +462,9 @@ impl Parser<'_> {
     }
 
     /// funcname ::= Name {`.` Name} [`:` Name]
-    fn func_name(&mut self) -> Result<(Vec<String>, Option<String>), SyntaxError> {
+    fn func_name(
+        &mut self,
+    ) -> Result<(Vec<SrcLoc<String>>, Option<Box<SrcLoc<String>>>), SyntaxError> {
         const DOT: bool = true;
         const COLON: bool = false;
         let mut pres = Vec::with_capacity(4);
@@ -468,11 +475,12 @@ impl Parser<'_> {
             let mut is_id = false;
             match &mut self.current {
                 Token::Ident(id) => {
+                    let line = self.lex.line();
                     if dot_or_colon == COLON {
-                        method = Some(std::mem::take(id));
+                        method = Some(SrcLoc::new(std::mem::take(id), (line, line)));
                         is_id = true;
                     } else {
-                        pres.push(std::mem::take(id));
+                        pres.push(SrcLoc::new(std::mem::take(id), (line, line)));
                     }
                 }
 
@@ -493,7 +501,7 @@ impl Parser<'_> {
             }
         }
 
-        Ok((pres, method))
+        Ok((pres, method.map(Box::new)))
     }
 
     /// funcbody ::= `(` [parlist] `)` block `end`
@@ -503,11 +511,7 @@ impl Parser<'_> {
         self.check_and_next(Token::RP)?;
         let body = self.block()?;
         self.check_and_next(Token::End)?;
-
-        Ok(FuncBody {
-            params,
-            body: Box::new(body),
-        })
+        Ok(FuncBody { params, body })
     }
 
     /// paralist ::= namelist [`,` `...`] | `...`
@@ -516,7 +520,10 @@ impl Parser<'_> {
         let mut vargs = false;
 
         if let Token::RP = self.current {
-            return Ok(ParaList::new(vargs, Vec::new()));
+            return Ok(ParaList {
+                vargs,
+                namelist: vec![],
+            });
         }
 
         let paras = self.exprlist(None)?;
@@ -537,8 +544,10 @@ impl Parser<'_> {
             }
         };
 
-        let paras = paras.into_iter().map(|node| node.into_inner()).collect();
-        Ok(ParaList::new(vargs, paras))
+        Ok(ParaList {
+            vargs,
+            namelist: paras,
+        })
     }
 
     /// retstat ::= return [explist] [`;`]
@@ -574,29 +583,29 @@ impl Parser<'_> {
     }
 
     /// exp ::=  `nil` |
-    ///	    `false` |
-    ///	    `true` |
-    ///	    Numeral |
-    ///	    LiteralString |
-    ///	    `...` |
-    ///	    functiondef |
-    ///	    prefixexp |
-    ///	    tablector |
-    ///	    exp binop exp |
-    ///	    unop exp
+    ///  `false` |
+    ///  `true` |
+    ///  Numeral |
+    ///  LiteralString |
+    ///  `...` |
+    ///  functiondef |
+    ///  prefixexp |
+    ///  tablector |
+    ///  exp binop exp |
+    ///  unop exp
     fn subexpr(&mut self, limit: usize) -> Result<ExprNode, SyntaxError> {
         let begin = self.lex.line();
         let mut lhs = if let Some(uniop) = self.unary_op() {
             self.next()?;
             let sub = self.subexpr(Self::UNARY_PRIORITY)?;
             let end = self.lex.line();
-            ExprNode::new(
+            Box::new(SrcLoc::new(
                 Expr::UnaryOp {
                     op: uniop,
-                    expr: Box::new(sub),
+                    expr: sub,
                 },
                 (begin, end),
-            )
+            ))
         } else {
             self.simple_expr()?
         };
@@ -610,14 +619,14 @@ impl Parser<'_> {
                 // parse rhs with right associativity poritity
                 let rhs = self.subexpr(Self::BINARY_PRIORITY[binop as usize].1)?;
                 let end = self.lex.line();
-                lhs = ExprNode::new(
+                lhs = Box::new(SrcLoc::new(
                     Expr::BinaryOp {
-                        lhs: Box::new(lhs),
+                        lhs,
                         op: binop,
-                        rhs: Box::new(rhs),
+                        rhs,
                     },
                     (begin, end),
-                );
+                ));
             } else {
                 break;
             }
@@ -640,23 +649,18 @@ impl Parser<'_> {
         } {
             let line_info = (self.lex.line(), self.lex.line());
             self.next()?;
-            return Ok(ExprNode::new(exp, line_info));
+            return Ok(Box::new(SrcLoc::new(exp, line_info)));
         };
 
-        let begin = self.lex.line();
         match &self.current {
             Token::Function => {
                 self.next()?;
+                let beg = self.lex.line();
                 let body = self.func_body()?;
-                Ok(ExprNode::new(
-                    Expr::FuncDefine(body),
-                    (begin, self.lex.line()),
-                ))
+                let end = self.lex.line();
+                Ok(Box::new(SrcLoc::new(Expr::FuncDefine(body), (beg, end))))
             }
-            Token::LB => Ok(ExprNode::new(
-                Expr::TableCtor(self.table_constructor()?),
-                (begin, self.lex.line()),
-            )),
+            Token::LB => Ok(self.table_constructor()?),
 
             _ => self.suffixed_expr(),
         }
@@ -719,9 +723,9 @@ impl Parser<'_> {
     /// tablector ::= `{` [fieldlist] `}`
     /// fieldlist ::= field {fieldsep field} [fieldsep]
     /// fieldsep ::= `,` | `;`
-    fn table_constructor(&mut self) -> Result<Vec<Field>, SyntaxError> {
+    fn table_constructor(&mut self) -> Result<ExprNode, SyntaxError> {
         self.next()?; // skip '{'
-
+        let beg = self.lex.line();
         let mut fieldlist = Vec::with_capacity(4);
         loop {
             match &self.current {
@@ -730,9 +734,13 @@ impl Parser<'_> {
                 _ => fieldlist.push(self.field()?),
             }
         }
-
         self.next()?;
-        Ok(fieldlist)
+        let end = self.lex.line();
+
+        Ok(Box::new(SrcLoc::new(
+            Expr::TableCtor(fieldlist),
+            (beg, end),
+        )))
     }
 
     /// field ::= `[` exp `]` `=` exp | Name `=` exp | exp
@@ -762,7 +770,7 @@ impl Parser<'_> {
             self.next()?; // skip name
             self.next()?; // skip '='
             let line = self.lex.line();
-            let expr = ExprNode::new(Expr::Ident(holder), (line, line));
+            let expr = Box::new(SrcLoc::new(Expr::Ident(holder), (line, line)));
             Ok(Field::new(Some(Box::new(expr)), Box::new(self.expr()?)))
         } else {
             // expr
@@ -790,7 +798,10 @@ impl Parser<'_> {
 
         let begin = self.lex.line();
         self.next()?;
-        Ok(ExprNode::new(Expr::Ident(holder), (begin, self.lex.line())))
+        Ok(Box::new(SrcLoc::new(
+            Expr::Ident(holder),
+            (begin, self.lex.line()),
+        )))
     }
 
     /// suffixedexp ->
@@ -811,14 +822,10 @@ impl Parser<'_> {
                     };
 
                     let attr = Expr::Literal(holder);
+                    let curln = self.lex.line();
+                    let key = Box::new(SrcLoc::new(attr, (curln, curln)));
                     self.next()?;
-                    ExprNode::new(
-                        Expr::Index {
-                            prefix: Box::new(prefix),
-                            key: Box::new(attr),
-                        },
-                        (begin, self.lex.line()),
-                    )
+                    SrcLoc::new(Expr::Index { prefix, key }, (begin, self.lex.line()))
                 }
 
                 Token::LS => {
@@ -826,18 +833,13 @@ impl Parser<'_> {
                     let key = self.expr()?;
                     self.check_and_next(Token::RS)?;
 
-                    ExprNode::new(
-                        Expr::Index {
-                            prefix: Box::new(prefix),
-                            key: Box::new(key.into_inner()),
-                        },
-                        (begin, self.lex.line()),
-                    )
+                    SrcLoc::new(Expr::Index { prefix, key }, (begin, self.lex.line()))
                 }
 
                 // method call
                 Token::Colon => {
                     self.next()?;
+                    let line = self.lex.line();
                     let mut holder = String::new();
                     if let Token::Ident(method) = &mut self.current {
                         std::mem::swap(method, &mut holder);
@@ -848,19 +850,19 @@ impl Parser<'_> {
                     self.next()?; // skip name
 
                     let args = self.func_args()?;
-                    ExprNode::new(
+                    SrcLoc::new(
                         Expr::FuncCall(FuncCall::MethodCall {
-                            prefix: Box::new(prefix),
-                            method: holder,
+                            prefix,
+                            method: Box::new(SrcLoc::new(holder, (line, line))),
                             args,
                         }),
                         (begin, self.lex.line()),
                     )
                 }
 
-                Token::Literal(_) | Token::LB | Token::LP => ExprNode::new(
+                Token::Literal(_) | Token::LB | Token::LP => SrcLoc::new(
                     Expr::FuncCall(FuncCall::FreeFnCall {
-                        prefix: Box::new(prefix),
+                        prefix,
                         args: self.func_args()?,
                     }),
                     (begin, self.lex.line()),
@@ -869,35 +871,51 @@ impl Parser<'_> {
                 _ => return Ok(prefix),
             };
 
-            prefix = expr_node;
+            prefix = Box::new(expr_node);
         }
     }
 
     /// args ::=  `(` [explist] `)` | tablector | LiteralString
-    fn func_args(&mut self) -> Result<ParaList, SyntaxError> {
+    fn func_args(&mut self) -> Result<SrcLoc<ParaList>, SyntaxError> {
+        let beg = self.lex.line();
         let mut holder = String::new();
         match &mut self.current {
             Token::LP => {
                 self.next()?; // skip '('
                 let args = self.param_list()?;
                 self.check_and_next(Token::RP)?;
-                return Ok(args);
+                Ok(SrcLoc::new(args, (beg, self.lex.line())))
             }
 
             Token::LB => {
                 let table = self.table_constructor()?;
-                return Ok(ParaList::new(false, vec![Expr::TableCtor(table)]));
+                Ok(SrcLoc::new(
+                    ParaList {
+                        vargs: false,
+                        namelist: vec![table],
+                    },
+                    (beg, self.lex.line()),
+                ))
             }
 
             Token::Literal(s) => {
                 std::mem::swap(s, &mut holder);
+
+                let line = self.lex.line();
+                let litnode = Box::new(SrcLoc::new(Expr::Literal(holder), (line, line)));
+                self.next()?; // skip string literal
+
+                Ok(SrcLoc::new(
+                    ParaList {
+                        vargs: false,
+                        namelist: vec![litnode],
+                    },
+                    (beg, self.lex.line()),
+                ))
             }
 
-            _ => return Err(self.unexpected("function arguments")),
-        };
-        self.next()?; // skip string literal
-
-        Ok(ParaList::new(false, vec![Expr::Literal(holder)]))
+            _ => Err(self.unexpected("function arguments")),
+        }
     }
 
     fn test(&self, expect: Token) -> bool {
@@ -948,7 +966,7 @@ impl Parser<'_> {
 }
 
 impl Parser<'_> {
-    pub fn parse(src: &str, chunkname: Option<String>) -> Result<Block, SyntaxError> {
+    pub fn parse(src: &str, chunkname: Option<String>) -> Result<BasicBlock, SyntaxError> {
         let mut parser = Parser {
             lex: Lexer::new(src),
             current: Token::Eof,
@@ -959,13 +977,16 @@ impl Parser<'_> {
         parser.next()?;
 
         // parse statements
-        let block = parser.block()?;
+        let mut block = parser.block()?;
 
         debug_assert!(block.chunk.as_str() == Block::NAMELESS_CHUNK);
         debug_assert!(parser.current.is_eof());
         debug_assert!(parser.ahead.is_eof());
 
-        Ok(Block::new(chunkname, block.stats, block.ret))
+        if let Some(cn) = chunkname {
+            block.chunk = cn;
+        }
+        Ok(block)
     }
 }
 

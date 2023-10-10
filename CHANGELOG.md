@@ -16,6 +16,13 @@ All notable changes to this project will be documented in this file.
 
 * changes here.  -->
 
+## 0.1.4 (2023-10-11)
+Refactor the implementation of `CodeGen`. 
+
+### Features
+* Refactor `CodeGen` to support some optimization in `luac`.  
+* Add more source location infomation to AST to generate correct line number during code generation.
+
 ## 0.1.2 (2023-09-08)
 Add GC support, which implemented as a stop-the-world full collector.
 

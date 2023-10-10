@@ -1,9 +1,6 @@
-use crate::{
-    state::{RuntimeErr, State},
-    value::RsFunc,
-};
+use crate::{state::State, value::RsFunc, RuntimeErr};
 
-fn lua_print(lua: &mut State) -> Result<usize, RuntimeErr> {
+fn lua_print(lua: &mut State) -> Result<usize, Box<dyn RuntimeErr>> {
     let n = lua.top();
     print!("{}", lua.rget(1)?);
     if n > 1 {
@@ -15,43 +12,43 @@ fn lua_print(lua: &mut State) -> Result<usize, RuntimeErr> {
     Ok(0)
 }
 
-fn lua_assert(_lua: &mut State) -> Result<usize, RuntimeErr> {
+fn lua_assert(_lua: &mut State) -> Result<usize, Box<dyn RuntimeErr>> {
     todo!();
 }
 
-fn lua_error(_lua: &mut State) -> Result<usize, RuntimeErr> {
+fn lua_error(_lua: &mut State) -> Result<usize, Box<dyn RuntimeErr>> {
     todo!();
 }
 
-fn lua_pcall(_lua: &mut State) -> Result<usize, RuntimeErr> {
+fn lua_pcall(_lua: &mut State) -> Result<usize, Box<dyn RuntimeErr>> {
     todo!();
 }
 
-fn lua_xpcall(_lua: &mut State) -> Result<usize, RuntimeErr> {
+fn lua_xpcall(_lua: &mut State) -> Result<usize, Box<dyn RuntimeErr>> {
     todo!();
 }
 
-fn lua_getmetatable(_lua: &mut State) -> Result<usize, RuntimeErr> {
+fn lua_getmetatable(_lua: &mut State) -> Result<usize, Box<dyn RuntimeErr>> {
     todo!();
 }
 
-fn lua_setmetatable(_lua: &mut State) -> Result<usize, RuntimeErr> {
+fn lua_setmetatable(_lua: &mut State) -> Result<usize, Box<dyn RuntimeErr>> {
     todo!();
 }
 
-fn lua_next(_lua: &mut State) -> Result<usize, RuntimeErr> {
+fn lua_next(_lua: &mut State) -> Result<usize, Box<dyn RuntimeErr>> {
     todo!();
 }
 
-fn lua_pairs(_lua: &mut State) -> Result<usize, RuntimeErr> {
+fn lua_pairs(_lua: &mut State) -> Result<usize, Box<dyn RuntimeErr>> {
     todo!();
 }
 
-fn lua_ipairs(_lua: &mut State) -> Result<usize, RuntimeErr> {
+fn lua_ipairs(_lua: &mut State) -> Result<usize, Box<dyn RuntimeErr>> {
     todo!();
 }
 
-fn lua_load(_lua: &mut State) -> Result<usize, RuntimeErr> {
+fn lua_load(_lua: &mut State) -> Result<usize, Box<dyn RuntimeErr>> {
     todo!();
 }
 
