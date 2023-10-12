@@ -312,6 +312,16 @@ impl Default for State {
     }
 }
 
+impl Drop for State {
+    fn drop(&mut self) {
+        self.context(|_vm, heap| {
+            heap.collect_garbage(true);
+            heap.destroy();
+            Ok(())
+        }).unwrap();
+    }
+}
+
 impl State {
     pub fn new() -> Self {
         State {
@@ -401,6 +411,7 @@ impl State {
     /// Loads a Lua chunk without running it. If there are no errors, `load` pushes the compiled chunk as a Lua function on top of the stack.
     pub fn load_str(&mut self, src: &str, chunkname: Option<String>) -> Result<(), RuaErr> {
         let proto = Self::compile(src, chunkname)?;
+        // dbg!(&proto);
         let luaf = self.heap_view().alloc(proto);
         self.vm_view().stk_push(luaf)?;
         Ok(())
@@ -514,9 +525,9 @@ impl State {
         // TODO:
         // optimizer scheduler
         // let mut cfp = ConstantFoldPass::new();
-        // assert!(cfp.walk(&mut block).is_ok())
+        // assert!(cfp.walk(&mut block).is_ok());
 
-        let proto = CodeGen::generate(block, false)?;
+        let proto = CodeGen::generate(*block, false)?;
         Ok(proto)
     }
 

@@ -3,49 +3,49 @@ use std::{
     collections::{hash_map::DefaultHasher, HashMap},
     fmt::{Debug, Display},
     hash::{Hash, Hasher},
+    ptr::NonNull,
 };
 
 use crate::{
     codegen::Proto,
     heap::{
-        Gc, GcColor, GcHeader, HeapMemUsed, MarkAndSweepGcOps, Tag, TaggedBox, TypeTag,
-        WithGcHeader,
+        Gc, GcColor, Heap, HeapMemUsed, MarkAndSweepGcOps, Tag, TaggedBox, TypeTag, WithGcHeader,
     },
 };
 
 use super::{state::State, RuntimeErr};
 
-#[derive(Debug)]
-struct FlexibleArrayMarker();
-
 pub type StrHashVal = u32;
 
-/// String are implemented as a flexible array
-/// Depends on the fixed layout, so repr as C.
-#[repr(C)]
-#[derive(Debug)]
-pub struct StrImpl {
-    len: usize,             // len of string excluding header
-    capacity: usize,        // len of buffer including header
-    hash: Cell<StrHashVal>, // hash unique
-    extra: Cell<bool>,      // reserved (for short)  | hashed (for long)
-    _inplace_ptr: FlexibleArrayMarker,
+// const INTERNAL_STR_MAX_LEN: usize = 16;
+const INTERNAL_STR_MAX_LEN: usize = 10;
+
+pub struct Short {
+    hash: Cell<StrHashVal>,
+    reserved: Cell<bool>,
+    len: u8,
+    data: [u8; INTERNAL_STR_MAX_LEN], // c-style string ends with '\0'
 }
+
+pub struct Long {
+    hash: Cell<StrHashVal>,
+    hashed: Cell<bool>,
+    data: Box<str>,
+}
+
+pub enum StrImpl {
+    Short(Short),
+    Long(Long),
+}
+
+impl MarkAndSweepGcOps for StrImpl {}
 
 impl HeapMemUsed for StrImpl {
     fn heap_mem_used(&self) -> usize {
-        self.len + std::mem::size_of::<StrImpl>()
-    }
-}
-
-impl Debug for Gc<StrImpl> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Gc<StrImpl>")
-            .field("len", &self.len)
-            .field("capacity", &self.capacity)
-            .field("hash", &self.hash.get())
-            .field("extra", &self.extra.get())
-            .finish()
+        match self {
+            StrImpl::Short(_) => 0, //  no extra heap memory used for short string
+            StrImpl::Long(l) => l.data.len(),
+        }
     }
 }
 
@@ -64,93 +64,45 @@ impl PartialEq for StrImpl {
 }
 
 impl From<String> for Gc<StrImpl> {
-    fn from(mut s: String) -> Self {
-        let strlen = s.len();
-        let total_need = s.len() + StrImpl::EXTRA_HEADERS_SIZE;
-        if total_need > s.capacity() {
-            return Self::from(s.as_str());
-        }
-
-        if s.capacity() > 2 * total_need {
-            s.shrink_to(total_need);
-        }
-
-        unsafe {
-            // shuffle string to the end of buffer
-            let mut rsrc = s.as_ptr().add(s.len());
-            let mut rdest = rsrc.add(StrImpl::EXTRA_HEADERS_SIZE) as *mut u8;
-            for _ in 0..=s.len() {
-                *rdest = *rsrc;
-                rdest = rdest.sub(1);
-                rsrc = rsrc.sub(1);
-            }
-
-            let (with_gch, cap) = (
-                std::mem::transmute::<*mut u8, *mut WithGcHeader<StrImpl>>(s.as_mut_ptr()),
-                s.capacity(),
-            );
-            std::mem::forget(s);
-
-            let obj = with_gch.as_mut().unwrap_unchecked();
-            obj.gcheader.color.set(GcColor::Wild);
-            obj.gcheader.age.set(0);
-            obj.inner.len = strlen;
-            obj.inner.capacity = cap;
-            obj.inner.extra.set(false);
-            if obj.inner.is_short() {
-                obj.inner.hash = Cell::new(StrImpl::hash_str(obj.inner.as_str()));
-            } else {
-                obj.inner.hash = Cell::new(StrHashVal::MIN);
-            }
-
-            Gc::from(with_gch)
-        }
+    fn from(s: String) -> Self {
+        let sobj = if StrImpl::able_to_internal(&s) {
+            StrImpl::from_short(&s, false)
+        } else {
+            StrImpl::Long(Long {
+                hash: Cell::new(0),
+                hashed: Cell::new(false),
+                data: s.into_boxed_str(),
+            })
+        };
+        Gc::new(sobj)
     }
 }
 
 impl From<&str> for Gc<StrImpl> {
     fn from(s: &str) -> Self {
-        let (with_gch, cap) = unsafe {
-            let mut buf = String::with_capacity(s.len() + StrImpl::EXTRA_HEADERS_SIZE);
-            let dest = std::slice::from_raw_parts_mut(
-                buf.as_ptr().add(StrImpl::EXTRA_HEADERS_SIZE) as *mut u8,
-                s.len(),
-            );
-            dest.copy_from_slice(std::slice::from_raw_parts(s.as_ptr(), s.len()));
-
-            let res = (
-                buf.as_mut_ptr() as *mut WithGcHeader<StrImpl>,
-                buf.capacity(),
-            );
-            std::mem::forget(buf);
-            res // avoid drop buf
+        let sobj = if StrImpl::able_to_internal(s) {
+            StrImpl::from_short(s, false)
+        } else {
+            StrImpl::Long(Long {
+                hash: Cell::new(0),
+                hashed: Cell::new(false),
+                data: s.into(),
+            })
         };
-
-        unsafe {
-            let obj = with_gch.as_mut().unwrap_unchecked();
-            obj.gcheader.color.set(GcColor::Wild);
-            obj.gcheader.age.set(0);
-            obj.inner.len = s.len();
-            obj.inner.capacity = cap;
-            obj.inner.extra.set(false);
-            if obj.inner.is_short() {
-                obj.inner.hash = Cell::new(StrImpl::hash_str(s));
-            } else {
-                obj.inner.hash = Cell::new(StrHashVal::MIN);
-            }
-        }
-        Gc::from(with_gch)
+        Gc::new(sobj)
     }
 }
 
 impl StrImpl {
-    pub const STR_HEADER_SIZE: usize = std::mem::size_of::<StrImpl>();
-    pub const CACHELINE_SIZE: usize = 64;
-    pub const EXTRA_HEADERS_SIZE: usize = Self::STR_HEADER_SIZE + std::mem::size_of::<GcHeader>();
-    pub const MAX_SHORT_LEN: usize = Self::CACHELINE_SIZE - Self::EXTRA_HEADERS_SIZE;
+    pub const MAX_SHORT_LEN: usize = INTERNAL_STR_MAX_LEN;
+
+    pub fn new_reserved(s: &str) -> StrImpl {
+        debug_assert!(s.len() <= Self::MAX_SHORT_LEN);
+        StrImpl::from_short(s, true)
+    }
 
     pub fn hash_str(ss: &str) -> StrHashVal {
-        let step = if Self::check_short(ss) {
+        let step = if Self::able_to_internal(ss) {
             1
         } else {
             ss.len() >> 5
@@ -162,31 +114,44 @@ impl StrImpl {
     }
 
     pub fn hashid(&self) -> StrHashVal {
-        if self.is_long() && !self.extra.get() {
-            self.hash.set(Self::hash_str(self.as_str()));
-            self.extra.set(true);
-        };
-        self.hash.get()
+        match self {
+            StrImpl::Short(s) => s.hash.get(),
+            StrImpl::Long(l) => {
+                if l.hashed.get() {
+                    l.hash.get()
+                } else {
+                    let hashid = Self::hash_str(&l.data);
+                    l.hash.set(hashid);
+                    l.hashed.set(true);
+                    hashid
+                }
+            }
+        }
     }
 
     pub fn len(&self) -> usize {
-        self.len
+        match self {
+            StrImpl::Short(s) => s.len as usize,
+            StrImpl::Long(l) => l.data.len(),
+        }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.len() == 0
     }
 
     pub fn as_str(&self) -> &str {
-        unsafe {
-            let ptr = (self as *const StrImpl as *const u8).add(Self::STR_HEADER_SIZE);
-            let slc = std::slice::from_raw_parts(ptr, self.len);
-            std::str::from_utf8(slc).unwrap()
+        match self {
+            StrImpl::Short(s) => unsafe { std::str::from_utf8_unchecked(&s.data[..self.len()]) },
+            StrImpl::Long(l) => &l.data,
         }
     }
 
     pub fn is_short(&self) -> bool {
-        self.len <= Self::MAX_SHORT_LEN
+        match self {
+            StrImpl::Short(_) => true,
+            StrImpl::Long(_) => false,
+        }
     }
 
     pub fn is_long(&self) -> bool {
@@ -194,28 +159,38 @@ impl StrImpl {
     }
 
     pub fn is_reserved(&self) -> bool {
-        self.is_short() && self.extra.get()
-    }
-
-    /// Return true if s is short
-    pub fn check_short(s: &str) -> bool {
-        s.len() <= StrImpl::MAX_SHORT_LEN
-    }
-
-    pub fn drop(val: Gc<StrImpl>) {
-        unsafe {
-            let ptr = val.heap_address() as *mut u8;
-            let _len = val.len;
-            let cap = val.capacity;
-            let _ = Box::from_raw(std::slice::from_raw_parts_mut(ptr, cap));
+        if let StrImpl::Short(s) = self {
+            s.reserved.get()
+        } else {
+            false
         }
     }
 
-    pub fn new_reserved(s: &str) -> Gc<StrImpl> {
-        let gc = Gc::from(s);
-        debug_assert!(gc.is_short());
-        gc.extra.set(true);
-        gc
+    pub fn is_hashed(&self) -> bool {
+        if let StrImpl::Long(l) = self {
+            l.hashed.get()
+        } else {
+            true
+        }
+    }
+
+    /// Return true if s is short
+    pub fn able_to_internal(s: &str) -> bool {
+        s.len() <= Self::MAX_SHORT_LEN
+    }
+
+    fn from_short(s: &str, reserved: bool) -> StrImpl {
+        let hash = Cell::new(StrImpl::hash_str(s));
+        let reserved = Cell::new(reserved);
+        let len = s.len() as u8;
+        let mut data = [0_u8; StrImpl::MAX_SHORT_LEN];
+        data[..s.len()].copy_from_slice(s.as_bytes());
+        StrImpl::Short(Short {
+            hash,
+            reserved,
+            len,
+            data,
+        })
     }
 }
 
@@ -233,19 +208,10 @@ pub struct TableImpl {
 
 impl HeapMemUsed for TableImpl {
     fn heap_mem_used(&self) -> usize {
-        let self_and_map = self
-            .hmap
-            .iter()
-            .fold(std::mem::size_of::<TableImpl>(), |acc, (_, val)| {
-                acc + val.heap_mem_used()
-            });
-
-        let ary = self
-            .array
-            .iter()
-            .fold(0, |acc, val| acc + val.heap_mem_used());
-
-        self_and_map + ary
+        self.hmap
+            .values()
+            .chain(self.array.iter())
+            .fold(0, |acc, val| acc + val.heap_mem_used())
     }
 }
 
@@ -265,6 +231,10 @@ impl MarkAndSweepGcOps for TableImpl {
 }
 
 impl TableImpl {
+    pub fn delegate_to(_p: &mut TableImpl, _heap: &mut Heap) {
+        todo!()
+    }
+
     pub fn with_capacity(cap: (usize, usize)) -> Self {
         Self {
             hmap: HashMap::with_capacity(cap.0),
@@ -288,11 +258,10 @@ impl TableImpl {
     }
 }
 
-/// a flexible array
-#[repr(C)]
+#[derive(Debug, Clone, Copy)]
 pub struct UserDataImpl {
-    pub size: usize,
-    _inplace_ptr: FlexibleArrayMarker,
+    ptr: NonNull<()>,
+    size: usize,
 }
 
 impl HeapMemUsed for UserDataImpl {
@@ -301,30 +270,26 @@ impl HeapMemUsed for UserDataImpl {
     }
 }
 
+impl MarkAndSweepGcOps for UserDataImpl {}
+
 impl UserDataImpl {
-    pub fn get_raw_data(&self) -> &[u8] {
-        unsafe {
-            let ptr = (self as *const UserDataImpl as *const u8).add(std::mem::size_of::<Self>());
-            std::slice::from_raw_parts(ptr, self.size)
+    pub fn new<T>(data: Box<T>) -> UserDataImpl {
+        UserDataImpl {
+            ptr: NonNull::from(Box::leak(data)).cast(),
+            size: std::mem::size_of::<T>(),
         }
     }
 
     pub fn as_ptr<T>(&self) -> *const T {
-        self.get_raw_data().as_ptr() as *const T
+        self.ptr.cast().as_ptr()
     }
 
-    pub fn as_mut<T>(&mut self) -> *mut T {
-        unsafe {
-            (self as *const UserDataImpl as *const u8).add(std::mem::size_of::<Self>()) as *mut T
-        }
+    pub unsafe fn as_mut<T>(&mut self) -> *mut T {
+        self.ptr.cast().as_mut()
     }
 
-    pub fn drop(val: Gc<UserDataImpl>) {
-        unsafe {
-            let ptr = val.heap_address() as *mut u8;
-            let len = val.size;
-            let _ = Box::from_raw(std::slice::from_raw_parts_mut(ptr, len));
-        }
+    pub unsafe fn as_ref<T>(&self) -> &T {
+        self.ptr.cast().as_ref()
     }
 }
 
@@ -457,10 +422,10 @@ impl AsTableKey for LValue {
             LValue::Int(i) => i as usize,
             LValue::Float(f) => usize::from_ne_bytes(f.to_ne_bytes()),
             LValue::String(s) => ((s.hashid() as usize) << 32) | s.len(),
-            LValue::Table(t) => t.gch_ptr() as usize,
-            LValue::Function(f) => f.gch_ptr() as usize,
+            LValue::Table(t) => t.heap_address(),
+            LValue::Function(f) => f.heap_address(),
             LValue::RsFn(rf) => rf as usize,
-            LValue::UserData(ud) => ud.gch_ptr() as usize,
+            LValue::UserData(ud) => ud.heap_address(),
         }
     }
 }
@@ -503,6 +468,18 @@ impl From<usize> for LValue {
     }
 }
 
+impl From<&str> for LValue {
+    fn from(value: &str) -> Self {
+        LValue::String(Gc::from(value.to_string()))
+    }
+}
+
+impl From<String> for LValue {
+    fn from(value: String) -> Self {
+        LValue::String(Gc::from(value))
+    }
+}
+
 impl From<RsFunc> for LValue {
     fn from(value: RsFunc) -> Self {
         LValue::RsFn(value)
@@ -537,10 +514,10 @@ impl TryInto<TaggedBox> for LValue {
     type Error = ();
     fn try_into(self) -> Result<TaggedBox, Self::Error> {
         match self {
-            LValue::String(s) => Ok(TaggedBox::from_heap_ptr(StrImpl::tagid(), s.gch_ptr())),
-            LValue::Table(t) => Ok(TaggedBox::from_heap_ptr(TableImpl::tagid(), t.gch_ptr())),
-            LValue::Function(f) => Ok(TaggedBox::from_heap_ptr(Proto::tagid(), f.gch_ptr())),
-            LValue::UserData(u) => Ok(TaggedBox::from_heap_ptr(UserDataImpl::tagid(), u.gch_ptr())),
+            LValue::String(s) => Ok(TaggedBox::new(StrImpl::tagid(), s.heap_address())),
+            LValue::Table(t) => Ok(TaggedBox::new(TableImpl::tagid(), t.heap_address())),
+            LValue::Function(f) => Ok(TaggedBox::new(Proto::tagid(), f.heap_address())),
+            LValue::UserData(u) => Ok(TaggedBox::new(UserDataImpl::tagid(), u.heap_address())),
             _ => Err(()),
         }
     }
@@ -564,14 +541,6 @@ impl Display for LValue {
 }
 
 impl LValue {
-    pub fn from_wild<T>(val: Gc<T>) -> LValue
-    where
-        T: TypeTag + HeapMemUsed,
-        LValue: From<Gc<T>>,
-    {
-        LValue::from(val)
-    }
-
     /// Check if the value is managed by lua gc
     pub fn is_managed(&self) -> bool {
         use LValue::*;
@@ -608,7 +577,7 @@ impl LValue {
         matches!(self, LValue::Float(_))
     }
 
-    pub fn is_string(&self) -> bool {
+    pub fn is_str(&self) -> bool {
         matches!(self, LValue::String(_))
     }
 
@@ -655,10 +624,17 @@ impl LValue {
         }
     }
 
-    pub fn as_string(&self) -> Option<&StrImpl> {
+    pub fn as_str(&self) -> Option<&str> {
         match self {
-            LValue::String(s) => Some(s),
+            LValue::String(s) => Some(s.as_str()),
             _ => None,
+        }
+    }
+
+    pub unsafe fn as_str_unchecked(&self) -> &str {
+        match self {
+            LValue::String(s) => s.as_str(),
+            _ => unreachable!(),
         }
     }
 
@@ -695,6 +671,7 @@ mod size_check {
 }
 
 mod test {
+
     #[test]
     fn basic() {
         use super::TaggedBox;
@@ -742,6 +719,13 @@ mod test {
     fn strimpl() {
         use super::Gc;
         use super::StrImpl;
+        use crate::heap::WithGcHeader;
+
+        {
+            // Expected to be 32 / 64 to fill the size of cache line in 64-bit platform.
+            const STR_IMPL_SIZE: usize = std::mem::size_of::<WithGcHeader<StrImpl>>();
+            assert!(STR_IMPL_SIZE <= 64);
+        }
 
         {
             let s = "hello world";
@@ -756,29 +740,18 @@ mod test {
             assert_eq!(ogs.as_str(), gs.as_str());
             assert_eq!(ogs.hashid(), gs.hashid());
 
-            assert_eq!(*ogs, *gs);
+            assert_eq!(ogs.as_str(), gs.as_str());
         }
 
         {
             let s = "hello world".repeat(10);
-            assert!(!StrImpl::check_short(s.as_str()));
+            assert!(!StrImpl::able_to_internal(s.as_str()));
 
             let gs = Gc::<StrImpl>::from(s.as_str());
             assert!(gs.is_long());
             assert!(!gs.is_reserved());
             assert_eq!(gs.len(), s.len());
             assert_eq!(gs.as_str(), s);
-        }
-
-        {
-            let mut s = String::with_capacity(StrImpl::MAX_SHORT_LEN * 4);
-            let original_buf_size = s.capacity();
-            s.push_str("short string");
-            let gs = Gc::<StrImpl>::from(s);
-            assert!(gs.is_short());
-
-            // buffer will shirnk to fit the length if it is too large
-            assert!(gs.capacity < original_buf_size);
         }
     }
 }
