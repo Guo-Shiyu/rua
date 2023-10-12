@@ -1,6 +1,6 @@
 use crate::{lstd::base, value::RsFunc};
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub enum StdLib {
     Base,
     Package,

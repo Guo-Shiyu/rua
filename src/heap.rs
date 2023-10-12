@@ -417,7 +417,7 @@ pub struct ManagedHeap {
 
 impl Default for ManagedHeap {
     fn default() -> Self {
-        let mut heap = ManagedHeap {
+        ManagedHeap {
             enablegc: true,
             impls: GcImpl::Incremental(IncrGcImpl::default()),
             curwhite: GcColor::White,
@@ -428,45 +428,11 @@ impl Default for ManagedHeap {
             total: 0,
             debt: -1024,
             estimate: 0,
-        };
-
-        // add builtin string to string pool
-        let builtin = ManagedHeap::TYPE_STRS
-            .iter()
-            .chain(Self::METATOPS_STRS.iter());
-
-        builtin.for_each(|s| {
-            let val = Gc::new(StrImpl::new_reserved(s));
-            heap.fixed.push(val.into());
-            heap.sstrpool.insert(val.hashid(), val);
-            heap.total += val.heap_mem_used();
-        });
-        heap.estimate = heap.total;
-
-        heap
+        }
     }
 }
 
 impl ManagedHeap {
-    #[rustfmt::skip]
-    const TYPE_STRS: [&str; 8] = [
-        "number", "integer", "name", "string", 
-        "userdata", "table", "function", "thread",
-    ];
-
-    #[rustfmt::skip]
-    const METATOPS_STRS: [&str; 29]  = [
-        "__metatable",
-        "__index", "__newindex",
-        "__gc", "__mode", "__len", "__eq",
-        "__add", "__sub", "__mul", "__mod", "__pow",
-        "__div", "__idiv",
-        "__band", "__bor", "__bxor", "__shl", "__shr",
-        "__unm", "__bnot", "__lt", "__le",
-        "__concat", "__call", "__close",
-        "__tostring", "__pairs", "__ipairs",
-    ];
-
     fn switch_white(&mut self) {
         self.curwhite = match self.curwhite {
             GcColor::White => GcColor::AnotherWhite,
@@ -654,15 +620,25 @@ impl Heap<'_> {
 
     pub fn alloc<S, D>(&mut self, data: S) -> LValue
     where
-        D: TypeTag + MarkAndSweepGcOps + HeapMemUsed,
+        D: GcObject,
         Gc<D>: From<S>,
         LValue: From<Gc<D>>,
     {
-        let gcptr: Gc<D> = data.into();
-        let mut val = LValue::from(gcptr);
+        let mut val = LValue::from(data.into());
         self.delegate(&mut val);
         self.gc_checkpoint();
         val
+    }
+
+    pub fn alloc_fixed(&mut self, s: &str) -> LValue {
+        let val: Gc<StrImpl> = s.into();
+
+        if val.is_short() {
+            self.sstrpool.insert(val.hashid(), val);
+        }
+        self.fixed.push(val.into());
+
+        LValue::from(val)
     }
 
     fn gc_checkpoint(&mut self) {

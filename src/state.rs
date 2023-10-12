@@ -318,16 +318,45 @@ impl Drop for State {
             heap.collect_garbage(true);
             heap.destroy();
             Ok(())
-        }).unwrap();
+        })
+        .unwrap();
     }
 }
 
 impl State {
+    #[rustfmt::skip]
+    const TYPE_STRS: [&str; 8] = [
+        "number", "integer", "name", "string", 
+        "userdata", "table", "function", "thread",
+    ];
+
+    #[rustfmt::skip]
+    const METATOPS_STRS: [&str; 29]  = [
+        "__metatable",
+        "__index", "__newindex",
+        "__gc", "__mode", "__len", "__eq",
+        "__add", "__sub", "__mul", "__mod", "__pow",
+        "__div", "__idiv",
+        "__band", "__bor", "__bxor", "__shl", "__shr",
+        "__unm", "__bnot", "__lt", "__le",
+        "__concat", "__call", "__close",
+        "__tostring", "__pairs", "__ipairs",
+    ];
+
     pub fn new() -> Self {
-        State {
+        let mut state = State {
             vm: UnsafeCell::new(Rvm::new()),
             heap: ManagedHeap::default(),
-        }
+        };
+
+        state.heap_with(|h| {
+            // add builtin string to string pool
+            for builtin in Self::TYPE_STRS {
+                h.alloc_fixed(builtin);
+            }
+        });
+
+        state
     }
 
     pub fn with_libs(libs: &[StdLib]) -> Self {
@@ -374,11 +403,20 @@ impl State {
     pub fn open(&mut self, lib: StdLib) {
         let entrys = crate::ffi::get_std_libs(lib);
         for (name, func) in entrys.iter() {
-            let _r = self.context(|vm, heap| {
+            let res = self.context(|vm, heap| {
                 vm.globaltab.set(heap.alloc(*name), LValue::from(*func));
                 Ok(())
             });
-            debug_assert!(_r.is_ok())
+            debug_assert!(res.is_ok())
+        }
+
+        // create string about meta operators lazyly
+        if lib == StdLib::Base {
+            self.heap_with(|h| {
+                for builtin in Self::METATOPS_STRS {
+                    h.alloc_fixed(builtin);
+                }
+            });
         }
     }
 

@@ -18,13 +18,12 @@ use super::{state::State, RuntimeErr};
 pub type StrHashVal = u32;
 
 // const INTERNAL_STR_MAX_LEN: usize = 16;
-const INTERNAL_STR_MAX_LEN: usize = 10;
+const MAX_SHORT_STR_LEN: usize = 23;
 
 pub struct Short {
     hash: Cell<StrHashVal>,
-    reserved: Cell<bool>,
     len: u8,
-    data: [u8; INTERNAL_STR_MAX_LEN], // c-style string ends with '\0'
+    data: [u8; MAX_SHORT_STR_LEN], // c-style string ends with '\0'
 }
 
 pub struct Long {
@@ -66,7 +65,7 @@ impl PartialEq for StrImpl {
 impl From<String> for Gc<StrImpl> {
     fn from(s: String) -> Self {
         let sobj = if StrImpl::able_to_internal(&s) {
-            StrImpl::from_short(&s, false)
+            StrImpl::from_short(&s)
         } else {
             StrImpl::Long(Long {
                 hash: Cell::new(0),
@@ -81,7 +80,7 @@ impl From<String> for Gc<StrImpl> {
 impl From<&str> for Gc<StrImpl> {
     fn from(s: &str) -> Self {
         let sobj = if StrImpl::able_to_internal(s) {
-            StrImpl::from_short(s, false)
+            StrImpl::from_short(s)
         } else {
             StrImpl::Long(Long {
                 hash: Cell::new(0),
@@ -94,12 +93,7 @@ impl From<&str> for Gc<StrImpl> {
 }
 
 impl StrImpl {
-    pub const MAX_SHORT_LEN: usize = INTERNAL_STR_MAX_LEN;
-
-    pub fn new_reserved(s: &str) -> StrImpl {
-        debug_assert!(s.len() <= Self::MAX_SHORT_LEN);
-        StrImpl::from_short(s, true)
-    }
+    pub const INTERNAL_STR_MAX_LEN: usize = 64;
 
     pub fn hash_str(ss: &str) -> StrHashVal {
         let step = if Self::able_to_internal(ss) {
@@ -158,14 +152,6 @@ impl StrImpl {
         !self.is_short()
     }
 
-    pub fn is_reserved(&self) -> bool {
-        if let StrImpl::Short(s) = self {
-            s.reserved.get()
-        } else {
-            false
-        }
-    }
-
     pub fn is_hashed(&self) -> bool {
         if let StrImpl::Long(l) = self {
             l.hashed.get()
@@ -176,21 +162,15 @@ impl StrImpl {
 
     /// Return true if s is short
     pub fn able_to_internal(s: &str) -> bool {
-        s.len() <= Self::MAX_SHORT_LEN
+        s.len() <= Self::INTERNAL_STR_MAX_LEN
     }
 
-    fn from_short(s: &str, reserved: bool) -> StrImpl {
+    fn from_short(s: &str) -> StrImpl {
         let hash = Cell::new(StrImpl::hash_str(s));
-        let reserved = Cell::new(reserved);
         let len = s.len() as u8;
-        let mut data = [0_u8; StrImpl::MAX_SHORT_LEN];
+        let mut data = [0_u8; MAX_SHORT_STR_LEN];
         data[..s.len()].copy_from_slice(s.as_bytes());
-        StrImpl::Short(Short {
-            hash,
-            reserved,
-            len,
-            data,
-        })
+        StrImpl::Short(Short { hash, len, data })
     }
 }
 
@@ -531,7 +511,7 @@ impl Display for LValue {
             Bool(b) => write!(f, "{}", b),
             Int(i) => write!(f, "{}", i),
             Float(fl) => write!(f, "{}", fl),
-            String(s) => write!(f, "\"{}\"", s.as_str()),
+            String(s) => f.write_str(s.as_str()),
             Table(t) => write!(f, "table: 0x{:X}", t.heap_address()),
             Function(func) => write!(f, "function: 0x{:X}", { func.heap_address() }),
             RsFn(rsf) => write!(f, "rsfn: 0x{:X}", rsf as *const _ as usize),
@@ -732,7 +712,6 @@ mod test {
             let gs = Gc::from(s);
 
             assert!(gs.is_short());
-            assert!(!gs.is_reserved());
             assert_eq!(gs.len(), s.len());
             assert_eq!(gs.as_str(), s);
 
@@ -749,7 +728,6 @@ mod test {
 
             let gs = Gc::<StrImpl>::from(s.as_str());
             assert!(gs.is_long());
-            assert!(!gs.is_reserved());
             assert_eq!(gs.len(), s.len());
             assert_eq!(gs.as_str(), s);
         }
