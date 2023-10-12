@@ -101,7 +101,7 @@ fn main() -> Result<(), RuaErr> {
         cfp.walk(&mut ast);
     }
 
-    let chunk = CodeGen::generate(ast, args.strip_debug)
+    let chunk = CodeGen::generate(*ast, args.strip_debug)
         .map_err(|ce| StaticErr::CodeGenErr(Box::new(ce)))?;
 
     if args.list > 0 {
