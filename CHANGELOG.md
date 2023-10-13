@@ -16,6 +16,17 @@ All notable changes to this project will be documented in this file.
 
 * changes here.  -->
 
+## 0.1.5 (2023-10-13)
+Refactor the implementation of `StrImpl`. 
+
+### Features
+* Refactor `StrImpl` with `Box<str>` instead of flexiable array.
+* Refactor `UserDataImpl` with intermidiate pointer instead of flexiable array.
+
+### Fixes
+* Extract some logic into function in `ManagedHeap`.
+* rewrite `full_gc` method to fix unexpected collect for newborned object.
+
 ## 0.1.4 (2023-10-11)
 Refactor the implementation of `CodeGen`. 
 

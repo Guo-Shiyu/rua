@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, LinkedList},
     fmt::{Debug, Display},
     io::{BufReader, BufWriter, Read, Write},
+    num::NonZeroU32,
     ops::{Deref, DerefMut},
 };
 
@@ -10,9 +11,9 @@ use crate::{
         Attribute, BasicBlock, BinOp, Block, Expr, ExprNode, Field, FuncBody, FuncCall, GenericFor,
         NumericFor, ParaList, SrcLoc, Stmt, UnOp,
     },
-    heap::{Gc, Heap, HeapMemUsed},
+    heap::{Gc, Heap, HeapMemUsed, MarkAndSweepGcOps},
     state::RegIndex,
-    value::{LValue, StrImpl},
+    value::LValue,
 };
 
 /// We assume that instructions are unsigned 32-bit integers.
@@ -232,10 +233,10 @@ impl Instruction {
     const MASK_B: u32 = 0xFF << Self::OFFSET_B;
     const MASK_C: u32 = 0xFF << Self::OFFSET_C;
     const MASK_K: u32 = 0x1 << Self::OFFSET_K;
-    const MASK_BX: u32 = (Self::MAX_BX as u32) << Self::OFFSET_BX;
+    const MASK_BX: u32 = (u32::MAX) << Self::OFFSET_BX;
     const MASK_SBX: u32 = Self::MASK_BX;
-    const MASK_AX: u32 = (Self::MAX_AX as u32) << Self::OFFSET_AX;
-    const MASK_SJ: u32 = Self::MASK_AX;
+    const MASK_AX: u32 = (u32::MAX) << Self::OFFSET_AX;
+    const _MASK_SJ: u32 = Self::MASK_AX;
 
     fn set_op(code: &mut u32, op: OpCode) {
         debug_assert!(op as u8 <= EXTRAARG as u8);
@@ -375,7 +376,7 @@ impl Instruction {
     }
 
     fn get_sj(&self) -> i32 {
-        ((self.code & Self::MASK_SJ) >> Self::OFFSET_SJ) as i32
+        (self.code as i32) >> Self::OFFSET_SJ
     }
 
     pub fn repr_abck(&self) -> (OpCode, i32, i32, i32, bool) {
@@ -405,7 +406,7 @@ impl Instruction {
     }
 
     pub fn placeholder() -> Self {
-        Instruction { code: 0 }
+        Isc::isj(JMP, 9999)
     }
 }
 
@@ -433,7 +434,7 @@ impl Display for Instruction {
                 if k {
                     f.write_str("k")
                 } else {
-                    Ok(())
+                    f.write_str(" ")
                 }
             }
             OpMode::IABx => {
@@ -442,7 +443,7 @@ impl Display for Instruction {
             }
             OpMode::IAsBx => {
                 let (code, a, sbx) = self.repr_asbx();
-                write!(f, "{code:<16}\t{a:<3} {sbx:<3}")
+                write!(f, "{code:<16}\t{a:<3} {sbx:<3}     ")
             }
             OpMode::IAx => {
                 let (code, ax) = self.repr_ax();
@@ -450,7 +451,7 @@ impl Display for Instruction {
             }
             OpMode::IsJ => {
                 let (code, sj) = self.repr_sj();
-                write!(f, "{code:<16}\t{sj:<3}      ")
+                write!(f, "{code:<16}\t{sj:<3}         ")
             }
         }
     }
@@ -500,13 +501,49 @@ pub struct Proto {
 
 impl HeapMemUsed for Proto {
     fn heap_mem_used(&self) -> usize {
-        std::mem::size_of::<Self>()
-            + self.kst.capacity()
+        self.source.heap_mem_used()
             + self.code.capacity()
-            + self.subfn.capacity()
             + self.pcline.capacity()
-            + self.locvars.capacity()
-            + self.updecl.capacity()
+            + self
+                .kst
+                .iter()
+                .fold(self.kst.capacity(), |acc, k| acc + k.heap_mem_used())
+            + self
+                .locvars
+                .iter()
+                .fold(self.locvars.capacity(), |acc, l| acc + l.name.capacity())
+            + self
+                .updecl
+                .iter()
+                .fold(self.updecl.capacity(), |acc, u| acc + u.name().len())
+            + self
+                .subfn
+                .iter()
+                .fold(self.subfn.capacity(), |acc, f| acc + f.heap_mem_used())
+    }
+}
+
+impl MarkAndSweepGcOps for Proto {
+    fn delegate_to(&mut self, heap: &mut Heap) {
+        heap.delegate(&mut self.source);
+        self.kst.iter_mut().for_each(|k| heap.delegate(k));
+        self.subfn.iter_mut().for_each(|s| s.delegate_to(heap));
+    }
+
+    fn mark_newborned(&self, white: crate::heap::GcColor) {
+        self.source.mark_newborned(white);
+        self.kst.iter().for_each(|k| k.mark_newborned(white));
+        self.subfn.iter().for_each(|s| s.mark_newborned(white));
+    }
+
+    fn mark_reachable(&self) {
+        self.source.mark_reachable();
+        self.kst.iter().for_each(|k| k.mark_reachable());
+        self.subfn.iter().for_each(|s| s.mark_reachable());
+    }
+
+    fn mark_untouched(&self) {
+        todo!()
     }
 }
 
@@ -533,36 +570,6 @@ impl Debug for Proto {
 }
 
 impl Proto {
-    pub fn delegate_to(p: &mut Proto, heap: &mut Heap) {
-        heap.delegate(p.source);
-
-        // for up in p.updecl.iter().skip(1) {
-        //     match up {
-        //         UpvalDecl::OnStack {
-        //             name,
-        //             parent_upidx: _,
-        //         } => heap.delegate(*name),
-        //         UpvalDecl::InEnv {
-        //             name,
-        //             self_upidx: _,
-        //         } => heap.delegate(*name),
-        //         UpvalDecl::Env => {
-        //             unreachable!()
-        //         }
-        //     }
-        // }
-
-        for k in p.kst.iter() {
-            println!("{}", k);
-            heap.delegate(*k);
-        }
-
-        for sub in p.subfn.iter_mut() {
-            heap.delegate_from(*sub);
-            Self::delegate_to(sub, heap);
-        }
-    }
-
     pub fn nparams(&self) -> i32 {
         self.nparam as i32
     }
@@ -851,7 +858,11 @@ impl GenState {
     }
 
     fn emit_backpatch(&mut self, iscidx: usize, isc: Isc) {
-        self.code[iscidx] = isc;
+        if let Some(dest) = self.code.get_mut(iscidx) {
+            *dest = isc
+        } else {
+            unreachable!("there must be a instruction in backpatch point.")
+        }
     }
 
     fn emit_index_local(
@@ -972,8 +983,10 @@ impl ExprGenCtx {
 type Ctx = ExprGenCtx;
 
 struct BranchBackPatchPoint {
-    if_to_else_entry: (u32, u32),         // (instruction index, pc of cond),
-    then_exit_to_end: Option<(u32, u32)>, // (instruction index, pc),  else block is optional
+    cond_jmp_idx: u32,
+    then_end_jmp_idx: Option<NonZeroU32>,
+    else_entry_pc: Option<NonZeroU32>,
+    def_end_pc: u32,
 }
 
 #[derive(Debug)]
@@ -1070,7 +1083,7 @@ impl CodeGen {
             self.upvals.push(UpvalDecl::Env);
         }
 
-        self.walk_basic_block(body)?;
+        self.walk_basic_block(body, true)?;
 
         // backpatch goto
         while let Some((pc, lable)) = self.jumpbp.pop() {
@@ -1142,14 +1155,18 @@ impl CodeGen {
             .for_each(|p| Self::strip_src_info(p, anonymous))
     }
 
-    fn walk_basic_block(&mut self, body: SrcLoc<Block>) -> Result<(), CodeGenErr> {
+    fn walk_basic_block(
+        &mut self,
+        body: SrcLoc<Block>,
+        must_return: bool,
+    ) -> Result<(), CodeGenErr> {
         self.locstate.push(Vec::with_capacity(4));
 
         let (body_def_end, body) = (body.def_end(), body.into_inner());
         for stmt in body.stats.into_iter() {
             self.walk_stmt(*stmt)?;
         }
-        self.walk_return(body.ret, body_def_end)?;
+        self.walk_return(body.ret, body_def_end, must_return)?;
 
         if let Some(ls) = self.locstate.pop() {
             self.local.extend(ls);
@@ -1199,7 +1216,7 @@ impl CodeGen {
                 }
             }
             Stmt::DoEnd(block) => {
-                self.walk_basic_block(*block)?;
+                self.walk_basic_block(*block, false)?;
             }
             Stmt::While { exp, block } => {
                 self.walk_while_loop(*exp, *block)?;
@@ -1240,7 +1257,7 @@ impl CodeGen {
     ) -> Result<(), CodeGenErr> {
         let def = cond.lineinfo.0;
         self.enter_loop();
-        self.walk_basic_block(block)?;
+        self.walk_basic_block(block, false)?;
         self.leave_loop();
         let cond_reg = {
             let s = self.walk_common_expr(cond, Ctx::Allocate)?;
@@ -1263,7 +1280,7 @@ impl CodeGen {
         };
         self.emit(Isc::iabc(TEST, cond_reg, false as i32, 0), ln);
         let loop_begin = self.set_recover_point(ln);
-        self.walk_basic_block(block)?;
+        self.walk_basic_block(block, false)?;
         self.leave_loop();
 
         let step = (self.cur_pc() - loop_begin.1) as i32;
@@ -1314,7 +1331,7 @@ impl CodeGen {
 
         // loop block
         self.enter_loop();
-        self.walk_basic_block(*n.body)?;
+        self.walk_basic_block(*n.body, false)?;
         self.leave_loop();
 
         // loop end
@@ -1347,7 +1364,7 @@ impl CodeGen {
 
         // loop body
         self.enter_loop();
-        self.walk_basic_block(*g.body)?;
+        self.walk_basic_block(*g.body, false)?;
 
         self.emit(Isc::iabc(TFORCALL, state_reg, 0, niter as i32), def.1);
         let step = (self.cur_pc() - recover_pc) as i32;
@@ -1366,42 +1383,53 @@ impl CodeGen {
         then: SrcLoc<Block>,
         els: Option<BasicBlock>,
     ) -> Result<(), CodeGenErr> {
-        let conddef = exp.def_begin();
+        let cond_def = exp.def_begin();
         let cond = self.walk_common_expr(exp, Ctx::Allocate)?;
-        let reg = self.try_load_expr_to_local(cond, conddef);
+        let reg = self.try_load_expr_to_local(cond, cond_def);
 
-        self.emit(Isc::iabc(TEST, reg, 0, 0), conddef);
+        self.emit(Isc::iabck(TEST, reg, 0, 0), cond_def);
 
-        let mut bpoint = BranchBackPatchPoint {
-            if_to_else_entry: (self.code.len() as u32, self.cur_pc()),
-            then_exit_to_end: None,
+        let mut branch = BranchBackPatchPoint {
+            cond_jmp_idx: self.cur_pc(),
+            then_end_jmp_idx: None,
+            else_entry_pc: None,
+            def_end_pc: 0,
         };
-        self.emit_placeholder(conddef);
+        // place holder for JMP to else block entry
+        self.emit_placeholder(cond_def);
 
-        self.walk_basic_block(then)?;
-        let else_entry_recover_point = self.cur_pc();
+        let then_defend = then.def_end();
+        self.walk_basic_block(then, false)?;
+
         if let Some(bk) = els {
-            bpoint.then_exit_to_end = Some((self.code.len() as u32, self.cur_pc()));
-            self.walk_basic_block(*bk)?;
+            // place holder fpr JMP to else block end
+            branch.then_end_jmp_idx = Some(unsafe { NonZeroU32::new_unchecked(self.cur_pc()) });
+            self.emit_placeholder(then_defend);
+
+            branch.else_entry_pc = Some(unsafe { NonZeroU32::new_unchecked(self.cur_pc()) });
+            self.walk_basic_block(*bk, false)?;
         }
-        let if_end_recover_point = self.cur_pc();
+        branch.def_end_pc = self.cur_pc();
 
         // back patch JMP
-        debug_assert!(bpoint.if_to_else_entry.0 <= self.code.len() as u32);
-        if let Some(isc) = self.code.get_mut(bpoint.if_to_else_entry.0 as usize) {
-            Isc::set_sj(
-                &mut isc.code,
-                (else_entry_recover_point - bpoint.if_to_else_entry.1) as i32,
-            );
-        }
+        if let Some(pc) = branch.else_entry_pc {
+            let pc: u32 = pc.into();
 
-        if let Some(te) = bpoint.then_exit_to_end {
-            if let Some(isc) = self.code.get_mut(te.0 as usize) {
-                Isc::set_sj(&mut isc.code, (if_end_recover_point - te.1) as i32);
-            } else {
-                unreachable!()
-            }
-        }
+            self.emit_backpatch(
+                unsafe { Into::<u32>::into(branch.then_end_jmp_idx.unwrap_unchecked()) } as usize,
+                Isc::isj(JMP, (branch.def_end_pc - pc) as i32),
+            );
+
+            self.emit_backpatch(
+                branch.cond_jmp_idx as usize,
+                Isc::isj(JMP, (pc - branch.cond_jmp_idx) as i32),
+            );
+        } else {
+            self.emit_backpatch(
+                branch.cond_jmp_idx as usize,
+                Isc::isj(JMP, (branch.def_end_pc - branch.cond_jmp_idx) as i32),
+            );
+        };
 
         Ok(())
     }
@@ -1524,6 +1552,7 @@ impl CodeGen {
         &mut self,
         ret: Option<Vec<ExprNode>>,
         line_of_on_empty_ret: u32,
+        must_return: bool,
     ) -> Result<(), CodeGenErr> {
         if let Some(mut rets) = ret {
             match rets.len() {
@@ -1570,7 +1599,7 @@ impl CodeGen {
                 }
                 _ => unreachable!(),
             }
-        } else {
+        } else if must_return {
             self.emit(Isc::iabc(RETURN0, 0, 0, 0), line_of_on_empty_ret);
         }
         Ok(())
@@ -2487,7 +2516,7 @@ impl ChunkDumper {
             0x11 => LValue::Bool(true),
             0x03 => LValue::Int(unsafe { std::mem::transmute(Self::undump_varint(r)?) }),
             0x13 => LValue::Float(Self::undump_float(r)?),
-            0x04 | 0x14 => LValue::from_wild(Self::undump_string(r)?.into()),
+            0x04 | 0x14 => LValue::from(Self::undump_string(r)?),
             _ => unreachable!(),
         };
         Ok(val)
@@ -2507,9 +2536,9 @@ impl ChunkDumper {
     fn undump_string(r: &mut BufReader<impl Read>) -> std::io::Result<String> {
         let len = Self::undump_varint(r)?;
         if len == 0 {
-            Ok(String::with_capacity(StrImpl::EXTRA_HEADERS_SIZE))
+            Ok(String::new())
         } else {
-            let mut buf = String::with_capacity(len + StrImpl::EXTRA_HEADERS_SIZE);
+            let mut buf = String::with_capacity(len);
             let reallen = len - 1;
             for _ in 0..reallen {
                 buf.push('\0');
@@ -2554,15 +2583,19 @@ mod test {
 
     #[test]
     fn instruction_build() {
-        use super::Isc;
-        use crate::codegen::OpMode;
-
+        use crate::codegen::{Isc, OpCode, OpMode};
         for signed in [0, 1, 123, 999, -1, -999] {
-            let i = Isc::iasbx(super::LOADI, 0, signed);
+            let i = Isc::iasbx(OpCode::LOADI, 0, signed);
             assert_eq!(i.mode(), OpMode::IAsBx);
             let (_, a, sbx) = i.repr_asbx();
             assert_eq!(a, 0);
             assert_eq!(sbx, signed);
+        }
+
+        for step in [1, -1, 100, -100] {
+            let i = Isc::isj(OpCode::JMP, step);
+            let (_, sj) = i.repr_sj();
+            debug_assert_eq!(sj, step);
         }
     }
 
