@@ -64,8 +64,8 @@ impl PartialEq for StrImpl {
 
 impl From<String> for Gc<StrImpl> {
     fn from(s: String) -> Self {
-        let sobj = if StrImpl::able_to_internal(&s) {
-            StrImpl::from_short(&s)
+        let sobj = if StrImpl::able_to_store_inplace(&s) {
+            StrImpl::inplace(&s)
         } else {
             StrImpl::Long(Long {
                 hash: Cell::new(0),
@@ -79,8 +79,8 @@ impl From<String> for Gc<StrImpl> {
 
 impl From<&str> for Gc<StrImpl> {
     fn from(s: &str) -> Self {
-        let sobj = if StrImpl::able_to_internal(s) {
-            StrImpl::from_short(s)
+        let sobj = if StrImpl::able_to_store_inplace(s) {
+            StrImpl::inplace(s)
         } else {
             StrImpl::Long(Long {
                 hash: Cell::new(0),
@@ -160,16 +160,22 @@ impl StrImpl {
         }
     }
 
-    /// Return true if s is short
+    /// Return true if s is able to be internalized.
     pub fn able_to_internal(s: &str) -> bool {
         s.len() <= Self::INTERNAL_STR_MAX_LEN
     }
 
-    fn from_short(s: &str) -> StrImpl {
-        let hash = Cell::new(StrImpl::hash_str(s));
-        let len = s.len() as u8;
+    pub fn able_to_store_inplace(s: &str) -> bool {
+        s.len() <= MAX_SHORT_STR_LEN
+    }
+
+    /// Construct a short string from given string.
+    fn inplace(short: &str) -> StrImpl {
+        debug_assert!(Self::able_to_store_inplace(short));
+        let hash = Cell::new(StrImpl::hash_str(short));
+        let len = short.len() as u8;
         let mut data = [0_u8; MAX_SHORT_STR_LEN];
-        data[..s.len()].copy_from_slice(s.as_bytes());
+        data[..short.len()].copy_from_slice(short.as_bytes());
         StrImpl::Short(Short { hash, len, data })
     }
 }
@@ -724,7 +730,7 @@ mod test {
 
         {
             let s = "hello world".repeat(10);
-            assert!(!StrImpl::able_to_internal(s.as_str()));
+            assert!(!StrImpl::able_to_store_inplace(s.as_str()));
 
             let gs = Gc::<StrImpl>::from(s.as_str());
             assert!(gs.is_long());
