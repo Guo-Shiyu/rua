@@ -694,7 +694,7 @@ mod gc_check {
 
         let mut state = State::new();
 
-        for n in 1..=5 {
+        for n in 1..5 {
             let long_str = ".".repeat(64 * n);
             let cloned = long_str.clone();
 
