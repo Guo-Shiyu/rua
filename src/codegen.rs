@@ -2384,7 +2384,7 @@ impl ChunkDumper {
             r.read_exact(&mut byte)?;
             let _stkid = u8::from_ne_bytes(byte);
 
-            r.read_exact(&mut byte)?;
+            // r.read_exact(&mut byte)?;
             // TODO:
             // support attribute dump
             // let attr = ...
