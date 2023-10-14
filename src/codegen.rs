@@ -1040,7 +1040,12 @@ impl CodeGen {
             namelist: Vec::new(),
         };
 
-        let mut res = self.walk_fn_body(name, plist, ast_root, false, true)?;
+        let mut res = self.walk_fn_body(name, plist, ast_root, false)?;
+
+        // init _ENV upvalue if main chunk is a pure function
+        if res.updecl.is_empty() {
+            res.updecl.push(UpvalDecl::Env);
+        }
 
         if self.strip {
             Self::strip_src_info(&mut res, Self::ANONYMOUS.into())
@@ -1058,7 +1063,6 @@ impl CodeGen {
         params: ParaList,
         body: SrcLoc<Block>,
         selfcall: bool,
-        is_main_chunk: bool,
     ) -> Result<Proto, CodeGenErr> {
         // prepare another GenState
         let mut new_state = GenState::new(name);
@@ -1078,12 +1082,12 @@ impl CodeGen {
             // self.emit_local_decl("self".to_string(), ExprStatus::Reg(free), (0, 0));
         }
 
-        // init _ENV upvalue
-        if is_main_chunk {
-            self.upvals.push(UpvalDecl::Env);
-        }
+        let defend = body.def_end();
+        let returned = self.walk_basic_block(body)?;
 
-        self.walk_basic_block(body, true)?;
+        if !returned {
+            self.emit(Isc::iabc(RETURN0, 0, 0, 0), defend);
+        }
 
         // backpatch goto
         while let Some((pc, lable)) = self.jumpbp.pop() {
@@ -1155,44 +1159,41 @@ impl CodeGen {
             .for_each(|p| Self::strip_src_info(p, anonymous))
     }
 
-    fn walk_basic_block(
-        &mut self,
-        body: SrcLoc<Block>,
-        must_return: bool,
-    ) -> Result<(), CodeGenErr> {
+    // Generate bytecode for basic block, return weither this block contains return statement.
+    fn walk_basic_block(&mut self, body: SrcLoc<Block>) -> Result<bool, CodeGenErr> {
         self.locstate.push(Vec::with_capacity(4));
 
         let (body_def_end, body) = (body.def_end(), body.into_inner());
         for stmt in body.stats.into_iter() {
             self.walk_stmt(*stmt)?;
         }
-        self.walk_return(body.ret, body_def_end, must_return)?;
 
         if let Some(ls) = self.locstate.pop() {
             self.local.extend(ls);
         } else {
             unreachable!()
         }
-        Ok(())
+
+        self.walk_return(body.ret, body_def_end)
     }
 
     fn walk_stmt(&mut self, stmt: SrcLoc<Stmt>) -> Result<(), CodeGenErr> {
         let lineinfo = stmt.lineinfo;
         match stmt.into_inner() {
-            Stmt::Assign { vars, exprs } => {
-                self.walk_assign_stmt(vars, exprs)?;
-            }
+            Stmt::Assign { vars, exprs } => self.walk_assign_stmt(vars, exprs),
             Stmt::FuncCall(call) => {
                 let next = self.alloc_free_reg();
                 let _ = self.walk_fn_call(call, next, 0, false);
                 self.free_reg();
+                Ok(())
             }
             Stmt::Lable(lable) => {
                 let dest = self.cur_pc();
                 if self.lables.contains_key(lable.as_str()) {
-                    return Err(CodeGenErr::RepeatedLable { lable });
+                    Err(CodeGenErr::RepeatedLable { lable })
                 } else {
                     self.lables.insert(lable, dest);
+                    Ok(())
                 }
             }
             Stmt::Goto(lable) => {
@@ -1205,49 +1206,39 @@ impl CodeGen {
                     let pc = self.cur_pc();
                     self.jumpbp.push((pc, lable));
                 }
+                Ok(())
             }
             Stmt::Break => {
                 let (idx, pc) = (self.code.len(), self.cur_pc());
                 if let Some(lop) = self.loopbp.back_mut() {
                     lop.push((idx as u32, pc));
                     self.emit(Isc::placeholder(), 0);
+                    Ok(())
                 } else {
-                    return Err(CodeGenErr::BreakNotInLoopBlock);
+                    Err(CodeGenErr::BreakNotInLoopBlock)
                 }
             }
             Stmt::DoEnd(block) => {
-                self.walk_basic_block(*block, false)?;
+                let has_ret = self.walk_basic_block(*block)?;
+                debug_assert!(!has_ret);
+                Ok(())
             }
-            Stmt::While { exp, block } => {
-                self.walk_while_loop(*exp, *block)?;
-            }
-            Stmt::Repeat { block, exp } => {
-                self.walk_repeat_loop(*exp, *block)?;
-            }
+            Stmt::While { exp, block } => self.walk_while_loop(*exp, *block),
+            Stmt::Repeat { block, exp } => self.walk_repeat_loop(*exp, *block),
             Stmt::IfElse {
                 cond: exp,
                 then,
                 els,
-            } => {
-                self.walk_branch_stmt(*exp, *then, els)?;
-            }
-            Stmt::NumericFor(num) => {
-                self.walk_numberic_loop(*num)?;
-            }
-            Stmt::GenericFor(gen) => {
-                self.walk_generic_for(*gen)?;
-            }
-            Stmt::FnDef { pres, method, body } => {
-                self.walk_fn_def(pres, method, *body)?;
-            }
-            Stmt::LocalVarDecl { names, exprs } => {
-                self.walk_local_decl(names, exprs, lineinfo)?;
-            }
+            } => self.walk_branch_stmt(*exp, *then, els),
+            Stmt::NumericFor(num) => self.walk_numberic_loop(*num),
+            Stmt::GenericFor(gen) => self.walk_generic_for(*gen),
+            Stmt::FnDef { pres, method, body } => self.walk_fn_def(pres, method, *body),
+            Stmt::LocalVarDecl { names, exprs } => self.walk_local_decl(names, exprs, lineinfo),
             Stmt::Expr(exp) => {
                 let _ = self.walk_common_expr(*exp, Ctx::Ignore)?;
+                Ok(())
             }
-        };
-        Ok(())
+        }
     }
 
     fn walk_repeat_loop(
@@ -1257,7 +1248,7 @@ impl CodeGen {
     ) -> Result<(), CodeGenErr> {
         let def = cond.lineinfo.0;
         self.enter_loop();
-        self.walk_basic_block(block, false)?;
+        self.walk_basic_block(block)?;
         self.leave_loop();
         let cond_reg = {
             let s = self.walk_common_expr(cond, Ctx::Allocate)?;
@@ -1280,7 +1271,7 @@ impl CodeGen {
         };
         self.emit(Isc::iabc(TEST, cond_reg, false as i32, 0), ln);
         let loop_begin = self.set_recover_point(ln);
-        self.walk_basic_block(block, false)?;
+        self.walk_basic_block(block)?;
         self.leave_loop();
 
         let step = (self.cur_pc() - loop_begin.1) as i32;
@@ -1331,7 +1322,7 @@ impl CodeGen {
 
         // loop block
         self.enter_loop();
-        self.walk_basic_block(*n.body, false)?;
+        self.walk_basic_block(*n.body)?;
         self.leave_loop();
 
         // loop end
@@ -1364,7 +1355,7 @@ impl CodeGen {
 
         // loop body
         self.enter_loop();
-        self.walk_basic_block(*g.body, false)?;
+        self.walk_basic_block(*g.body)?;
 
         self.emit(Isc::iabc(TFORCALL, state_reg, 0, niter as i32), def.1);
         let step = (self.cur_pc() - recover_pc) as i32;
@@ -1399,7 +1390,7 @@ impl CodeGen {
         self.emit_placeholder(cond_def);
 
         let then_defend = then.def_end();
-        self.walk_basic_block(then, false)?;
+        self.walk_basic_block(then)?;
 
         if let Some(bk) = els {
             // place holder fpr JMP to else block end
@@ -1407,7 +1398,7 @@ impl CodeGen {
             self.emit_placeholder(then_defend);
 
             branch.else_entry_pc = Some(unsafe { NonZeroU32::new_unchecked(self.cur_pc()) });
-            self.walk_basic_block(*bk, false)?;
+            self.walk_basic_block(*bk)?;
         }
         branch.def_end_pc = self.cur_pc();
 
@@ -1472,7 +1463,7 @@ impl CodeGen {
 
         let fnreg = self.alloc_free_reg();
         let pirdx = self.subproto.len();
-        let pro = self.walk_fn_body(fnname.into(), body.params, *body.body, false, false)?;
+        let pro = self.walk_fn_body(fnname.into(), body.params, *body.body, false)?;
         self.subproto.push(pro);
         self.emit(Isc::iabx(CLOSURE, fnreg, pirdx as i32), defln);
 
@@ -1552,8 +1543,7 @@ impl CodeGen {
         &mut self,
         ret: Option<Vec<ExprNode>>,
         line_of_on_empty_ret: u32,
-        must_return: bool,
-    ) -> Result<(), CodeGenErr> {
+    ) -> Result<bool, CodeGenErr> {
         if let Some(mut rets) = ret {
             match rets.len() {
                 1 => {
@@ -1598,11 +1588,11 @@ impl CodeGen {
                     todo!("multi return")
                 }
                 _ => unreachable!(),
-            }
-        } else if must_return {
-            self.emit(Isc::iabc(RETURN0, 0, 0, 0), line_of_on_empty_ret);
+            };
+            Ok(true)
+        } else {
+            Ok(false)
         }
-        Ok(())
     }
 
     fn walk_fn_call(
@@ -1861,7 +1851,6 @@ impl CodeGen {
                     CodeGen::ANONYMOUS.into(),
                     fnbody.params,
                     *fnbody.body,
-                    false,
                     false,
                 )?;
                 self.subproto.push(pto);
