@@ -147,7 +147,7 @@ impl Parser<'_> {
         let (lineinfo, inner) = (expr.lineinfo, expr.into_inner());
 
         let stmt = if let Expr::FuncCall(call) = inner {
-            SrcLoc::new(Stmt::FuncCall(call), lineinfo)
+            SrcLoc::new(Stmt::FnCall(call), lineinfo)
         } else {
             let first = Box::new(SrcLoc::new(inner, lineinfo));
             if self.test(Token::Comma) {
@@ -401,7 +401,7 @@ impl Parser<'_> {
         let beg = self.lex.line();
         let fndef = self.func_body()?;
         let end = self.lex.line();
-        let fndef = SrcLoc::new(Expr::FuncDefine(fndef), (beg, end));
+        let fndef = SrcLoc::new(Expr::Lambda(fndef), (beg, end));
         Ok(Stmt::LocalVarDecl {
             names: vec![(func_name, None)],
             exprs: vec![Box::new(fndef)],
@@ -514,13 +514,56 @@ impl Parser<'_> {
         Ok(FuncBody { params, body })
     }
 
-    /// paralist ::= namelist [`,` `...`] | `...`
-    /// namelist ::= Name {`,` Name}
-    fn param_list(&mut self) -> Result<ParaList, SyntaxError> {
+    fn param_list(&mut self) -> Result<ParameterList, SyntaxError> {
         let mut vargs = false;
 
         if let Token::RP = self.current {
-            return Ok(ParaList {
+            return Ok(ParameterList {
+                vargs,
+                namelist: vec![],
+            });
+        }
+
+        let mut namelist = Vec::with_capacity(4);
+        loop {
+            match &mut self.current {
+                Token::Dots => {
+                    vargs = true;
+                    self.next()?;
+                }
+
+                Token::Ident(id) => {
+                    namelist.push(std::mem::take(id));
+                    self.next()?;
+                }
+
+                Token::Comma => {
+                    self.next()?;
+                }
+
+                Token::RP => {
+                    break;
+                }
+
+                _ => {
+                    return Err(self.error(format!(
+                        "'...' or ')' are expected but {:?} was found",
+                        self.current
+                    )))
+                }
+            }
+        }
+
+        Ok(ParameterList { vargs, namelist })
+    }
+
+    /// paralist ::= namelist [`,` `...`] | `...`
+    /// namelist ::= Name {`,` Name}
+    fn argument_list(&mut self) -> Result<ArgumentList, SyntaxError> {
+        let mut vargs = false;
+
+        if let Token::RP = self.current {
+            return Ok(ArgumentList {
                 vargs,
                 namelist: vec![],
             });
@@ -544,7 +587,7 @@ impl Parser<'_> {
             }
         };
 
-        Ok(ParaList {
+        Ok(ArgumentList {
             vargs,
             namelist: paras,
         })
@@ -658,7 +701,7 @@ impl Parser<'_> {
                 let beg = self.lex.line();
                 let body = self.func_body()?;
                 let end = self.lex.line();
-                Ok(Box::new(SrcLoc::new(Expr::FuncDefine(body), (beg, end))))
+                Ok(Box::new(SrcLoc::new(Expr::Lambda(body), (beg, end))))
             }
             Token::LB => Ok(self.table_constructor()?),
 
@@ -876,13 +919,13 @@ impl Parser<'_> {
     }
 
     /// args ::=  `(` [explist] `)` | tablector | LiteralString
-    fn func_args(&mut self) -> Result<SrcLoc<ParaList>, SyntaxError> {
+    fn func_args(&mut self) -> Result<SrcLoc<ArgumentList>, SyntaxError> {
         let beg = self.lex.line();
         let mut holder = String::new();
         match &mut self.current {
             Token::LP => {
                 self.next()?; // skip '('
-                let args = self.param_list()?;
+                let args = self.argument_list()?;
                 self.check_and_next(Token::RP)?;
                 Ok(SrcLoc::new(args, (beg, self.lex.line())))
             }
@@ -890,7 +933,7 @@ impl Parser<'_> {
             Token::LB => {
                 let table = self.table_constructor()?;
                 Ok(SrcLoc::new(
-                    ParaList {
+                    ArgumentList {
                         vargs: false,
                         namelist: vec![table],
                     },
@@ -906,7 +949,7 @@ impl Parser<'_> {
                 self.next()?; // skip string literal
 
                 Ok(SrcLoc::new(
-                    ParaList {
+                    ArgumentList {
                         vargs: false,
                         namelist: vec![litnode],
                     },

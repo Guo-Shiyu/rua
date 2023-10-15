@@ -98,13 +98,14 @@ impl Block {
 ///        local attnamelist [`=` explist]
 
 pub enum Stmt {
-    // global assignment
+    // assignment,  x = A | x.y.z = A
     Assign {
         vars: Vec<ExprNode>,
         exprs: Vec<ExprNode>,
     },
 
-    FuncCall(FuncCall),
+    // fn(a, b, c) | x.y.fn(a, b, c)
+    FnCall(FuncCall),
 
     Lable(String),
 
@@ -159,22 +160,21 @@ pub enum FuncCall {
     // i.e: func(1, 2, 3, ...)
     FreeFnCall {
         prefix: ExprNode,
-        args: SrcLoc<ParaList>,
+        args: SrcLoc<ArgumentList>,
     },
 
     // i.e: class:func(1, 2, 3, ...)
     MethodCall {
         prefix: ExprNode,
         method: Box<SrcLoc<String>>,
-        args: SrcLoc<ParaList>,
+        args: SrcLoc<ArgumentList>,
     },
 }
 
-/// functiondef ::= function funcbody
 /// funcbody ::= `(` [parlist] `)` block end
 /// paralist ::= namelist [`,` `...`] | `...`
 pub struct FuncBody {
-    pub params: ParaList,
+    pub params: ParameterList,
     pub body: BasicBlock,
 }
 
@@ -209,8 +209,8 @@ pub enum Expr {
 
     Ident(String),
 
-    // global function defination
-    FuncDefine(FuncBody),
+    // anonymous function defination
+    Lambda(FuncBody),
 
     // table.key | table[key]
     Index {
@@ -252,10 +252,13 @@ impl From<Attribute> for u8 {
     }
 }
 
-pub struct ParaList {
+pub struct FnHeader<H> {
+    pub namelist: Vec<H>,
     pub vargs: bool,
-    pub namelist: Vec<ExprNode>,
 }
+
+pub type ParameterList = FnHeader<String>;
+pub type ArgumentList = FnHeader<ExprNode>;
 
 /// field ::= `[` exp `]` `=` exp | Name `=` exp | exp
 pub struct Field {
@@ -523,7 +526,7 @@ impl AstDumper {
                 self.write_lineinfo(buf, stmt.lineinfo.0)
             }),
 
-            Stmt::FuncCall(call) => match call {
+            Stmt::FnCall(call) => match call {
                 FuncCall::FreeFnCall { prefix, args } => {
                     self.write_lable(buf, COLLAPSE).and_then(|_| {
                         self.write_name(buf, "FreeFuncCall", this)?;
@@ -760,7 +763,7 @@ impl AstDumper {
             Expr::Literal(l) => l.clone(),
             Expr::Dots => "<VARG>".to_string(),
             Expr::Ident(id) => id.clone(),
-            Expr::FuncDefine(_) => "<FuncDef>".to_string(),
+            Expr::Lambda(_) => "<FuncDef>".to_string(),
             Expr::Index { prefix, key } => {
                 let mut buf = String::with_capacity(32);
                 buf.push_str(&Self::inspect(prefix.inner()));
@@ -873,7 +876,7 @@ impl ConstantFoldPass {
                         Self::try_fold(e);
                     });
                 }
-                Stmt::FuncCall(call) => match call {
+                Stmt::FnCall(call) => match call {
                     FuncCall::FreeFnCall { prefix: _, args } => {
                         args.namelist.iter_mut().for_each(|e| {
                             Self::try_fold(e);
@@ -943,9 +946,6 @@ impl ConstantFoldPass {
                     method: _,
                     body: func,
                 } => {
-                    func.params.namelist.iter_mut().for_each(|e| {
-                        Self::try_fold(e);
-                    });
                     Self::run_on_bolck(&mut func.body);
                 }
                 Stmt::LocalVarDecl { names: _, exprs } => {
@@ -1131,7 +1131,7 @@ mod test {
         use std::mem::size_of;
 
         const _B_SIZE: usize = size_of::<Block>();
-        const _P_SIZE: usize = size_of::<ParaList>();
+        const _P_SIZE: usize = size_of::<ArgumentList>();
         const _D_SIZE: usize = size_of::<FuncBody>();
         const _C_SIZE: usize = size_of::<FuncCall>();
 
