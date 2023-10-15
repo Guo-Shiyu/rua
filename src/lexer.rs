@@ -561,7 +561,7 @@ impl<'a> Lexer<'a> {
                             }
                         }
 
-                        ('\r', _, _) => {
+                        ('\r' | '\n', _, _) => {
                             self.bump();
                             self.new_line();
                         }
