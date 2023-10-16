@@ -423,13 +423,13 @@ fn try_fold(exp: &mut Expr) -> AfterFoldStatus {
                     // update expr node
                     *exp = new_exp;
 
-                    #[cfg(flag = "trace_optimize")]
-                    self.record.push(FoldInfo {
-                        srcloc: expr.lineinfo(),
-                        derive_n: *derive,
-                        status: StillConst,
-                        new: new_exp,
-                    });
+                    // #[cfg(flag = "trace_optimize")]
+                    // self.record.push(FoldInfo {
+                    //     srcloc: expr.lineinfo(),
+                    //     derive_n: *derive,
+                    //     status: StillConst,
+                    //     new: new_exp,
+                    // });
 
                     StillConst
                 } else {
@@ -449,12 +449,11 @@ fn gen_arithmetic_op_int(op: BinOp) -> Option<fn(i64, i64) -> i64> {
         BinOp::Add => Some(|l, r| l + r),
         BinOp::Minus => Some(|l: i64, r: i64| l - r),
         BinOp::Mul => Some(|l, r| l * r),
-        // BinOp::Mod => Some(|l, r| l % r),
+        BinOp::Mod => Some(|l, r| l % r),
         BinOp::Pow => Some(|l, r| l ^ r),
         BinOp::IDiv => Some(|l, r| l / r),
 
-        // 1 / 1 => 1.0
-        // BinOp::Div => Some(|l, r| l / r),
+        BinOp::Div => Some(|l, r| l / r),
         _ => None,
     }
 }
