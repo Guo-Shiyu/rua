@@ -1,24 +1,9 @@
+use crate::{SyntaxErrKind, SyntaxError};
+
 use super::{
     ast::*,
-    lexer::{Lexer, LexicalError, Token},
+    lexer::{Lexer, Token},
 };
-
-#[derive(Debug)]
-pub struct SyntaxError {
-    pub reason: String,
-    pub line: u32,
-    pub column: u32,
-}
-
-impl SyntaxError {
-    fn new(state: &Parser, reason: String) -> Self {
-        SyntaxError {
-            reason,
-            line: state.lex.line(),
-            column: state.lex.column(),
-        }
-    }
-}
 
 /// An LL(2) parser for Lua 5.4       
 ///
@@ -35,7 +20,7 @@ impl Parser<'_> {
     /// This will clear self.ahead if self.ahead is't EOF.
     fn next(&mut self) -> Result<(), SyntaxError> {
         if let Token::Eof = self.ahead {
-            self.current = self.lex.pump().map_err(|e| self.lexerr(e))?;
+            self.current = self.lex.tokenize().map_err(|e| self.error(e))?;
         } else {
             self.current = std::mem::replace(&mut self.ahead, Token::Eof);
         }
@@ -45,7 +30,7 @@ impl Parser<'_> {
     /// Motivate lexer to next token and update self.ahead
     fn look_ahead(&mut self) -> Result<(), SyntaxError> {
         debug_assert!(self.ahead == Token::Eof);
-        self.ahead = self.lex.pump().map_err(|e| self.lexerr(e))?;
+        self.ahead = self.lex.tokenize().map_err(|e| self.error(e))?;
         Ok(())
     }
 
@@ -186,7 +171,7 @@ impl Parser<'_> {
 
         let ret = match &mut self.current {
             Token::Ident(id) => Ok(Stmt::Lable(std::mem::take(id))),
-            _ => Err(self.unexpected("::")),
+            _ => Err(self.unexpected(&[Token::Follow])),
         };
         if ret.is_ok() {
             self.next()?; // skip lable
@@ -202,7 +187,7 @@ impl Parser<'_> {
         if let Token::Ident(lable) = &mut self.current {
             Ok(Stmt::Goto(std::mem::take(lable)))
         } else {
-            Err(self.unexpected("identifier"))
+            Err(self.unexpected(&[id()]))
         }
     }
 
@@ -293,14 +278,14 @@ impl Parser<'_> {
             let line = self.lex.line();
             SrcLoc::new(std::mem::take(first), (line, line))
         } else {
-            return Err(self.unexpected("identifier"));
+            return Err(self.unexpected(&[id()]));
         };
 
         self.next()?;
         let stmt = match &self.current {
             Token::Comma | Token::In => self.generic_for(iter)?,
             Token::Assign => self.numeric_for(iter)?,
-            _ => return Err(self.unexpected("'=' or ','")),
+            _ => return Err(self.unexpected(&[Token::Eq, Token::Comma])),
         };
 
         Ok(stmt)
@@ -321,7 +306,7 @@ impl Parser<'_> {
                 }
                 Token::Comma => self.next()?,
                 Token::In => break,
-                _ => return Err(self.unexpected("identifier or 'in'")),
+                _ => return Err(self.unexpected(&[id(), Token::In])),
             }
         }
         self.check_and_next(Token::In)?;
@@ -393,7 +378,7 @@ impl Parser<'_> {
             let line = self.lex.line();
             SrcLoc::new(std::mem::take(name), (line, line))
         } else {
-            return Err(self.unexpected("identifier"));
+            return Err(self.unexpected(&[id()]));
         };
 
         self.next()?; // eat func name
@@ -414,8 +399,8 @@ impl Parser<'_> {
         let mut names = Vec::with_capacity(4);
         loop {
             let line = self.lex.line();
-            if let Token::Ident(id) = &mut self.current {
-                let name = SrcLoc::new(std::mem::take(id), (line, line));
+            if let Token::Ident(ident) = &mut self.current {
+                let name = SrcLoc::new(std::mem::take(ident), (line, line));
                 self.next()?;
 
                 // optional attribute
@@ -424,13 +409,17 @@ impl Parser<'_> {
                     if let Token::Ident(attrid) = &mut self.current {
                         std::mem::swap(attrid, &mut attr_holder);
                     } else {
-                        return Err(self.unexpected("attribute"));
+                        return Err(self.unexpected(&[id()]));
                     };
 
                     let attr = match attr_holder.as_str() {
                         "const" => Some(Attribute::Const),
                         "close" => Some(Attribute::Close),
-                        other => return Err(self.error(format!("invalid attribute '{}'", other))),
+                        other => {
+                            return Err(self.error(SyntaxErrKind::InvalidAttribute {
+                                attr: other.to_string(),
+                            }))
+                        }
                     };
 
                     self.next()?; // skip attribute
@@ -546,10 +535,7 @@ impl Parser<'_> {
                 }
 
                 _ => {
-                    return Err(self.error(format!(
-                        "'...' or ')' are expected but {:?} was found",
-                        self.current
-                    )))
+                    return Err(self.unexpected(&[Token::Dots, Token::RP]));
                 }
             }
         }
@@ -580,10 +566,7 @@ impl Parser<'_> {
             Token::RP => {}
 
             _ => {
-                return Err(self.error(format!(
-                    "'...' or ')' are expected but {:?} was found",
-                    self.current
-                )))
+                return Err(self.unexpected(&[Token::Dots, Token::RP]));
             }
         };
 
@@ -836,7 +819,7 @@ impl Parser<'_> {
                 return Ok(exp);
             }
 
-            _ => return Err(self.unexpected("identifier or '('")),
+            _ => return Err(self.unexpected(&[id(), Token::LP])),
         };
 
         let begin = self.lex.line();
@@ -861,7 +844,7 @@ impl Parser<'_> {
                     if let Token::Ident(id) = &mut self.current {
                         std::mem::swap(id, &mut holder);
                     } else {
-                        return Err(self.unexpected("identifier"));
+                        return Err(self.unexpected(&[id()]));
                     };
 
                     let attr = Expr::Literal(holder);
@@ -887,7 +870,7 @@ impl Parser<'_> {
                     if let Token::Ident(method) = &mut self.current {
                         std::mem::swap(method, &mut holder);
                     } else {
-                        return Err(self.unexpected("identifier"));
+                        return Err(self.unexpected(&[id()]));
                     };
 
                     self.next()?; // skip name
@@ -957,7 +940,7 @@ impl Parser<'_> {
                 ))
             }
 
-            _ => Err(self.unexpected("function arguments")),
+            _ => Err(self.unexpected(&[Token::LP, Token::LB, Token::Literal(String::new())])),
         }
     }
 
@@ -970,7 +953,7 @@ impl Parser<'_> {
         if self.test(expect.clone()) {
             Ok(())
         } else {
-            Err(self.unexpected(format!("{:?}", expect).as_str()))
+            Err(self.unexpected(&[expect]))
         }
     }
 
@@ -992,19 +975,19 @@ impl Parser<'_> {
 }
 
 impl Parser<'_> {
-    fn error(&self, r: String) -> SyntaxError {
-        SyntaxError::new(self, r)
+    fn error(&self, e: SyntaxErrKind) -> SyntaxError {
+        SyntaxError {
+            kind: e,
+            line: self.lex.line(),
+            column: self.lex.column(),
+        }
     }
 
-    fn unexpected(&self, expect: &str) -> SyntaxError {
-        self.error(format!(
-            "Unexpected symbol, {expect} is expected but {:?} was found",
-            self.current
-        ))
-    }
-
-    fn lexerr(&self, le: LexicalError) -> SyntaxError {
-        self.error(le.reason)
+    fn unexpected(&self, expect: &[Token]) -> SyntaxError {
+        self.error(SyntaxErrKind::UnexpectedToken {
+            expect: Vec::from(expect),
+            found: self.current.clone(),
+        })
     }
 }
 
@@ -1031,6 +1014,11 @@ impl Parser<'_> {
         }
         Ok(block)
     }
+}
+
+/// Make an empty token for error report.
+fn id() -> Token {
+    Token::Ident(String::new())
 }
 
 mod test {

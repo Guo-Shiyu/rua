@@ -1,8 +1,13 @@
-use std::num::IntErrorKind;
-use std::str::Chars;
-use std::str::FromStr;
+use std::{
+    num::IntErrorKind,
+    str::{Chars, FromStr},
+};
 
-/// Defined in [Lua 5.4 manual / 3.1 ](https://www.lua.org/manual/5.4/manual.html) 
+use crate::SyntaxErrKind;
+
+/// Token value defined for rua lexer. Keywords, operators, identifier and literals are included.
+/// 
+/// Keywords are defined in [Lua 5.4 manual#3.1](https://www.lua.org/manual/5.4/manual.html#3.1) 
 #[rustfmt::skip]
 #[derive(Debug, PartialEq, Clone)]
 pub enum Token {
@@ -39,14 +44,22 @@ pub enum Token {
 }
 
 impl Token {
+    /// Return true if given token is an identifier.
     pub fn is_ident(&self) -> bool {
         matches!(self, Token::Ident(_))
     }
 
+    /// Return true if given token is a float or interger.
     pub fn is_number(&self) -> bool {
         matches!(self, Token::Integer(_) | Token::Float(_))
     }
 
+    /// Return true if given token is a string literal.
+    pub fn is_literal(&self) -> bool {
+        matches!(self, Token::Literal(_))
+    }
+
+    /// Return true if given token is a keyword defined in lua5.4.
     pub fn is_keyword(&self) -> bool {
         matches!(
             self,
@@ -75,6 +88,7 @@ impl Token {
         )
     }
 
+    /// Return true if given token is the end of file.
     pub fn is_eof(&self) -> bool {
         matches!(self, Token::Eof)
     }
@@ -82,35 +96,36 @@ impl Token {
 
 /// A low-level peekable scannner iterate the input character sequence.
 ///
-/// Next 'n' th character can be peeked via `first` and `second` method.
+/// Next 'n' th character can be peeked via `peek`, `first` and `second` method.
 /// Position can be shifted forward via `eat` and `eat_n` method.   
 ///
-/// ref: https://github.com/rust-lang/rust/blob/master/compiler/rustc_lexer/src/cursor.rs
+/// If given sequence are fully consumed, it will return '\0'.
+///
+/// This implementation is inspried by: [rustc::lexer::cursor](https://github.com/rust-lang/rust/blob/master/compiler/rustc_lexer/src/cursor.rs)
 pub struct Scanner<'a> {
     chars: Chars<'a>,
 }
-//
+
 impl<'a> Scanner<'a> {
+    /// Construct a new Scanner from given `&str`.
     pub fn new(input: &'a str) -> Scanner<'a> {
         Scanner {
             chars: input.chars(),
         }
     }
 
-    /// Peek the next `nth(n)` char without consuming any input.
-    pub fn peek(&self, n: usize) -> Option<char> {
-        let mut it = self.chars.clone();
-        let mut ch = None;
-        (0..n).for_each(|_| ch = it.next());
-        ch
-    }
-
+    /// Peek next 1th character without consuming it.
     pub fn first(&self) -> char {
-        self.peek(1).unwrap_or_default()
+        // `.next()` optimizes better than `.nth(0)`
+        self.chars.clone().next().unwrap_or_default()
     }
 
+    /// Peek next 2th character without consuming it.
     pub fn second(&self) -> char {
-        self.peek(2).unwrap_or_default()
+        // `.next()` optimizes better than `.nth(1)`
+        let mut it = self.chars.clone();
+        it.next();
+        it.next().unwrap_or_default()
     }
 
     /// Checks if there is nothing more to consume.
@@ -127,24 +142,31 @@ impl<'a> Scanner<'a> {
 
     /// Consume while predicate returns `true` or until the end of input.
     pub fn eat_while(&mut self, mut predicate: impl FnMut(char) -> bool) -> &'a str {
-        let record = self.chars.as_str();
-        let mut len = 0;
-        while predicate(self.first()) && !self.is_eof() {
-            self.eat();
-            len += 1;
-        }
-        &record[0..len]
+        let seq = self.chars.as_str();
+        let nbyte = seq
+            .char_indices()
+            .take_while(|(_, ch)| predicate(*ch))
+            .fold(0, |acc, (_, ch)| {
+                self.eat();
+                acc + ch.len_utf8()
+            });
+
+        &seq[0..nbyte]
     }
 
-    /// Consume n character or until the end of input.
+    /// Consume n utf8 character or until the end of input.
     pub fn eat_n(&mut self, n: usize) -> &'a str {
-        let record = self.chars.as_str();
-        let mut i = 0;
-        while !self.is_eof() && i < n {
-            self.eat();
-            i += 1;
-        }
-        &record[0..n.min(record.len())]
+        let seq = self.chars.as_str();
+        let len = seq
+            .char_indices()
+            .enumerate()
+            .take_while(|(nth, _)| *nth < n)
+            .fold(0, |acc, (_, (_, ch))| {
+                self.eat();
+                acc + ch.len_utf8()
+            });
+
+        &seq[0..len]
     }
 }
 
@@ -161,6 +183,7 @@ pub struct Lexer<'a> {
 }
 
 impl Lexer<'_> {
+    /// Initialize a tokenizer at line 1 and col 1.
     pub fn new(input: &str) -> Lexer {
         Lexer {
             scan: Scanner::new(input),
@@ -169,20 +192,21 @@ impl Lexer<'_> {
         }
     }
 
+    /// Return current line number.
     pub fn line(&self) -> u32 {
         self.line
     }
 
+    /// Return current column number.
     pub fn column(&self) -> u32 {
         self.colume
     }
 
+    /// Return `true` if udelying scanner is on the end of file.
     pub fn is_eof(&self) -> bool {
         self.scan.is_eof()
     }
-}
 
-impl<'a> Lexer<'a> {
     /// Record n columns.
     fn col_n(&mut self, n: usize) -> &mut Self {
         self.colume += n as u32;
@@ -195,14 +219,14 @@ impl<'a> Lexer<'a> {
         self.col_n(1)
     }
 
-    /// Record new line, reset column to 1.
+    /// Record a new line, reset column number to 1.
     fn new_line(&mut self) {
         self.line += 1;
         self.colume = 1;
     }
 
-    /// Get next token or an lexical error.
-    pub fn pump(&mut self) -> Result<Token, LexicalError> {
+    /// Get next token or a lexical error.
+    pub fn tokenize(&mut self) -> Result<Token, SyntaxErrKind> {
         const WHITESPACES: [char; 4] = [' ', '\t', '\u{013}', '\u{014}'];
 
         loop {
@@ -257,25 +281,19 @@ impl<'a> Lexer<'a> {
 
                 punc if punc.is_ascii_punctuation() => {
                     break if punc == '@' || punc == '`' {
-                        Err(LexicalError {
-                            reason: format!("invalid punctuatuion character: {}", punc),
-                        })
+                        Err(SyntaxErrKind::InvalidCharacter { ch: punc })
                     } else {
                         self.lex_punctuation(punc)
                     }
                 }
 
-                invalid => {
-                    break Err(LexicalError {
-                        reason: format!("invalid character: {}", invalid),
-                    })
-                }
+                invalid => break Err(SyntaxErrKind::InvalidCharacter { ch: invalid }),
             }
         }
     }
 
     /// Lex all form of number in lua.
-    fn lex_number(&mut self) -> Result<Token, LexicalError> {
+    fn lex_number(&mut self) -> Result<Token, SyntaxErrKind> {
         let hex = matches!(
             (self.scan.first(), self.scan.second()),
             ('0', 'X') | ('0', 'x')
@@ -337,23 +355,16 @@ impl<'a> Lexer<'a> {
                         '-' => {self.bump(); false},
                         dig if dig.is_ascii_digit() => true,
                         other => {
-                            return Err(LexicalError {
-                                reason: format!(
-                                    "invalid float exponent nonation: 0x{}p{}",
-                                    src, other
-                                ),
-                            })
+                            return  Err(SyntaxErrKind::BadFloatRepresentation { repr: format!("0x{src}p{other}") });
                         }
                     };
 
                     let exp_str = self.scan.eat_while(|c| c.is_ascii_digit());
                     if exp_str.is_empty() {
-                        Err(LexicalError {
-                            reason: format!(
-                                "invalid float exponent nonation: 0x{}p{}",
-                                base, if is_positive { '+' } else {'-'}
-                            ),
-                        })
+                        Err(SyntaxErrKind::BadFloatRepresentation { repr: format!(
+                            "0x{}p{}",
+                            base, if is_positive { '+' } else {'-'}
+                        ) } )
                     } else {
                         let exp = u32::from_str(exp_str).unwrap();
                         self.col_n(exp_str.len());
@@ -378,17 +389,13 @@ impl<'a> Lexer<'a> {
                         self.col_n(copy.len());
                         Ok(Token::Float(f))
                     } else {
-                        Err(LexicalError {
-                            reason: format!("invalid float E nonation: {}", copy),
-                        })
+                        Err(SyntaxErrKind::BadFloatRepresentation { repr: copy })
                     }
                 } else if let Ok(f) = f64::from_str(base) {
                         self.col_n(base.len());
                         Ok(Token::Float(f))
                     } else {
-                        Err(LexicalError {
-                            reason: format!("invalid float representation: {}", base),
-                        })
+                        Err(SyntaxErrKind::BadFloatRepresentation { repr: base.to_string() })
                     }
             },
 
@@ -406,9 +413,7 @@ impl<'a> Lexer<'a> {
                         self.col_n(copy.len());
                         Ok(Token::Float(f))
                     } else {
-                        Err(LexicalError {
-                            reason: format!("invalid E-float nonation: {}", copy),
-                        })
+                        Err(SyntaxErrKind::BadFloatRepresentation { repr: copy })
                     }
                 }else {
                     self.col_n(base.len());
@@ -420,26 +425,20 @@ impl<'a> Lexer<'a> {
                             IntErrorKind::PosOverflow | IntErrorKind::NegOverflow => {
                                 return i128::from_str(base)
                                             .map(|i| Token::Float(i as f64))
-                                            .map_err(|_| LexicalError {
-                                                reason: format!("invalid interger representation: {}", base),
-                                            })
+                                            .map_err(|_| SyntaxErrKind::BadIntergerRepresentation { repr: base.to_string() })
                             },
-                            _ => return Err(LexicalError {
-                                reason: format!("invalid interger representation: {}", base),
-                            }),
+                            _ => return Err(SyntaxErrKind::BadIntergerRepresentation { repr: base.to_string() }),
                         }
                     };
 
-                    ret.map_err(|_| LexicalError {
-                        reason: format!("invalid interger representation: {}", base),
-                    })
+                    ret.map_err(|_| SyntaxErrKind::BadIntergerRepresentation { repr: base.to_string() })
                 }
             }
         }
     }
 
     /// Lex sequence bounded with '\'' / '\"'.
-    fn lex_literal(&mut self) -> Result<Token, LexicalError> {
+    fn lex_literal(&mut self) -> Result<Token, SyntaxErrKind> {
         // ' or "
         let quote = self.scan.first();
         self.bump();
@@ -458,8 +457,8 @@ impl<'a> Lexer<'a> {
                 }
 
                 '\x00' | '\n' | '\r' => {
-                    return Err(LexicalError {
-                        reason: format!("unfinished literal near: {quote}{lit}"),
+                    return Err(SyntaxErrKind::UnclosedStringLiteral {
+                        literal: format!("{quote}{lit}"),
                     })
                 }
 
@@ -490,8 +489,8 @@ impl<'a> Lexer<'a> {
                         ('x', x, y) if x.is_ascii_hexdigit() && y.is_ascii_hexdigit() => {
                             let escape =
                                 u8::from_str_radix(self.scan.eat_n(2), 16).map_err(|_| {
-                                    LexicalError {
-                                        reason: format!("invalid hex escape seq: \\x{x}{y}"),
+                                    SyntaxErrKind::InvalidHexEscapeSequence {
+                                        seq: format!("\\x{x}{y}"),
                                     }
                                 })?;
                             lit.push(escape as char);
@@ -507,8 +506,10 @@ impl<'a> Lexer<'a> {
                             } else {
                                 let escape_len = subseq.len().min(2);
                                 let s = &subseq[0..escape_len];
-                                let escape = s.parse::<u8>().map_err(|_| LexicalError {
-                                    reason: format!("invalid decimal escape seq: \\{s}"),
+                                let escape = s.parse::<u8>().map_err(|_| {
+                                    SyntaxErrKind::InvalidDecimalEscapeSequence {
+                                        seq: format!("\\{s}"),
+                                    }
                                 })?;
 
                                 lit.push(escape as char);
@@ -552,11 +553,8 @@ impl<'a> Lexer<'a> {
                                 lit.push(c);
                                 self.col_n(unicode.len());
                             } else {
-                                return Err(LexicalError {
-                                    reason: format!(
-                                        r##"invalid escape sequence: \u{{{}}}"##,
-                                        unicode
-                                    ),
+                                return Err(SyntaxErrKind::InvalidUtf8EscapeSequence {
+                                    seq: format!("\\u{{{unicode}}}",),
                                 });
                             }
                         }
@@ -583,7 +581,7 @@ impl<'a> Lexer<'a> {
         match (self.scan.first(), self.scan.second()) {
             // multiline comment
             ('[', '[') | ('[', '=') => {
-                self.lex_multiline();
+                let _ = self.lex_multiline();
             }
             // single line comment
             _ => {
@@ -641,19 +639,8 @@ impl<'a> Lexer<'a> {
         content
     }
 
-    // /// Lex sequence like "\x06".
-    // fn lex_hex_escape(&mut self) -> Result<char, LexicalError> {
-    //     let hex = self.scan.eat_n(2);
-    //     self.col_n(2);
-    //     u8::from_str_radix(hex, 16)
-    //         .map(|u| u as char )
-    //         .map_err(|_| LexicalError {
-    //             reason: format!("invalid hexadecimal espace sequence: \\x{{{}}}", hex),
-    //         })
-    // }
-
     /// Lex operator and delimters
-    fn lex_punctuation(&mut self, start: char) -> Result<Token, LexicalError> {
+    fn lex_punctuation(&mut self, start: char) -> Result<Token, SyntaxErrKind> {
         if start == '.' {
             let next = self.scan.second();
             // .25 | .4
@@ -739,8 +726,8 @@ impl<'a> Lexer<'a> {
         Ok(token)
     }
 
-    /// specify a string is ident or keyword.
-    fn keyword_or_ident(name: &'a str) -> Token {
+    /// Specify a string is ident or keyword.
+    fn keyword_or_ident(name: &str) -> Token {
         use Token::*;
         match name {
             "and" => And,
@@ -767,11 +754,6 @@ impl<'a> Lexer<'a> {
             _ => Ident(name.to_string()),
         }
     }
-}
-
-#[derive(Debug)]
-pub struct LexicalError {
-    pub reason: String,
 }
 
 mod test {

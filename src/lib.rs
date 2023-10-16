@@ -11,11 +11,34 @@ pub mod value;
 use std::fmt::Debug;
 
 use codegen::CodeGenErr;
-use parser::SyntaxError;
+use lexer::Token;
 use state::RegIndex;
 use value::LValue;
 
 use crate::state::Rvm;
+
+#[derive(Debug)]
+pub enum SyntaxErrKind {
+    // Tokenizer Error
+    InvalidCharacter { ch: char },
+    BadFloatRepresentation { repr: String },
+    BadIntergerRepresentation { repr: String },
+    UnclosedStringLiteral { literal: String },
+    InvalidHexEscapeSequence { seq: String },
+    InvalidUtf8EscapeSequence { seq: String },
+    InvalidDecimalEscapeSequence { seq: String },
+
+    // Parser Error
+    UnexpectedToken { expect: Vec<Token>, found: Token },
+    InvalidAttribute { attr: String },
+}
+
+#[derive(Debug)]
+pub struct SyntaxError {
+    pub kind: SyntaxErrKind,
+    pub line: u32,
+    pub column: u32,
+}
 
 #[derive(Debug)]
 pub enum StaticErr {
