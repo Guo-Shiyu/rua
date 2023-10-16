@@ -374,12 +374,16 @@ fn try_fold(exp: &mut Expr) -> AfterFoldStatus {
                             NonConst
                         }
                     } else if let Some(iop) = gen_arithmetic_op_int(*op) {
-                        if i2 == 0 && (*op == BinOp::Div || *op == BinOp::IDiv) {
-                            *exp = Expr::Float(match i1.cmp(&0) {
-                                std::cmp::Ordering::Less => f64::NEG_INFINITY,
-                                std::cmp::Ordering::Equal => f64::NAN,
-                                std::cmp::Ordering::Greater => f64::INFINITY,
-                            });
+                        if i2 == 0 {
+                            if *op == BinOp::Div || *op == BinOp::IDiv {
+                                *exp = Expr::Float(match i1.cmp(&0) {
+                                    std::cmp::Ordering::Less => f64::NEG_INFINITY,
+                                    std::cmp::Ordering::Equal => f64::NAN,
+                                    std::cmp::Ordering::Greater => f64::INFINITY,
+                                });
+                            } else if *op == BinOp::Mod {
+                                // do nothing. perform mod 0 is a runtime error in lua.
+                            }
                         } else {
                             *exp = apply_arithmetic_op_int(i1, i2, iop);
                         }
@@ -423,13 +427,13 @@ fn try_fold(exp: &mut Expr) -> AfterFoldStatus {
                     // update expr node
                     *exp = new_exp;
 
-                    // #[cfg(flag = "trace_optimize")]
-                    // self.record.push(FoldInfo {
-                    //     srcloc: expr.lineinfo(),
-                    //     derive_n: *derive,
-                    //     status: StillConst,
-                    //     new: new_exp,
-                    // });
+                    #[cfg(flag = "trace_optimize")]
+                    self.record.push(FoldInfo {
+                        srcloc: expr.lineinfo(),
+                        derive_n: *derive,
+                        status: StillConst,
+                        new: new_exp,
+                    });
 
                     StillConst
                 } else {
@@ -452,7 +456,6 @@ fn gen_arithmetic_op_int(op: BinOp) -> Option<fn(i64, i64) -> i64> {
         BinOp::Mod => Some(|l, r| l % r),
         BinOp::Pow => Some(|l, r| l ^ r),
         BinOp::IDiv => Some(|l, r| l / r),
-
         BinOp::Div => Some(|l, r| l / r),
         _ => None,
     }
