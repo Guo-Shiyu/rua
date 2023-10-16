@@ -1182,7 +1182,7 @@ impl CodeGen {
         self.locstate.push(Vec::with_capacity(4));
 
         let end = body.def_end();
-        let body = body.into_inner();
+        let body = body.inner();
         for stmt in body.stats.into_iter() {
             self.walk_stmt(*stmt)?;
         }
@@ -1198,7 +1198,7 @@ impl CodeGen {
 
     fn walk_stmt(&mut self, stmt: SrcLoc<Stmt>) -> Result<(), CodeGenErr> {
         let lineinfo = stmt.lineinfo;
-        match stmt.into_inner() {
+        match stmt.inner() {
             Stmt::Assign { vars, exprs } => self.walk_assign_stmt(vars, exprs),
             Stmt::FnCall(call) => {
                 let next = self.alloc_free_reg();
@@ -1450,7 +1450,7 @@ impl CodeGen {
         method: Option<Box<SrcLoc<String>>>,
         body: SrcLoc<FuncBody>,
     ) -> Result<(), CodeGenErr> {
-        let (defln, body) = (body.def_begin(), body.into_inner());
+        let (defln, body) = (body.def_begin(), body.inner());
 
         let mut fnname = pres
             .iter()
@@ -1471,7 +1471,7 @@ impl CodeGen {
         let mut prefix_iter = pres.into_iter();
         let rootreg = if let Some(root) = prefix_iter.next() {
             let rootdef = root.def_begin();
-            let r = self.lookup_name(root.into_inner(), None, rootdef);
+            let r = self.lookup_name(root.inner(), None, rootdef);
             for idx in pre_name_kregs.into_iter().skip(1) {
                 self.emit(Isc::iabc(GETFIELD, r, r, idx), defln);
             }
@@ -1513,7 +1513,7 @@ impl CodeGen {
             for ((name, _attr), exp) in names.into_iter().zip(exprs.iter_mut()) {
                 let ln = name.def_begin();
                 let status = self.walk_common_expr(std::mem::take(exp), Ctx::Allocate)?;
-                self.emit_local_decl(name.into_inner(), status, ln);
+                self.emit_local_decl(name.inner(), status, ln);
             }
             for extra in exprs.into_iter().skip(nvar) {
                 self.walk_common_expr(*extra, Ctx::Ignore)?;
@@ -1530,7 +1530,7 @@ impl CodeGen {
                 let desc = unsafe { &mut names.get_mut(idx).unwrap_unchecked() };
                 let name = std::mem::take(&mut desc.0);
                 let ln = name.def_begin();
-                self.emit_local_decl(name.into_inner(), status, ln);
+                self.emit_local_decl(name.inner(), status, ln);
             }
 
             let remain = names.iter().skip(nexp).count();
@@ -1539,11 +1539,7 @@ impl CodeGen {
             if let ExprStatus::Call(reg) = last_sta {
                 for (idx, (name, _attr)) in names.into_iter().skip(nexp).enumerate() {
                     let ln = name.def_begin();
-                    self.emit_local_decl(
-                        name.into_inner(),
-                        ExprStatus::Reg(reg + idx as RegIndex),
-                        ln,
-                    );
+                    self.emit_local_decl(name.inner(), ExprStatus::Reg(reg + idx as RegIndex), ln);
                 }
             } else {
                 let mut iter = names.into_iter().skip(nexp);
@@ -1551,11 +1547,11 @@ impl CodeGen {
                 // let next = unsafe { iter.next().unwrap_unchecked() };
                 let next = iter.next().unwrap();
                 let ln = next.0.def_begin();
-                self.emit_local_decl(next.0.into_inner(), last_sta, ln);
+                self.emit_local_decl(next.0.inner(), last_sta, ln);
 
                 for (name, _attr) in iter {
                     let ln = name.def_begin();
-                    self.emit_local_decl(name.into_inner(), ExprStatus::LitNil, ln);
+                    self.emit_local_decl(name.inner(), ExprStatus::LitNil, ln);
                 }
             }
         }
@@ -1650,7 +1646,7 @@ impl CodeGen {
                 // }
                 debug_assert_eq!(fnreg, fnreg_real);
 
-                for (n, param) in args.into_inner().namelist.into_iter().enumerate() {
+                for (n, param) in args.inner().namelist.into_iter().enumerate() {
                     let _ = self.walk_common_expr(*param, Ctx::must_use(1 + fnreg + n as i32));
                 }
 
@@ -1729,7 +1725,7 @@ impl CodeGen {
         node: SrcLoc<Expr>,
         ctx: ExprGenCtx,
     ) -> Result<ExprStatus, CodeGenErr> {
-        let (def, node) = (node.lineinfo, node.into_inner());
+        let (def, node) = (node.lineinfo, node.inner());
 
         match ctx {
             // case that the value of expression will be ignored,
