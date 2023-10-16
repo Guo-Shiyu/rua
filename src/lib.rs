@@ -5,6 +5,7 @@ pub mod heap;
 pub mod lexer;
 pub mod lstd;
 pub mod parser;
+pub mod passes;
 pub mod state;
 pub mod value;
 
@@ -46,9 +47,9 @@ pub enum StaticErr {
     CodeGenErr(Box<CodeGenErr>),
 }
 
-impl From<SyntaxError> for StaticErr {
-    fn from(err: SyntaxError) -> Self {
-        StaticErr::SyntaxErr(Box::new(err))
+impl From<Box<SyntaxError>> for StaticErr {
+    fn from(err: Box<SyntaxError>) -> Self {
+        StaticErr::SyntaxErr(err)
     }
 }
 

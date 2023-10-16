@@ -4,7 +4,12 @@ use std::{
 };
 
 #[derive(Default)]
-/// Warpper for an ast-node to attach source location info
+/// Warpper for an ast-node to attach source location info.
+///
+/// `lineinfo` represent that (begin, end) of defination line number.
+///
+/// Because AST node are stored on heap. `mem_address()` method used to get it's
+/// address as hex number. This method used in `AstDumper` only.
 pub struct SrcLoc<T> {
     node: T,
     // lineinfo: (begin, end)
@@ -19,11 +24,11 @@ impl<T> SrcLoc<T> {
         }
     }
 
-    pub fn into_inner(self) -> T {
+    pub fn inner(self) -> T {
         self.node
     }
 
-    pub fn inner(&self) -> &T {
+    pub fn inner_ref(&self) -> &T {
         &self.node
     }
 
@@ -57,7 +62,9 @@ impl<T> DerefMut for SrcLoc<T> {
     }
 }
 
+/// ``` text
 /// block ::= {stat} [retstat]
+/// ```
 pub struct Block {
     pub chunk: String,
     pub stats: Vec<StmtNode>,
@@ -81,6 +88,7 @@ impl Block {
     }
 }
 
+/// ``` text
 /// stat ::=  `;` |
 ///        varlist `=` explist |
 ///        functioncall |
@@ -96,6 +104,7 @@ impl Block {
 ///        function funcname funcbody |
 ///        local function Name funcbody |
 ///        local attnamelist [`=` explist]
+/// ```
 
 pub enum Stmt {
     // assignment,  x = A | x.y.z = A
@@ -146,9 +155,11 @@ pub enum Stmt {
         exprs: Vec<ExprNode>,
     },
 
+    // single expression as a statement
     Expr(ExprNode),
 }
 
+/// ``` text
 /// functioncall ::=  prefixexp args | prefixexp `:` Name args
 ///
 /// funcname ::= Name {`.` Name} [`:` Name]
@@ -156,6 +167,7 @@ pub enum Stmt {
 /// prefixexp ::= var | functioncall | `(` exp `)`
 ///
 /// args ::=  `(` [explist] `)` | tablector | LiteralString
+/// ```
 pub enum FuncCall {
     // i.e: func(1, 2, 3, ...)
     FreeFnCall {
@@ -171,13 +183,18 @@ pub enum FuncCall {
     },
 }
 
+/// ``` text
 /// funcbody ::= `(` [parlist] `)` block end
 /// paralist ::= namelist [`,` `...`] | `...`
+/// ```
 pub struct FuncBody {
     pub params: ParameterList,
     pub body: BasicBlock,
 }
 
+/// ``` text
+/// for Name `=` exp `,` exp [`,` exp] do block end
+/// ```
 pub struct NumericFor {
     pub iter: SrcLoc<String>,
     pub init: ExprNode,
@@ -186,16 +203,22 @@ pub struct NumericFor {
     pub body: BasicBlock,
 }
 
+/// ``` text
+/// for namelist in explist do block end
+/// ```
 pub struct GenericFor {
     pub iters: Vec<SrcLoc<String>>,
     pub exprs: Vec<ExprNode>,
     pub body: BasicBlock,
 }
+
+/// ``` text
 /// exp ::=  nil | false | true | Numeral | LiteralString | `...` |
 ///     functiondef | prefixexp | tablector |
 ///     exp binop exp | unop exp
 ///
 /// prefixexp ::= var | functioncall | `(` exp `)`
+/// ```
 #[derive(Default)]
 pub enum Expr {
     #[default]
@@ -209,7 +232,7 @@ pub enum Expr {
 
     Ident(String),
 
-    // anonymous function defination
+    // anonymous function defination, e.g, : function () ... end
     Lambda(FuncBody),
 
     // table.key | table[key]
@@ -218,10 +241,10 @@ pub enum Expr {
         key: ExprNode,
     },
 
-    // functioncall ::=  prefixexp args | prefixexp `:` Name args
+    // fn(a, b, c) | fn(...) | fn { ... } | fn "..."
     FuncCall(FuncCall),
 
-    // fieldlist ::= field {fieldsep field} [fieldsep]
+    // x = expr | ["xx"] = expr
     TableCtor(Vec<Field>),
 
     BinaryOp {
@@ -236,6 +259,24 @@ pub enum Expr {
     },
 }
 
+/// There are two possible attributes: const, which declares a constant variable, that is, a variable that cannot be assigned to after its initialization;
+/// and close, which declares a to-be-closed variable. A list of variables can contain at most one to-be-closed variable.
+///
+/// A to-be-closed variable behaves like a constant local variable, except that its value is closed whenever the variable goes out of scope, including normal
+/// block termination, exiting its block by `break` / `goto` / `return` , or exiting by an error.
+///
+/// Here, to close a value means to call its __close metamethod. When calling the metamethod, the value itself is passed as the first argument and the error
+/// object that caused the exit (if any) is passed as a second argument; if there was no error, the second argument is nil.
+///
+/// Attribute syntax e.g. :
+/// ``` lua
+/// local x <const> = 1
+///
+/// local y <close> = {}
+///
+/// setmetatable(y, {__close = function(y_self, err)  ... end}
+///
+/// ```
 #[repr(u8)]
 #[derive(Debug, Clone, Copy)]
 pub enum Attribute {
@@ -257,10 +298,15 @@ pub struct FnHeader<H> {
     pub vargs: bool,
 }
 
+/// Parameter list in function defination.
 pub type ParameterList = FnHeader<String>;
+
+/// Argument list in function call.
 pub type ArgumentList = FnHeader<ExprNode>;
 
+/// ``` text
 /// field ::= `[` exp `]` `=` exp | Name `=` exp | exp
+/// ```
 pub struct Field {
     pub key: Option<Box<ExprNode>>,
     pub val: Box<ExprNode>,
@@ -272,9 +318,14 @@ impl Field {
     }
 }
 
+/// Binary operators in Lua 5.4
+/// 
 #[rustfmt::skip]
 #[derive(Clone, Copy, PartialEq)]
 pub enum BinOp {
+    // Notice that do not change the order of operators, there is a 
+    // `binary_operator_priority` table in parser depends on that.
+    
     /* arithmetic operators */
     Add, Minus, Mul, Mod, Pow, Div, IDiv,
 
@@ -291,7 +342,9 @@ pub enum BinOp {
     And, Or,
 }
 
+/// ``` text
 /// unop ::= `-` | not | `#` | `~`
+/// ```
 pub enum UnOp {
     Minus,
     Not,
@@ -302,26 +355,6 @@ pub enum UnOp {
 pub type ExprNode = Box<SrcLoc<Expr>>;
 pub type StmtNode = Box<SrcLoc<Stmt>>;
 pub type BasicBlock = Box<SrcLoc<Block>>;
-
-pub trait PassRunStatus {
-    fn is_ok(&self) -> bool;
-    fn is_err(&self) -> bool;
-}
-
-/// Take run result from a pass impl
-pub trait PassRunRes<Output = (), Error = ()>: PassRunStatus {
-    fn output(&self) -> Option<&Output>;
-    fn take_output(&mut self) -> Output;
-    fn error(&self) -> Option<&Error>;
-}
-
-pub trait AnalysisPass {
-    fn walk(&mut self, root: &Block) -> &Self;
-}
-
-pub trait TransformPass {
-    fn walk(&mut self, root: &mut Block) -> &Self;
-}
 
 pub enum DumpPrecison {
     Statement,
@@ -344,61 +377,8 @@ enum AstDumpErr {
     PassHasNotRun,
 }
 
-impl PassRunStatus for AstDumper {
-    fn is_ok(&self) -> bool {
-        self.errinfo.is_none() && !self.dump_buf.is_empty()
-    }
-
-    fn is_err(&self) -> bool {
-        !self.is_ok()
-    }
-}
-
-impl PassRunRes<Vec<u8>, AstDumpErr> for AstDumper {
-    fn output(&self) -> Option<&Vec<u8>> {
-        if self.is_ok() {
-            Some(&self.dump_buf)
-        } else {
-            None
-        }
-    }
-
-    fn take_output(&mut self) -> Vec<u8> {
-        std::mem::take(&mut self.dump_buf)
-    }
-
-    fn error(&self) -> Option<&AstDumpErr> {
-        if self.errinfo.is_some() {
-            self.errinfo.as_ref()
-        } else if self.dump_buf.is_empty() {
-            Some(&AstDumpErr::PassHasNotRun)
-        } else {
-            None
-        }
-    }
-}
-
-impl AnalysisPass for AstDumper {
-    fn walk(&mut self, block: &Block) -> &Self {
-        const BUF_SIZE: usize = 8192; // equal with std::io::DEFAULT_BUF_SIZE
-        if self.dump_buf.len() < BUF_SIZE {
-            self.dump_buf.reserve(BUF_SIZE);
-        }
-
-        let inner_buf = std::mem::take(&mut self.dump_buf);
-        let mut bw = BufWriter::new(inner_buf);
-
-        let _ = self
-            .dump_block(block, &mut bw)
-            .map(|_| std::mem::swap(&mut bw.into_inner().unwrap(), &mut self.dump_buf))
-            .map_err(|e| self.errinfo = Some(AstDumpErr::IOErr(e)));
-
-        self
-    }
-}
-
 impl AstDumper {
-    pub fn new(level: DumpPrecison, colored: bool, buf: Option<Vec<u8>>) -> Self {
+    fn new(level: DumpPrecison, colored: bool, buf: Option<Vec<u8>>) -> Self {
         AstDumper {
             depth: 0,
             colored,
@@ -416,6 +396,21 @@ impl AstDumper {
     ) -> Result<(), Error> {
         let mut dumper = AstDumper::new(precision, colored, None);
         dumper.dump_block(block, buf)
+    }
+
+    fn walk(&mut self, block: &Block) {
+        const BUF_SIZE: usize = 8192; // equal with std::io::DEFAULT_BUF_SIZE
+        if self.dump_buf.len() < BUF_SIZE {
+            self.dump_buf.reserve(BUF_SIZE);
+        }
+
+        let inner_buf = std::mem::take(&mut self.dump_buf);
+        let mut bw = BufWriter::new(inner_buf);
+
+        let _ = self
+            .dump_block(block, &mut bw)
+            .map(|_| std::mem::swap(&mut bw.into_inner().unwrap(), &mut self.dump_buf))
+            .map_err(|e| self.errinfo = Some(AstDumpErr::IOErr(e)));
     }
 }
 
@@ -457,20 +452,20 @@ impl AstDumper {
 
     fn dump_stmt(&mut self, stmt: &StmtNode, buf: &mut BufWriter<impl Write>) -> Result<(), Error> {
         let this = stmt.mem_address();
-        match stmt.inner() {
+        match stmt.inner_ref() {
             Stmt::Assign { vars, exprs } => self.write_lable(buf, COLLAPSE).and_then(|_| {
                 self.write_name(buf, "Assignment", this)?;
                 if vars.len() == 1 {
                     write!(
                         buf,
                         "decl: {}, expr-count: [{}]",
-                        Self::inspect(vars[0].inner()),
+                        Self::inspect(vars[0].inner_ref()),
                         exprs.len(),
                     )?;
                 } else {
                     let names = vars
                         .iter()
-                        .map(|e| Self::inspect(e.inner()))
+                        .map(|e| Self::inspect(e.inner_ref()))
                         .collect::<Vec<_>>();
 
                     write!(buf, "decls: {:?}, expr-count: [{}]", names, exprs.len(),)?;
@@ -533,7 +528,7 @@ impl AstDumper {
                         write!(
                             buf,
                             "prefix: {}, vararg: {}, positional-args-num: {}",
-                            Self::inspect(prefix.inner()),
+                            Self::inspect(prefix.inner_ref()),
                             args.vargs,
                             args.namelist.len(),
                         )?;
@@ -550,7 +545,7 @@ impl AstDumper {
                     write!(
                         buf,
                         "prefix: {}, method: {}, vararg:{}, positional-args-num: {:x}",
-                        Self::inspect(prefix.inner()),
+                        Self::inspect(prefix.inner_ref()),
                         method.as_str(),
                         args.vargs,
                         args.namelist.len(),
@@ -614,7 +609,7 @@ impl AstDumper {
                     write!(
                         buf,
                         "exp: {}, then: 0x{:x}, else: 0x{:x}",
-                        Self::inspect(exp.inner()),
+                        Self::inspect(exp.inner_ref()),
                         Self::mem_address(then),
                         Self::mem_address(els),
                     )
@@ -766,7 +761,7 @@ impl AstDumper {
             Expr::Lambda(_) => "<FuncDef>".to_string(),
             Expr::Index { prefix, key } => {
                 let mut buf = String::with_capacity(32);
-                buf.push_str(&Self::inspect(prefix.inner()));
+                buf.push_str(&Self::inspect(prefix.inner_ref()));
                 buf.push_str(&Self::inspect(key));
                 buf
             }
@@ -779,348 +774,6 @@ impl AstDumper {
             } => "<BinaryOp>".to_string(),
             Expr::UnaryOp { op: _, expr: _ } => "<UnaryOp>".to_string(),
         }
-    }
-}
-
-enum AfterFoldStatus {
-    StillConst,
-    NonConst,
-}
-
-#[cfg(flag = "trace_optimize")]
-enum FoldOperation {
-    BinaryOp { op: BinOp },
-    UnaryOp { op: UnOp },
-}
-
-pub struct FoldInfo {
-    #[cfg(flag = "trace_optimize")]
-    srcloc: (u32, u32), // source location
-
-    #[cfg(flag = "trace_optimize")]
-    derive_n: usize, //
-
-    #[cfg(flag = "trace_optimize")]
-    status: AfterFoldStatus, //
-
-    #[cfg(flag = "trace_optimize")]
-    // op: FoldOperation,       //
-    new: Expr, // updated node (must be a constant)
-}
-
-pub struct ConstantFoldPass {
-    #[cfg(flag = "trace_optimize")]
-    record: Vec<FoldInfo>,
-}
-
-impl PassRunStatus for ConstantFoldPass {
-    fn is_ok(&self) -> bool {
-        true
-    }
-
-    fn is_err(&self) -> bool {
-        false
-    }
-}
-
-impl PassRunRes<Vec<FoldInfo>, PassHasNotRun> for ConstantFoldPass {
-    #[cfg(flag = "trace_optimize")]
-    fn output(&self) -> Option<&Vec<FoldInfo>> {
-        self.record.as_ref()
-    }
-
-    fn output(&self) -> Option<&Vec<FoldInfo>> {
-        None
-    }
-
-    #[cfg(flag = "trace_optimize")]
-    fn take_output(&mut self) -> Vec<FoldInfo> {
-        std::mem::take(&mut self.record)
-    }
-
-    fn take_output(&mut self) -> Vec<FoldInfo> {
-        Vec::new()
-    }
-
-    fn error(&self) -> Option<&PassHasNotRun> {
-        None
-    }
-}
-
-impl TransformPass for ConstantFoldPass {
-    fn walk(&mut self, root: &mut Block) -> &Self {
-        Self::run_on_bolck(root);
-        self
-    }
-}
-
-impl Default for ConstantFoldPass {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl ConstantFoldPass {
-    pub fn new() -> Self {
-        ConstantFoldPass {
-            #[cfg(flag = "trace_optimize")]
-            record: Vec::new(),
-        }
-    }
-
-    fn run_on_bolck(root: &mut Block) {
-        for stmt in root.stats.iter_mut() {
-            match stmt.inner_mut() {
-                Stmt::Assign { vars: _, exprs } => {
-                    exprs.iter_mut().for_each(|e| {
-                        Self::try_fold(e);
-                    });
-                }
-                Stmt::FnCall(call) => match call {
-                    FuncCall::FreeFnCall { prefix: _, args } => {
-                        args.namelist.iter_mut().for_each(|e| {
-                            Self::try_fold(e);
-                        });
-                    }
-                    FuncCall::MethodCall {
-                        prefix: _,
-                        method: _,
-                        args,
-                    } => {
-                        args.namelist.iter_mut().for_each(|e| {
-                            Self::try_fold(e);
-                        });
-                    }
-                },
-                Stmt::DoEnd(block) => Self::run_on_bolck(block),
-                Stmt::While { exp, block } => {
-                    Self::try_fold(exp);
-                    Self::run_on_bolck(block);
-                }
-                Stmt::Repeat { block, exp } => {
-                    Self::try_fold(exp);
-                    Self::run_on_bolck(block)
-                }
-                Stmt::IfElse {
-                    cond: exp,
-                    then,
-                    els,
-                } => {
-                    let status = Self::try_fold(exp);
-                    if let AfterFoldStatus::StillConst = status {
-                        match exp.inner_mut() {
-                            // if (false), remove then block
-                            Expr::Nil | Expr::False => {
-                                let _ = std::mem::take(&mut then.chunk);
-                                let _ = std::mem::take(&mut then.stats);
-                                let _ = then.ret.take();
-                            }
-
-                            // if-true, remove else block
-                            Expr::True | Expr::Int(_) | Expr::Float(_) | Expr::Literal(_) => {
-                                *els = None;
-                            }
-
-                            _ => {}
-                        };
-                    };
-                    Self::run_on_bolck(then);
-                    if let Some(bk) = els.as_mut() {
-                        Self::run_on_bolck(bk)
-                    }
-                }
-                Stmt::NumericFor(num) => {
-                    Self::try_fold(&mut num.init);
-                    Self::try_fold(&mut num.limit);
-                    Self::try_fold(&mut num.step);
-                    Self::run_on_bolck(&mut num.body)
-                }
-                Stmt::GenericFor(gen) => {
-                    for exp in gen.exprs.iter_mut() {
-                        Self::try_fold(exp);
-                    }
-                    Self::run_on_bolck(&mut gen.body)
-                }
-                Stmt::FnDef {
-                    pres: _,
-                    method: _,
-                    body: func,
-                } => {
-                    Self::run_on_bolck(&mut func.body);
-                }
-                Stmt::LocalVarDecl { names: _, exprs } => {
-                    exprs.iter_mut().for_each(|e| {
-                        Self::try_fold(e);
-                    });
-                }
-                Stmt::Expr(e) => {
-                    Self::try_fold(e);
-                }
-                _ => {}
-            }
-        }
-    }
-
-    fn try_fold(exp: &mut Expr) -> AfterFoldStatus {
-        use AfterFoldStatus::*;
-        match exp {
-            Expr::Nil
-            | Expr::False
-            | Expr::True
-            | Expr::Int(_)
-            | Expr::Float(_)
-            | Expr::Literal(_) => StillConst,
-
-            Expr::BinaryOp { lhs, op, rhs } => {
-                let ls = Self::try_fold(lhs);
-                let rs = Self::try_fold(rhs);
-                match (ls, rs) {
-                    (StillConst, StillConst) => {
-                        let (mut i1, mut i2) = (0, 0);
-                        // intergral promotion
-                        if let Some(promoted) = match (lhs.inner(), rhs.inner()) {
-                            (Expr::Int(l), Expr::Int(r)) => {
-                                i1 = *l;
-                                i2 = *r;
-                                None
-                            }
-                            (Expr::Int(to), Expr::Float(f)) => Some((*to as f64, *f)),
-                            (Expr::Float(f), Expr::Int(to)) => Some((*f, *to as f64)),
-                            (Expr::Float(f1), Expr::Float(f2)) => Some((*f1, *f2)),
-                            _ => None,
-                        } {
-                            if let Some(fop) = Self::gen_arithmetic_op_float(*op) {
-                                *exp = Self::apply_arithmetic_op_float(promoted.0, promoted.1, fop);
-
-                                // TODO:
-                                // record fold op
-                                // #[cfg(flag = "trace_optimize")]
-                                // self.record.push(FoldInfo {
-                                //     srcloc: expr.lineinfo(),
-                                //     derive_n: *derive,
-                                //     status: StillConst,
-                                //     new: new_exp,
-                                // });
-
-                                StillConst
-                            } else {
-                                NonConst
-                            }
-                        } else if let Some(iop) = Self::gen_arithmetic_op_int(*op) {
-                            if i2 == 0 && (*op == BinOp::Div || *op == BinOp::IDiv) {
-                                *exp = Expr::Float(match i1.cmp(&0) {
-                                    std::cmp::Ordering::Less => f64::NEG_INFINITY,
-                                    std::cmp::Ordering::Equal => f64::NAN,
-                                    std::cmp::Ordering::Greater => f64::INFINITY,
-                                });
-                            } else {
-                                *exp = Self::apply_arithmetic_op_int(i1, i2, iop);
-
-                                // TODO:
-                                // record fold op
-                                // #[cfg(flag = "trace_optimize")]
-                                // self.record.push(FoldInfo {
-                                //     srcloc: expr.lineinfo(),
-                                //     derive_n: *derive,
-                                //     status: StillConst,
-                                //     new: new_exp,
-                                // });
-                            }
-                            StillConst
-                        } else {
-                            match (op, lhs.inner(), rhs.inner()) {
-                                (BinOp::Concat, Expr::Literal(l1), Expr::Literal(l2)) => {
-                                    *exp = Expr::Int((l1.len() + l2.len()) as i64);
-                                    StillConst
-                                }
-                                _ => NonConst,
-                            }
-                        }
-                    }
-                    _ => NonConst,
-                }
-            }
-
-            Expr::UnaryOp { op, expr } => {
-                if let StillConst = Self::try_fold(expr) {
-                    // execute fold operation
-                    if let Some(new_exp) = match (op, expr.inner()) {
-                        // not nil => true
-                        (UnOp::Not, Expr::Nil) => Some(Expr::True),
-
-                        // not literial => false
-                        (UnOp::Not, _) => Some(Expr::False),
-
-                        // # str => len(str)
-                        (UnOp::Length, Expr::Literal(lit)) => Some(Expr::Int(lit.len() as i64)),
-
-                        // - number => 0 - number
-                        (UnOp::Minus, Expr::Int(i)) => Some(Expr::Int(0 - i)),
-                        (UnOp::Minus, Expr::Float(f)) => Some(Expr::Float(0.0 - f)),
-
-                        // ~int
-                        (UnOp::BitNot, Expr::Int(i)) => Some(Expr::Int(!i)),
-
-                        _ => None,
-                    } {
-                        // update expr node
-                        *exp = new_exp;
-
-                        #[cfg(flag = "trace_optimize")]
-                        self.record.push(FoldInfo {
-                            srcloc: expr.lineinfo(),
-                            derive_n: *derive,
-                            status: StillConst,
-                            new: new_exp,
-                        });
-
-                        StillConst
-                    } else {
-                        NonConst
-                    }
-                } else {
-                    NonConst
-                }
-            }
-
-            _ => NonConst,
-        }
-    }
-
-    fn gen_arithmetic_op_int(op: BinOp) -> Option<fn(i64, i64) -> i64> {
-        match op {
-            BinOp::Add => Some(|l, r| l + r),
-            BinOp::Minus => Some(|l: i64, r: i64| l - r),
-            BinOp::Mul => Some(|l, r| l * r),
-            // BinOp::Mod => Some(|l, r| l % r),
-            BinOp::Pow => Some(|l, r| l ^ r),
-            BinOp::IDiv => Some(|l, r| l / r),
-
-            // 1 / 1 => 1.0
-            // BinOp::Div => Some(|l, r| l / r),
-            _ => None,
-        }
-    }
-
-    fn gen_arithmetic_op_float(op: BinOp) -> Option<fn(f64, f64) -> f64> {
-        match op {
-            BinOp::Add => Some(|l, r| l + r),
-            BinOp::Minus => Some(|l, r| l - r),
-            BinOp::Mul => Some(|l, r| l * r),
-            BinOp::Mod => Some(|l, r| l % r),
-            BinOp::Pow => Some(|l, r| l.powf(r)),
-            BinOp::IDiv => Some(|l, r| l / r),
-            BinOp::Div => Some(|l, r| l / r),
-            _ => None,
-        }
-    }
-
-    fn apply_arithmetic_op_int(lhs: i64, rhs: i64, arth: impl Fn(i64, i64) -> i64) -> Expr {
-        Expr::Int(arth(lhs, rhs))
-    }
-
-    fn apply_arithmetic_op_float(lhs: f64, rhs: f64, arth: impl Fn(f64, f64) -> f64) -> Expr {
-        Expr::Float(arth(lhs, rhs))
     }
 }
 
@@ -1158,51 +811,5 @@ mod test {
         let result = AstDumper::dump(&block, DumpPrecison::Statement, &mut buf, false);
 
         assert!(result.is_ok())
-    }
-
-    #[test]
-    fn constant_fold_exec_test() {
-        use super::{ConstantFoldPass, PassRunStatus, TransformPass};
-        use crate::parser::Parser;
-
-        let emsg = format!(
-            "unable to find directory: \"test\" with base dir:{}",
-            std::env::current_dir().unwrap().display()
-        );
-
-        let dir = std::fs::read_dir("./test/").expect(&emsg);
-
-        let mut src_paths = dir
-            .map(|e| e.map(|e| e.path()))
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-
-        src_paths.sort();
-
-        src_paths
-            .into_iter()
-            .filter(|p| {
-                // filter filename ends with '.lua'
-                matches! { p.extension().map(|ex| ex.to_str().unwrap_or_default()), Some("lua")}
-            })
-            .map(|p| {
-                // take file name
-                let file_name = p
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .map(|s| s.to_string())
-                    .unwrap_or_default();
-                // read content to string
-                let content = std::fs::read_to_string(p).unwrap_or_default();
-                (file_name, content)
-            })
-            .flat_map(|(file, content)| {
-                // execute parse
-                Parser::parse(&content, Some(file))
-            })
-            .for_each(|mut block| {
-                let mut cfp = ConstantFoldPass::new();
-                assert!(cfp.walk(&mut block).is_ok())
-            });
     }
 }

@@ -175,7 +175,7 @@ impl<'a> Scanner<'a> {
 /// Get next token or an lexical error via `next` method.
 /// Get source loaction info via `column`, `line` method.
 ///
-/// The lua language refrence: https://www.lua.org/manual/5.4/manual.html#3
+/// The lua language refrence: <https://www.lua.org/manual/5.4/manual.html#3>
 pub struct Lexer<'a> {
     scan: Scanner<'a>,
     line: u32,

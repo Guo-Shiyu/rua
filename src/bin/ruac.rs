@@ -1,8 +1,8 @@
 use rua::{
-    ast::{AstDumper, ConstantFoldPass, DumpPrecison, TransformPass},
+    ast::{AstDumper, DumpPrecison},
     codegen::{ChunkDumper, CodeGen},
     parser::Parser,
-    RuaErr, StaticErr,
+    passes, RuaErr, StaticErr,
 };
 
 struct CliArg {
@@ -80,8 +80,7 @@ fn main() -> Result<(), RuaErr> {
 
     let src = std::fs::read_to_string(&args.input).map_err(RuaErr::IOErr)?;
 
-    let mut ast =
-        Parser::parse(&src, Some(args.input)).map_err(|se| StaticErr::SyntaxErr(Box::new(se)))?;
+    let mut ast = Parser::parse(&src, Some(args.input)).map_err(StaticErr::SyntaxErr)?;
 
     if args.parse_only {
         return Ok(());
@@ -97,8 +96,7 @@ fn main() -> Result<(), RuaErr> {
         // TODO:
         // Use OptimizeScheduler insted of ConstantFoldPass
 
-        let mut cfp = ConstantFoldPass::new();
-        cfp.walk(&mut ast);
+        passes::constant_fold(&mut ast);
     }
 
     let chunk = CodeGen::generate(*ast, args.strip_debug)

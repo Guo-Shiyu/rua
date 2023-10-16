@@ -12,6 +12,7 @@ use crate::{
     ffi::StdLib,
     heap::{Heap, ManagedHeap, Tag},
     parser::Parser,
+    passes,
     value::{AsTableKey, LValue, RsFunc, TableImpl},
     InvalidRegisterAccess, RuntimeErr, StackOverflow, StaticErr,
 };
@@ -448,8 +449,8 @@ impl State {
 
     /// Loads a Lua chunk without running it. If there are no errors, `load` pushes the compiled chunk as a Lua function on top of the stack.
     pub fn load_str(&mut self, src: &str, chunkname: Option<String>) -> Result<(), RuaErr> {
-        let proto = Self::compile(src, chunkname)?;
-        // dbg!(&proto);
+        let proto = Self::compile(src, chunkname, true)?;
+        dbg!(&proto);
         let luaf = self.heap_view().alloc(proto);
         self.vm_view().stk_push(luaf)?;
         Ok(())
@@ -557,13 +558,18 @@ impl State {
         Ok(())
     }
 
-    pub fn compile(src: &str, chunkname: Option<String>) -> Result<Proto, StaticErr> {
-        let block = Parser::parse(src, chunkname)?;
+    pub fn compile(
+        src: &str,
+        chunkname: Option<String>,
+        optimize: bool,
+    ) -> Result<Proto, StaticErr> {
+        let mut block = Parser::parse(src, chunkname)?;
 
         // TODO:
         // optimizer scheduler
-        // let mut cfp = ConstantFoldPass::new();
-        // assert!(cfp.walk(&mut block).is_ok());
+        if optimize {
+            passes::constant_fold(&mut block);
+        }
 
         let proto = CodeGen::generate(*block, false)?;
         Ok(proto)
