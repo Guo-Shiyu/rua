@@ -2,7 +2,7 @@ use rua::{
     ast::{AstDumper, DumpPrecison},
     codegen::{ChunkDumper, CodeGen},
     parser::Parser,
-    passes, RuaErr, StaticErr,
+    passes, RuaErr,
 };
 
 struct CliArg {
@@ -80,7 +80,7 @@ fn main() -> Result<(), RuaErr> {
 
     let src = std::fs::read_to_string(&args.input).map_err(RuaErr::IOErr)?;
 
-    let mut ast = Parser::parse(&src, Some(args.input)).map_err(StaticErr::SyntaxErr)?;
+    let mut ast = Parser::parse(&src, Some(args.input))?;
 
     if args.parse_only {
         return Ok(());
@@ -99,8 +99,7 @@ fn main() -> Result<(), RuaErr> {
         passes::constant_fold(&mut ast);
     }
 
-    let chunk = CodeGen::generate(*ast, args.strip_debug)
-        .map_err(|ce| StaticErr::CodeGenErr(Box::new(ce)))?;
+    let chunk = CodeGen::generate(*ast, args.strip_debug)?;
 
     if args.list > 0 {
         if args.list == 1 {

@@ -1,3 +1,4 @@
+use core::fmt;
 use std::{
     cell::Cell,
     collections::{hash_map::DefaultHasher, HashMap},
@@ -11,9 +12,10 @@ use crate::{
     heap::{
         Gc, GcColor, Heap, HeapMemUsed, MarkAndSweepGcOps, Tag, TaggedBox, TypeTag, WithGcHeader,
     },
+    RuaErr,
 };
 
-use super::{state::State, RuntimeErr};
+use super::state::State;
 
 pub type StrHashVal = u32;
 
@@ -280,7 +282,7 @@ impl UserDataImpl {
 }
 
 // usize: stack size after call
-pub type RsFunc = fn(&mut State) -> Result<usize, Box<dyn RuntimeErr>>;
+pub type RsFunc = fn(&mut State) -> Result<usize, RuaErr>;
 
 #[derive(Clone, Copy, Default)]
 pub enum LValue {
@@ -506,6 +508,12 @@ impl TryInto<TaggedBox> for LValue {
             LValue::UserData(u) => Ok(TaggedBox::new(UserDataImpl::tagid(), u.heap_address())),
             _ => Err(()),
         }
+    }
+}
+
+impl Debug for LValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self)
     }
 }
 

@@ -8,7 +8,7 @@ use std::{
 
 use crate::{
     codegen::Proto,
-    state::Rvm,
+    state::{mark_rootset, Rvm},
     value::{LValue, StrHashVal, StrImpl, TableImpl, UserDataImpl},
 };
 
@@ -465,9 +465,7 @@ impl ManagedHeap {
             gch.color.set(GcColor::Gray);
         }
 
-        // mark all reachable object to black
-        set.stack.iter().for_each(|val| val.mark_reachable());
-        set.globaltab.mark_reachable();
+        mark_rootset(set);
 
         // sweep and collect remained object
         let (remain, release) = std::mem::take(&mut self.allocs).into_iter().fold(

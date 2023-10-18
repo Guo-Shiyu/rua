@@ -549,10 +549,10 @@ impl MarkAndSweepGcOps for Proto {
 
 impl Display for Proto {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.display_fmt(f)?;
+        display_fmt(self, f)?;
         for each in self.subfn.iter() {
             writeln!(f)?;
-            each.display_fmt(f)?;
+            display_fmt(self, f)?;
         }
         Ok(())
     }
@@ -560,13 +560,73 @@ impl Display for Proto {
 
 impl Debug for Proto {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.debug_fmt(f)?;
+        debug_fmt(self, f)?;
         for each in self.subfn.iter() {
             writeln!(f)?;
-            each.debug_fmt(f)?;
+            debug_fmt(self, f)?;
         }
         Ok(())
     }
+}
+
+fn basic_fmt(p: &Proto, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+    debug_assert!(p.source.is_str());
+    writeln!(
+        f,
+        "function <{}:{},{}> ({} instructions at 0x{:X})",
+        p.source,
+        p.begline,
+        p.endline,
+        p.code.len(),
+        p as *const Proto as usize
+    )?;
+    if p.vararg {
+        f.write_str("vararg params, ")?;
+    } else {
+        write!(f, "{} params, ", p.nparam)?;
+    }
+    writeln!(
+        f,
+        "{} slots, {} upvalue, {} locals, {}, constants, {} functions",
+        p.nreg,
+        p.updecl.len(),
+        p.locvars.len(),
+        p.kst.len(),
+        p.subfn.len()
+    )?;
+
+    for (idx, code) in p.code.iter().enumerate() {
+        let line = p.pcline.get(idx).unwrap_or(&0);
+        writeln!(f, "\t{idx}\t[{}]\t{:?>8} ;", line, code)?;
+    }
+
+    Ok(())
+}
+
+fn debug_fmt(p: &Proto, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+    basic_fmt(p, f)?;
+
+    let self_addr = p as *const Proto as usize;
+    writeln!(f, "{} constants for 0x{:X}", p.kst.len(), self_addr)?;
+    for (idx, k) in p.kst.iter().enumerate() {
+        writeln!(f, "\t{idx}\t{k}")?;
+    }
+
+    writeln!(f, "{} locals for 0x{:X}", p.locvars.len(), self_addr)?;
+    for (idx, loc) in p.locvars.iter().enumerate() {
+        writeln!(f, "\t{idx}\t\"{}\"", loc.name.as_str())?;
+    }
+
+    writeln!(f, "{} upvalues for 0x{:X}", p.updecl.len(), self_addr)?;
+    for (idx, up) in p.updecl.iter().enumerate() {
+        writeln!(f, "\t{idx}\t\"{}\"", up.name())?;
+    }
+
+    Ok(())
+}
+
+fn display_fmt(p: &Proto, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+    basic_fmt(p, f)
 }
 
 impl Proto {
@@ -578,81 +638,32 @@ impl Proto {
         self.nreg as usize
     }
 
+    pub fn is_vararg(&self) -> bool {
+        self.vararg
+    }
+
+    pub fn def_info(&self) -> (u32, u32) {
+        (self.begline, self.endline)
+    }
+
     pub fn bytecode(&self) -> &[Instruction] {
         &self.code
     }
 
-    pub fn constants(&self) -> &[LValue] {
+    pub fn constant(&self) -> &[LValue] {
         &self.kst
     }
 
-    pub fn subprotos(&self) -> &[Gc<Proto>] {
+    pub fn subproto(&self) -> &[Gc<Proto>] {
         &self.subfn
     }
 
-    pub fn upvalues(&self) -> &[LValue] {
-        // self.upvals.as_ref().map_or(&[], |v| v.as_slice())
-        &[]
+    pub fn updecl(&self) -> &[UpvalDecl] {
+        &self.updecl
     }
 
-    fn basic_fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
-        debug_assert!(self.source.is_str());
-        writeln!(
-            f,
-            "function <{}:{},{}> ({} instructions at 0x{:X})",
-            self.source,
-            self.begline,
-            self.endline,
-            self.code.len(),
-            self as *const Proto as usize
-        )?;
-        if self.vararg {
-            f.write_str("vararg params, ")?;
-        } else {
-            write!(f, "{} params, ", self.nparam)?;
-        }
-        writeln!(
-            f,
-            "{} slots, {} upvalue, {} locals, {}, constants, {} functions",
-            self.nreg,
-            self.updecl.len(),
-            self.locvars.len(),
-            self.kst.len(),
-            self.subfn.len()
-        )?;
-
-        for (idx, code) in self.code.iter().enumerate() {
-            let line = self.pcline.get(idx).unwrap_or(&0);
-            writeln!(f, "\t{idx}\t[{}]\t{:?>8} ;", line, code)?;
-        }
-
-        Ok(())
-    }
-
-    fn debug_fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
-        self.basic_fmt(f)?;
-
-        let self_addr = self as *const Proto as usize;
-        writeln!(f, "{} constants for 0x{:X}", self.kst.len(), self_addr)?;
-        for (idx, k) in self.kst.iter().enumerate() {
-            writeln!(f, "\t{idx}\t{k}")?;
-        }
-
-        writeln!(f, "{} locals for 0x{:X}", self.locvars.len(), self_addr)?;
-        for (idx, loc) in self.locvars.iter().enumerate() {
-            writeln!(f, "\t{idx}\t\"{}\"", loc.name.as_str())?;
-        }
-
-        writeln!(f, "{} upvalues for 0x{:X}", self.updecl.len(), self_addr)?;
-        for (idx, up) in self.updecl.iter().enumerate() {
-            writeln!(f, "\t{idx}\t\"{}\"", up.name())?;
-        }
-
-        Ok(())
-    }
-
-    fn display_fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
-        self.basic_fmt(f)
+    pub fn is_pure(&self) -> bool {
+        !self.vararg && self.updecl.len() == 0
     }
 }
 

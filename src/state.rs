@@ -10,11 +10,10 @@ use std::{
 use crate::{
     codegen::{CodeGen, Instruction, OpCode, Proto},
     ffi::StdLib,
-    heap::{Heap, ManagedHeap, Tag},
+    heap::{Heap, ManagedHeap, MarkAndSweepGcOps, Tag},
     parser::Parser,
     passes,
     value::{AsTableKey, LValue, RsFunc, TableImpl},
-    InvalidRegisterAccess, RuntimeErr, StackOverflow, StaticErr,
 };
 
 use super::RuaErr;
@@ -59,7 +58,7 @@ impl Frame {
         unsafe { self.upvalues.0.offset(idx as isize).read() }
     }
 
-    pub fn rget(&self, idx: RegIndex) -> Result<LValue, Box<dyn RuntimeErr>> {
+    pub fn rget(&self, idx: RegIndex) -> Result<LValue, RuaErr> {
         match idx.cmp(&0) {
             Ordering::Less => {
                 let absidx = self.reg_top + idx;
@@ -67,10 +66,10 @@ impl Frame {
                     let val = unsafe { self.stk_base.offset(absidx as isize).read() };
                     Ok(val)
                 } else {
-                    Err(Box::new(InvalidRegisterAccess {
-                        target: idx,
+                    Err(RuaErr::InvalidRegisterAccess {
+                        target: absidx,
                         max: self.reg_top,
-                    }))
+                    })
                 }
             }
             Ordering::Greater | Ordering::Equal => {
@@ -79,10 +78,10 @@ impl Frame {
                     let val = unsafe { self.stk_base.offset(absidx as isize).read() };
                     Ok(val)
                 } else {
-                    Err(Box::new(InvalidRegisterAccess {
-                        target: idx,
+                    Err(RuaErr::InvalidRegisterAccess {
+                        target: absidx,
                         max: self.reg_top,
-                    }))
+                    })
                 }
             }
         }
@@ -106,16 +105,16 @@ pub enum HookMask {
 }
 
 pub struct Rvm {
-    pub(crate) stack: Vec<LValue>,                // vm registers stack
-    callchain: LinkedList<Frame>,                 // call frames
-    ci: Frame,                                    // current frame
-    pub(crate) globaltab: TableImpl,              // global table
-    pub(crate) metatab: BTreeMap<Tag, TableImpl>, // meta table for basic types
-    warnfn: RsFunc,                               // warn handler
-    panicfn: RsFunc,                              // panic handler
-    allowhook: bool,                              // enable hook
-    hook: HookFn,                                 // hook handler
-    hkmask: HookMask,                             // hook mask
+    stack: Vec<LValue>,                // vm registers stack
+    callchain: LinkedList<Frame>,      // call frames
+    ci: Frame,                         // current frame
+    globaltab: TableImpl,              // global table
+    metatab: BTreeMap<Tag, TableImpl>, // meta table for basic types
+    warnfn: RsFunc,                    // warn handler
+    panicfn: RsFunc,                   // panic handler
+    allowhook: bool,                   // enable hook
+    hook: HookFn,                      // hook handler
+    hkmask: HookMask,                  // hook mask
 }
 
 impl Deref for Rvm {
@@ -134,7 +133,7 @@ impl DerefMut for Rvm {
 
 impl Rvm {
     pub const MAX_CALL_DEPTH: usize = 200; // recursion limit
-    pub const MIN_STACK_SPACE: usize = 32; //min stack size
+    pub const MIN_STACK_SPACE: usize = 32; // min stack size
     pub const MAX_STACK_SPACE: usize = 256; // max stack limit
     pub const EXTRA_STACK_SPACE: usize = 8; // extra slot for error handling
 
@@ -143,10 +142,10 @@ impl Rvm {
     }
 
     pub fn new() -> Self {
-        let mut stack = Self::init_stack();
+        let mut stack = Vec::with_capacity(Self::MIN_STACK_SPACE + Self::EXTRA_STACK_SPACE);
 
         // First frame of a vm (rust call lua frame)
-        let rsclua = Frame {
+        let init_frame = Frame {
             oldpc: u32::MAX,
             pc: 0,
             stk_base: stack.as_mut_ptr(),
@@ -165,7 +164,7 @@ impl Rvm {
         Rvm {
             stack,
             callchain: LinkedList::new(),
-            ci: rsclua,
+            ci: init_frame,
             globaltab: TableImpl::with_capacity((24, 0)),
             metatab: init_metatable(),
             warnfn: default_warnfn,
@@ -190,9 +189,8 @@ impl Rvm {
         self.globaltab.get(k)
     }
 
-    pub fn stk_push(&mut self, val: LValue) -> Result<(), Box<dyn RuntimeErr>> {
-        self.try_extend_stack()
-            .map_err(|e| e as Box<dyn RuntimeErr>)?;
+    pub fn stk_push(&mut self, val: LValue) -> Result<(), RuaErr> {
+        self.try_extend_stack().map_err(|e| e as RuaErr)?;
         self.stack.push(val);
         self.reg_top += 1;
         Ok(())
@@ -212,10 +210,7 @@ impl Rvm {
     // pub fn stk_get(&self, idx: RegIndex) -> Result<LValue, RuntimeErr> {
     // match idx.cmp(&0) {
     //     std::cmp::Ordering::Greater => {
-    //         let idx = idx as usize;
-    //         if idx < self.reg_top as usize {
-    //             Ok(unsafe { self.stack.get_unchecked(idx).clone() })
-    //         } else {
+    //   RuaErr::InvalidRegisterAccess { target: absidx, max: self.reg_top }{
     //             Err(RuntimeErr::InvalidStackIndex)
     //         }
     //     }
@@ -252,23 +247,23 @@ impl Rvm {
             let fixed = Self::MIN_STACK_SPACE.max(self.stack.capacity() / 2);
             self.stack.shrink_to(fixed);
             debug_assert!(fixed >= Self::MIN_STACK_SPACE);
-            self.correct_callinfo();
+            self.correct_callchain();
         }
     }
 
-    fn try_extend_stack(&mut self) -> Result<(), Box<StackOverflow>> {
+    fn try_extend_stack(&mut self) -> Result<(), RuaErr> {
         if self.stack.len() + Self::EXTRA_STACK_SPACE >= self.stack.capacity() {
             let need = self.stack.capacity() * 2;
             if need > Self::MAX_STACK_SPACE {
-                return Err(Box::new(StackOverflow()));
+                return Err(RuaErr::StackOverflow);
             }
             self.stack.reserve(need + Self::EXTRA_STACK_SPACE);
-            self.correct_callinfo();
+            self.correct_callchain();
         }
         Ok(())
     }
 
-    fn correct_callinfo(&mut self) {
+    fn correct_callchain(&mut self) {
         self.ci.stk_base = self.stack.as_mut_ptr();
         self.ci.stk_last = unsafe { self.ci.stk_base.add(self.stack.capacity()) };
 
@@ -276,10 +271,6 @@ impl Rvm {
             ci.stk_base = self.ci.stk_base;
             ci.stk_last = self.ci.stk_last;
         })
-    }
-
-    fn init_stack() -> Vec<LValue> {
-        Vec::with_capacity(Self::MIN_STACK_SPACE + Self::EXTRA_STACK_SPACE)
     }
 }
 // enum LoadMode {
@@ -374,9 +365,9 @@ impl State {
         Heap::new(self.vm.get_mut(), &mut self.heap)
     }
 
-    pub fn context<O>(&mut self, op: O) -> Result<(), Box<dyn RuntimeErr>>
+    pub fn context<O>(&mut self, op: O) -> Result<(), RuaErr>
     where
-        O: FnOnce(&mut Rvm, &mut Heap) -> Result<(), Box<dyn RuntimeErr>>,
+        O: FnOnce(&mut Rvm, &mut Heap) -> Result<(), RuaErr>,
     {
         unsafe {
             op(
@@ -386,9 +377,9 @@ impl State {
         }
     }
 
-    pub fn vm_with<O>(&mut self, op: O) -> Result<(), Box<dyn RuntimeErr>>
+    pub fn vm_with<O>(&mut self, op: O) -> Result<(), RuaErr>
     where
-        O: FnOnce(&mut Rvm) -> Result<(), Box<dyn RuntimeErr>>,
+        O: FnOnce(&mut Rvm) -> Result<(), RuaErr>,
     {
         op(self.vm_view())
     }
@@ -464,12 +455,7 @@ impl State {
     //     todo!()
     // }
 
-    pub fn do_call(
-        &mut self,
-        fnidx: RegIndex,
-        nin: i32,
-        _nout: i32,
-    ) -> Result<(), Box<dyn RuntimeErr>> {
+    pub fn do_call(&mut self, fnidx: RegIndex, nin: i32, _nout: i32) -> Result<(), RuaErr> {
         let f = self.rget(fnidx)?;
         assert!(f.is_callable());
 
@@ -482,18 +468,17 @@ impl State {
             LValue::Function(p) => {
                 self.vm_with(|vm| {
                     if vm.callchain.len() > Rvm::MAX_CALL_DEPTH {
-                        Err(Box::new(StackOverflow()))
+                        Err(RuaErr::StackOverflow)
                     } else if vm.stk_remain() < nin as usize {
-                        vm.try_extend_stack()
-                            .map_err(|so| so as Box<dyn RuntimeErr>)
+                        vm.try_extend_stack().map_err(|so| so as RuaErr)
                     } else {
                         Ok(())
                     }
                 })?;
 
                 let ncodes = p.bytecode();
-                let nkst = p.constants();
-                let nups = p.upvalues();
+                let nkst = p.constant();
+                let nups = p.updecl();
 
                 let mut nextci = Frame {
                     oldpc: self.ci.pc,
@@ -502,7 +487,7 @@ impl State {
                     stk_last: self.ci.stk_last,
                     reg_base: self.ci.reg_top - 1,
                     reg_top: self.ci.reg_top,
-                    upvalues: (nups.as_ptr(), nups.len() as u32),
+                    upvalues: (ptr::null(), nups.len() as u32),
                     constants: (nkst.as_ptr(), nkst.len() as u32),
                     bytescode: (ncodes.as_ptr(), ncodes.len() as u32),
                 };
@@ -558,11 +543,7 @@ impl State {
         Ok(())
     }
 
-    pub fn compile(
-        src: &str,
-        chunkname: Option<String>,
-        optimize: bool,
-    ) -> Result<Proto, StaticErr> {
+    pub fn compile(src: &str, chunkname: Option<String>, optimize: bool) -> Result<Proto, RuaErr> {
         let mut block = Parser::parse(src, chunkname)?;
 
         // TODO:
@@ -601,7 +582,7 @@ impl State {
 
     fn pos_call(&mut self) {}
 
-    fn interpret(&mut self) -> Result<(), Box<dyn RuntimeErr>> {
+    fn interpret(&mut self) -> Result<(), RuaErr> {
         use super::codegen::OpCode::*;
         use super::codegen::OpMode;
 
@@ -677,10 +658,16 @@ fn init_metatable() -> BTreeMap<Tag, TableImpl> {
     BTreeMap::new()
 }
 
-fn default_panicfn(_vm: &mut State) -> Result<usize, Box<dyn RuntimeErr>> {
+fn default_panicfn(_vm: &mut State) -> Result<usize, RuaErr> {
     todo!()
 }
 
-pub fn default_warnfn(_vm: &mut State) -> Result<usize, Box<dyn RuntimeErr>> {
+pub fn default_warnfn(_vm: &mut State) -> Result<usize, RuaErr> {
     todo!()
+}
+
+pub(super) fn mark_rootset(vm: &mut Rvm) {
+    // mark all reachable object to black
+    vm.stack.iter().for_each(|val| val.mark_reachable());
+    vm.globaltab.mark_reachable();
 }
