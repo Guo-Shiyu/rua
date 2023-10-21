@@ -2,10 +2,10 @@ use crate::{state::State, value::RsFunc, RuaErr};
 
 fn lua_print(lua: &mut State) -> Result<usize, RuaErr> {
     let n = lua.top();
-    print!("{}", lua.rget(1)?);
+    print!("{}", lua.rget(1));
     if n > 1 {
         for i in 2..=n {
-            print!("\t{}", lua.rget(i)?);
+            print!("\t{}", lua.rget(i));
         }
     }
     println!();
