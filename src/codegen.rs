@@ -11,7 +11,7 @@ use crate::{
         Attribute, BasicBlock, BinOp, Block, Expr, ExprNode, Field, FuncBody, FuncCall, GenericFor,
         NumericFor, ParameterList, SrcLoc, Stmt, UnOp,
     },
-    heap::{Gc, Heap, HeapMemUsed, MarkAndSweepGcOps},
+    heap::{Gc, Heap, HeapMemUsed, MarkAndSweepGcOps, Tag, TypeTag},
     state::RegIndex,
     value::LValue,
 };
@@ -471,7 +471,7 @@ pub enum UpvalDecl {
 }
 
 impl UpvalDecl {
-    fn name(&self) -> &str {
+    pub fn name(&self) -> &str {
         match self {
             UpvalDecl::OnStack { name, register: _ } => name.as_str(),
             UpvalDecl::InUpList { name, offset: _ } => name.as_str(),
@@ -482,21 +482,21 @@ impl UpvalDecl {
 
 /// Lua Function Prototype
 pub struct Proto {
-    vararg: bool,
-    nparam: u8, // positional parameter count
-    nreg: u8,   // number of registers used by this function
+    pub vararg: bool,
+    pub nparam: u8, // positional parameter count
+    pub nreg: u8,   // number of registers used by this function
 
-    begline: u32, // begin define line number
-    endline: u32, // end define line number
+    pub begline: u32, // begin define line number
+    pub endline: u32, // end define line number
 
-    kst: Vec<LValue>,       // constants
-    code: Vec<Instruction>, // bytecodes
-    subfn: Vec<Gc<Proto>>,  // sub functions
-    pcline: Vec<u32>,       // line number of each instruction
-    updecl: Vec<UpvalDecl>, // upvalue information
+    pub kst: Vec<LValue>,       // constants
+    pub code: Vec<Instruction>, // bytecodes
+    pub subfn: Vec<Gc<Proto>>,  // sub function
+    pub pcline: Vec<u32>,       // line number of each instruction
+    pub updecl: Vec<UpvalDecl>, // upvalue information
 
-    source: LValue,           // source file name, used for debug info
-    locvars: Vec<LocVarDecl>, // local variable name, used for debug info
+    pub source: LValue,           // source file name, used for debug info
+    pub locvars: Vec<LocVarDecl>, // local variable name, used for debug info
 }
 
 impl HeapMemUsed for Proto {
@@ -547,12 +547,16 @@ impl MarkAndSweepGcOps for Proto {
     }
 }
 
+impl TypeTag for Proto {
+    const TAGID: Tag = 6;
+}
+
 impl Display for Proto {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         display_fmt(self, f)?;
         for each in self.subfn.iter() {
             writeln!(f)?;
-            display_fmt(self, f)?;
+            display_fmt(each, f)?;
         }
         Ok(())
     }
@@ -563,7 +567,7 @@ impl Debug for Proto {
         debug_fmt(self, f)?;
         for each in self.subfn.iter() {
             writeln!(f)?;
-            debug_fmt(self, f)?;
+            debug_fmt(each, f)?;
         }
         Ok(())
     }
@@ -634,8 +638,16 @@ impl Proto {
         self.nparam as i32
     }
 
-    pub fn nreg(&self) -> usize {
-        self.nreg as usize
+    pub fn nreg(&self) -> i32 {
+        self.nreg as i32
+    }
+
+    pub fn nupdecl(&self) -> i32 {
+        self.updecl.len() as i32
+    }
+
+    pub fn nconst(&self) -> i32 {
+        self.kst.len() as i32
     }
 
     pub fn is_vararg(&self) -> bool {
@@ -663,13 +675,13 @@ impl Proto {
     }
 
     pub fn is_pure(&self) -> bool {
-        !self.vararg && self.updecl.len() == 0
+        !self.vararg && self.updecl.is_empty()
     }
 }
 
 #[derive(Debug, Default)]
 pub struct LocVarDecl {
-    name: String,
+    pub name: String,
     reg: RegIndex, // register index on stack
     start_pc: u32, // first pc where variable is active
     end_pc: u32,   // first pc where variable is dead
@@ -695,14 +707,15 @@ pub struct GenState {
     pub jumpbp: Vec<(u32, String)>,          // jump backpatch (iscidx, lable), used for `goto`
     pub loopbp: LinkedList<Vec<(u32, u32)>>, // loop backpatch (iscidx, pc), used for `break`
     pub regs: RegIndex,                      // current register count (vm stack length)
-    pub ksts: Vec<LValue>,                   // constants
-    pub upvals: Vec<UpvalDecl>,              // upvalue declration
-    pub code: Vec<Instruction>,              // byte code
-    pub subproto: Vec<Proto>,                // sub functions
-    pub locstate: Vec<Vec<LocVarDecl>>,      // local variable infomation for each basic block
-    pub local: Vec<LocVarDecl>,              // all local variable infomation
-    pub srcfile: LValue,                     // source file name
-    pub absline: Vec<u32>,                   // line number of each bytecode
+    pub regmax: u8,
+    pub ksts: Vec<LValue>,              // constants
+    pub upvals: Vec<UpvalDecl>,         // upvalue declration
+    pub code: Vec<Instruction>,         // byte code
+    pub subproto: Vec<Proto>,           // sub functions
+    pub locstate: Vec<Vec<LocVarDecl>>, // local variable infomation for each basic block
+    pub local: Vec<LocVarDecl>,         // all local variable infomation
+    pub srcfile: LValue,                // source file name
+    pub absline: Vec<u32>,              // line number of each bytecode
 }
 
 impl Default for GenState {
@@ -721,6 +734,7 @@ impl GenState {
             jumpbp: Vec::default(),
             loopbp: LinkedList::default(),
             regs: 0,
+            regmax: 0,
             ksts: Vec::with_capacity(4),
             upvals: Vec::with_capacity(8),
             subproto: Vec::with_capacity(2),
@@ -774,6 +788,7 @@ impl GenState {
     fn alloc_free_reg(&mut self) -> RegIndex {
         let idx = self.regs;
         self.regs += 1;
+        self.regmax = self.regmax.max(idx as u8);
         idx
     }
 
@@ -1145,7 +1160,7 @@ impl CodeGen {
         let res = Proto {
             vararg: params.vargs,
             nparam: nparam as u8,
-            nreg: self.regs as u8,
+            nreg: self.regmax,
             begline: self.absline.first().copied().unwrap_or(0),
             endline: self.absline.last().copied().unwrap_or(0),
             kst: std::mem::take(&mut self.ksts),
@@ -1208,7 +1223,7 @@ impl CodeGen {
     }
 
     fn walk_stmt(&mut self, stmt: SrcLoc<Stmt>) -> Result<(), CodeGenErr> {
-        let lineinfo = stmt.lineinfo;
+        let lineinfo = stmt.def_info();
         match stmt.inner() {
             Stmt::Assign { vars, exprs } => self.walk_assign_stmt(vars, exprs),
             Stmt::FnCall(call) => {
@@ -1262,7 +1277,7 @@ impl CodeGen {
             } => self.walk_branch_stmt(*exp, *then, els),
             Stmt::NumericFor(num) => self.walk_numberic_loop(*num),
             Stmt::GenericFor(gen) => self.walk_generic_for(*gen),
-            Stmt::FnDef { pres, method, body } => self.walk_fn_def(pres, method, *body),
+            // Stmt::FnDef { pres, method, body } => self.walk_fn_def(pres, method, *body),
             Stmt::LocalVarDecl { names, exprs } => self.walk_local_decl(names, exprs),
             Stmt::Expr(exp) => {
                 let _ = self.walk_common_expr(*exp, Ctx::Ignore)?;
@@ -1276,7 +1291,7 @@ impl CodeGen {
         cond: SrcLoc<Expr>,
         block: SrcLoc<Block>,
     ) -> Result<(), CodeGenErr> {
-        let def = cond.lineinfo.0;
+        let def = cond.def_begin();
         self.enter_loop();
         self.walk_basic_block(block)?;
         self.leave_loop();
@@ -1294,7 +1309,7 @@ impl CodeGen {
         block: SrcLoc<Block>,
     ) -> Result<(), CodeGenErr> {
         self.enter_loop();
-        let ln = cond.lineinfo.0;
+        let ln = cond.def_begin();
         let cond_reg = {
             let s = self.walk_common_expr(cond, Ctx::Allocate)?;
             self.try_load_expr_to_local(s, ln)
@@ -1326,7 +1341,7 @@ impl CodeGen {
             self.try_load_expr_to_local(s, line)
         };
 
-        let loopdef = n.body.lineinfo;
+        let loopdef = n.body.def_info();
         let offset = (limit_reg - init_reg, step_reg - limit_reg);
         if offset.0 != offset.1 || offset.0 != 1 {
             let new_init = self.alloc_free_reg();
@@ -1369,7 +1384,7 @@ impl CodeGen {
     }
 
     fn walk_generic_for(&mut self, g: GenericFor) -> Result<(), CodeGenErr> {
-        let def = g.body.lineinfo;
+        let def = g.body.def_info();
 
         let niter = g.iters.len();
         // alloc 4 register to store loop state
@@ -1455,60 +1470,6 @@ impl CodeGen {
         Ok(())
     }
 
-    fn walk_fn_def(
-        &mut self,
-        pres: Vec<SrcLoc<String>>,
-        method: Option<Box<SrcLoc<String>>>,
-        body: SrcLoc<FuncBody>,
-    ) -> Result<(), CodeGenErr> {
-        let (defln, body) = (body.def_begin(), body.inner());
-
-        let mut fnname = pres
-            .iter()
-            .fold(String::with_capacity(32), |mut acc, next| {
-                acc.extend(next.chars());
-                acc
-            });
-
-        if let Some(ref metd) = method {
-            fnname.extend(metd.chars())
-        }
-
-        let pre_name_kregs = pres
-            .iter()
-            .map(|s| self.find_or_create_kstr(s))
-            .collect::<Vec<_>>();
-
-        let mut prefix_iter = pres.into_iter();
-        let rootreg = if let Some(root) = prefix_iter.next() {
-            let rootdef = root.def_begin();
-            let r = self.lookup_name(root.inner(), None, rootdef);
-            for idx in pre_name_kregs.into_iter().skip(1) {
-                self.emit(Isc::iabc(GETFIELD, r, r, idx), defln);
-            }
-            Some(r)
-        } else {
-            None
-        };
-
-        let fnreg = self.alloc_free_reg();
-        let pirdx = self.subproto.len();
-        let pro = self.walk_fn_body(fnname.into(), body.params, *body.body, false)?;
-        self.subproto.push(pro);
-        self.emit(Isc::iabx(CLOSURE, fnreg, pirdx as i32), defln);
-
-        // method call, set field
-        if let Some(metd_name) = method {
-            debug_assert!(rootreg.is_some());
-            let metdkidx = self.find_or_create_kstr(&metd_name);
-            self.emit(
-                Isc::iabck(SETFIELD, rootreg.unwrap(), metdkidx, metdkidx),
-                defln,
-            );
-        }
-        Ok(())
-    }
-
     fn walk_local_decl(
         &mut self,
         mut names: Vec<(SrcLoc<String>, Option<Attribute>)>,
@@ -1582,7 +1543,7 @@ impl CodeGen {
                 1 => {
                     // SAFETY: rets.len() == 1
                     let ret_node = unsafe { rets.pop().unwrap_unchecked() };
-                    let ln = ret_node.lineinfo.0;
+                    let ln = ret_node.def_begin();
 
                     let status = self.walk_common_expr(*ret_node, Ctx::PotentialTailCall)?;
 
@@ -1648,17 +1609,30 @@ impl CodeGen {
                 let callln = prefix.def_begin();
 
                 let fnreg_real = match self.walk_common_expr(*prefix, Ctx::must_use(fnreg))? {
-                    ExprStatus::Reg(reg) => reg,
+                    ExprStatus::Reg(reg) => {
+                        // function
+                        if reg != self.next_free_reg() - 1 {
+                            let tail = self.alloc_free_reg();
+                            self.emit(Isc::iabc(MOVE, tail, fnreg, 0), callln);
+                            tail
+                        } else {
+                            reg
+                        }
+                    }
                     _ => unreachable!(),
                 };
 
-                // if fnreg_real != fnreg {
-                //     self.emit(Isc::iabc(MOVE, fnreg, fnreg_real, 0), callln);
-                // }
                 debug_assert_eq!(fnreg, fnreg_real);
 
-                for (n, param) in args.inner().namelist.into_iter().enumerate() {
-                    let _ = self.walk_common_expr(*param, Ctx::must_use(1 + fnreg + n as i32));
+                let mut n: u32 = 0;
+                for param in args.inner().namelist.into_iter() {
+                    n += 1;
+                    let preg = self.alloc_free_reg();
+                    let _ = self.walk_common_expr(*param, Ctx::must_use(preg));
+                }
+                while n != 0 {
+                    self.free_reg();
+                    n -= 1;
                 }
 
                 let callisc = if tail_call { TAILCALL } else { CALL };
@@ -1736,7 +1710,7 @@ impl CodeGen {
         node: SrcLoc<Expr>,
         ctx: ExprGenCtx,
     ) -> Result<ExprStatus, CodeGenErr> {
-        let (def, node) = (node.lineinfo, node.inner());
+        let (def, node) = (node.def_info(), node.inner());
 
         match ctx {
             // case that the value of expression will be ignored,
@@ -1757,7 +1731,7 @@ impl CodeGen {
                     }
                     Expr::TableCtor(ctor) => {
                         for field in ctor {
-                            let _ = self.walk_common_expr(**field.val, Ctx::Ignore);
+                            let _ = self.walk_common_expr(*field.val, Ctx::Ignore);
                         }
                         ExprStatus::Reg(RegIndex::MAX)
                     }
@@ -2136,10 +2110,10 @@ impl CodeGen {
         let mut aryidx = 1;
         for field in flist.into_iter() {
             let fdefloc = field.val.def_begin();
-            let valstatus = self.walk_common_expr(**field.val, Ctx::Allocate)?;
+            let valstatus = self.walk_common_expr(*field.val, Ctx::Allocate)?;
 
             if let Some(key) = field.key {
-                let keystatus = self.walk_common_expr(**key, Ctx::Allocate)?;
+                let keystatus = self.walk_common_expr(*key, Ctx::Allocate)?;
                 match keystatus {
                     ExprStatus::Kst(kidx) => {
                         if let ExprStatus::Kst(valreg) = valstatus {
@@ -2288,6 +2262,10 @@ impl From<std::io::Error> for BinLoadErr {
     fn from(value: std::io::Error) -> Self {
         BinLoadErr::IOErr(value)
     }
+}
+
+pub fn dump_chunk(chunk: &Proto, bw: &mut BufWriter<impl Write>) -> std::io::Result<()> {
+    ChunkDumper::dump(chunk, bw)
 }
 
 pub struct ChunkDumper();

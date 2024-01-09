@@ -1,6 +1,6 @@
 use rua::{
-    ast::{AstDumper, DumpPrecison},
-    codegen::{ChunkDumper, CodeGen},
+    ast::{dump_ast, DumpPrecison},
+    codegen::{dump_chunk, CodeGen},
     parser::Parser,
     passes, RuaErr,
 };
@@ -88,8 +88,7 @@ fn main() -> Result<(), RuaErr> {
 
     if args.dump_stmt {
         let mut outer = std::io::BufWriter::new(std::io::stdout());
-        return AstDumper::dump(&ast, DumpPrecison::Statement, &mut outer, false)
-            .map_err(RuaErr::IOErr);
+        return dump_ast(&ast, DumpPrecison::Statement, &mut outer, false).map_err(RuaErr::IOErr);
     };
 
     if args.optimize {
@@ -111,7 +110,7 @@ fn main() -> Result<(), RuaErr> {
 
     let mut ruacout =
         std::io::BufWriter::new(std::fs::File::create(&args.output).map_err(RuaErr::IOErr)?);
-    ChunkDumper::dump(&chunk, &mut ruacout).map_err(RuaErr::IOErr)?;
+    dump_chunk(&chunk, &mut ruacout).map_err(RuaErr::IOErr)?;
 
     Ok(())
 }

@@ -178,7 +178,7 @@ impl Parser<'_> {
     /// Parse single expr as statememt.
     fn expr_stat(&mut self) -> Result<StmtNode, Error> {
         let expr = self.expr()?;
-        let (lineinfo, inner) = (expr.lineinfo, expr.inner());
+        let (lineinfo, inner) = (expr.def_info(), expr.inner());
 
         let stmt = if let Expr::FuncCall(call) = inner {
             SrcLoc::new(Stmt::FnCall(call), lineinfo)
@@ -424,19 +424,34 @@ impl Parser<'_> {
         })))
     }
 
-    /// function ::= `function` funcname funcbody
-    /// funcname ::= Name {`.` Name} [`:` Name]
+    /// function ::= `function` funcname funcbody   
+    /// funcname ::= Name {`.` Name} [`:` Name]    
+    ///
+    /// global function defination will be parsed as local
     fn global_fndef(&mut self) -> Result<Stmt, Error> {
         self.next()?; // skip `function`
-        let (pres, method) = self.func_name()?;
+        let (mut pres, method) = self.func_name()?;
         let beg = self.lex.line();
-        let body = self.func_body()?;
+        let mut body = self.func_body()?;
         let end = self.lex.line();
-        Ok(Stmt::FnDef {
-            pres,
-            method,
-            body: Box::new(SrcLoc::new(body, (beg, end))),
-        })
+
+        if let Some(mtd) = method {
+            body.params.namelist.insert(0, "self".to_string());
+            pres = SrcLoc::new(
+                Expr::Index {
+                    prefix: Box::new(pres),
+                    key: Box::new(mtd.map(|id| Expr::Ident(id))),
+                },
+                (beg, beg),
+            )
+        }
+
+        let lambda = SrcLoc::new(Expr::Lambda(body), (beg, end));
+        let stmt = Stmt::Assign {
+            vars: vec![Box::new(pres)],
+            exprs: vec![Box::new(lambda)],
+        };
+        Ok(stmt)
     }
 
     /// ``` text
@@ -524,7 +539,7 @@ impl Parser<'_> {
     /// ``` text
     /// funcname ::= Name {`.` Name} [`:` Name]
     /// ```
-    fn func_name(&mut self) -> Result<(Vec<SrcLoc<String>>, Option<Box<SrcLoc<String>>>), Error> {
+    fn func_name(&mut self) -> Result<(SrcLoc<Expr>, Option<SrcLoc<String>>), Error> {
         const DOT: bool = true;
         const COLON: bool = false;
         let mut pres = Vec::with_capacity(4);
@@ -561,7 +576,22 @@ impl Parser<'_> {
             }
         }
 
-        Ok((pres, method.map(Box::new)))
+        debug_assert!(pres.len() >= 1);
+        pres.push(SrcLoc::new(String::new(), (0, 0)));
+        let first = pres.swap_remove(0).map(|s| Expr::Ident(s));
+        let prefix = pres.into_iter().skip(1).fold(first, |acc, ident| {
+            let def = acc.def_info();
+            let key = ident.map(|id| Expr::Ident(id));
+            SrcLoc::new(
+                Expr::Index {
+                    prefix: Box::new(acc),
+                    key: Box::new(key),
+                },
+                def,
+            )
+        });
+
+        Ok((prefix, method))
     }
 
     /// ``` text
@@ -851,7 +881,7 @@ impl Parser<'_> {
                 let key = self.expr()?;
                 self.check_and_next(Token::RS)?;
                 self.check_and_next(Token::Assign)?;
-                return Ok(Field::new(Some(Box::new(key)), Box::new(self.expr()?)));
+                return Ok(Field::new(Some(key), self.expr()?));
             }
 
             Token::Ident(key) => {
@@ -859,7 +889,7 @@ impl Parser<'_> {
             }
 
             // expr
-            _ => return Ok(Field::new(None, Box::new(self.expr()?))),
+            _ => return Ok(Field::new(None, self.expr()?)),
         };
 
         self.look_ahead()?;
@@ -869,10 +899,10 @@ impl Parser<'_> {
             self.next()?; // skip '='
             let line = self.lex.line();
             let expr = Box::new(SrcLoc::new(Expr::Ident(holder), (line, line)));
-            Ok(Field::new(Some(Box::new(expr)), Box::new(self.expr()?)))
+            Ok(Field::new(Some(expr), self.expr()?))
         } else {
             // expr
-            Ok(Field::new(None, Box::new(self.expr()?)))
+            Ok(Field::new(None, self.expr()?))
         }
     }
 

@@ -13,7 +13,7 @@ use std::{
 pub struct SrcLoc<T> {
     node: T,
     // lineinfo: (begin, end)
-    pub lineinfo: (u32, u32),
+    lineinfo: (u32, u32),
 }
 
 impl<T> SrcLoc<T> {
@@ -36,6 +36,11 @@ impl<T> SrcLoc<T> {
         &mut self.node
     }
 
+    pub fn map<R>(self, f: impl FnOnce(T) -> R) -> SrcLoc<R> {
+        let def = self.def_info();
+        SrcLoc::new(f(self.inner()), def)
+    }
+
     pub fn def_begin(&self) -> u32 {
         self.lineinfo.0
     }
@@ -44,7 +49,11 @@ impl<T> SrcLoc<T> {
         self.lineinfo.1
     }
 
-    pub fn mem_address(&self) -> usize {
+    pub fn def_info(&self) -> (u32, u32) {
+        self.lineinfo
+    }
+
+    fn mem_address(&self) -> usize {
         self as *const _ as usize
     }
 }
@@ -143,12 +152,6 @@ pub enum Stmt {
     NumericFor(Box<NumericFor>),
 
     GenericFor(Box<GenericFor>),
-
-    FnDef {
-        pres: Vec<SrcLoc<String>>,
-        method: Option<Box<SrcLoc<String>>>,
-        body: Box<SrcLoc<FuncBody>>,
-    },
 
     LocalVarDecl {
         names: Vec<(SrcLoc<String>, Option<Attribute>)>,
@@ -308,12 +311,12 @@ pub type ArgumentList = FnHeader<ExprNode>;
 /// field ::= `[` exp `]` `=` exp | Name `=` exp | exp
 /// ```
 pub struct Field {
-    pub key: Option<Box<ExprNode>>,
-    pub val: Box<ExprNode>,
+    pub key: Option<ExprNode>,
+    pub val: ExprNode,
 }
 
 impl Field {
-    pub fn new(key: Option<Box<ExprNode>>, val: Box<ExprNode>) -> Self {
+    pub fn new(key: Option<ExprNode>, val: ExprNode) -> Self {
         Field { key, val }
     }
 }
@@ -366,51 +369,24 @@ pub struct AstDumper {
     depth: usize,        // ident state
     colored: bool,       // whether dump with color
     level: DumpPrecison, // dump level
-    dump_buf: Vec<u8>,   // dumped string buffer
-    errinfo: Option<AstDumpErr>,
 }
-
-pub struct PassHasNotRun();
-
-enum AstDumpErr {
-    IOErr(std::io::Error),
-    PassHasNotRun,
+pub fn dump_ast(
+    block: &Block,
+    precision: DumpPrecison,
+    buf: &mut BufWriter<impl Write>,
+    colored: bool,
+) -> Result<(), Error> {
+    let mut dumper = AstDumper::new(precision, colored);
+    dumper.dump_block(block, buf)
 }
 
 impl AstDumper {
-    fn new(level: DumpPrecison, colored: bool, buf: Option<Vec<u8>>) -> Self {
+    fn new(level: DumpPrecison, colored: bool) -> Self {
         AstDumper {
             depth: 0,
             colored,
             level,
-            dump_buf: buf.unwrap_or_default(),
-            errinfo: None,
         }
-    }
-
-    pub fn dump(
-        block: &Block,
-        precision: DumpPrecison,
-        buf: &mut BufWriter<impl Write>,
-        colored: bool,
-    ) -> Result<(), Error> {
-        let mut dumper = AstDumper::new(precision, colored, None);
-        dumper.dump_block(block, buf)
-    }
-
-    fn walk(&mut self, block: &Block) {
-        const BUF_SIZE: usize = 8192; // equal with std::io::DEFAULT_BUF_SIZE
-        if self.dump_buf.len() < BUF_SIZE {
-            self.dump_buf.reserve(BUF_SIZE);
-        }
-
-        let inner_buf = std::mem::take(&mut self.dump_buf);
-        let mut bw = BufWriter::new(inner_buf);
-
-        let _ = self
-            .dump_block(block, &mut bw)
-            .map(|_| std::mem::swap(&mut bw.into_inner().unwrap(), &mut self.dump_buf))
-            .map_err(|e| self.errinfo = Some(AstDumpErr::IOErr(e)));
     }
 }
 
@@ -667,29 +643,6 @@ impl AstDumper {
                 self.dec_indent();
                 Ok(())
             }
-            Stmt::FnDef {
-                pres,
-                method,
-                body: def,
-            } => {
-                self.write_lable(buf, '+')?;
-                self.write_name(buf, "FuncDef", this)?;
-
-                let prefixs = pres.iter().map(|name| name.as_str()).collect::<Vec<_>>();
-                write!(
-                    buf,
-                    "prefix:{:?}, method: {:?}, def: 0x{:x}",
-                    prefixs,
-                    method.as_ref().map(|s| s.as_str()),
-                    Self::mem_address(def),
-                )?;
-                self.write_lineinfo(buf, stmt.lineinfo.0)?;
-
-                self.inc_indent();
-                self.dump_block(&def.body, buf)?;
-                self.dec_indent();
-                Ok(())
-            }
         }
     }
 
@@ -808,7 +761,7 @@ mod test {
         };
 
         let mut buf = BufWriter::new(tmp_file);
-        let result = AstDumper::dump(&block, DumpPrecison::Statement, &mut buf, false);
+        let result = dump_ast(&block, DumpPrecison::Statement, &mut buf, false);
 
         assert!(result.is_ok())
     }

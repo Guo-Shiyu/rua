@@ -73,15 +73,6 @@ pub trait MutVisitor: Sized {
         walk_generic_for(self, names, exprs, chunk)
     }
 
-    fn visit_fndef(
-        &mut self,
-        pres: &mut Vec<SrcLoc<String>>,
-        method: &mut Option<Box<SrcLoc<String>>>,
-        chunk: &mut Box<SrcLoc<FuncBody>>,
-    ) {
-        walk_fndef(self, pres, method, chunk)
-    }
-
     fn visit_local_decl(
         &mut self,
         names: &mut Vec<(SrcLoc<String>, Option<Attribute>)>,
@@ -138,9 +129,6 @@ pub fn walk_stmt<T: MutVisitor>(vis: &mut T, stmt: &mut StmtNode) {
         }
         Stmt::GenericFor(gen) => {
             vis.visit_generic_for(&mut gen.iters, &mut gen.exprs, &mut gen.body);
-        }
-        Stmt::FnDef { pres, method, body } => {
-            vis.visit_fndef(pres, method, body);
         }
         Stmt::LocalVarDecl { names, exprs } => {
             vis.visit_local_decl(names, exprs);
@@ -309,34 +297,12 @@ pub fn walk_unary_op<T: MutVisitor>(vis: &mut T, _op: &mut UnOp, expr: &mut Expr
 }
 
 pub fn constant_fold(root: &mut BasicBlock) {
-    let mut cf = ConstantFolder::default();
-    cf.visit_chunk(root);
+    ConstantFolder::default().visit_chunk(root)
 }
 
 enum AfterFoldStatus {
     StillConst,
     NonConst,
-}
-
-#[cfg(flag = "trace_optimize")]
-enum FoldOperation {
-    BinaryOp { op: BinOp },
-    UnaryOp { op: UnOp },
-}
-
-pub struct FoldInfo {
-    #[cfg(flag = "trace_optimize")]
-    srcloc: (u32, u32), // source location
-
-    #[cfg(flag = "trace_optimize")]
-    derive_n: usize, //
-
-    #[cfg(flag = "trace_optimize")]
-    status: AfterFoldStatus, //
-
-    #[cfg(flag = "trace_optimize")]
-    // op: FoldOperation,       //
-    new: Expr, // updated node (must be a constant)
 }
 
 #[derive(Default)]
@@ -426,15 +392,6 @@ fn try_fold(exp: &mut Expr) -> AfterFoldStatus {
                 } {
                     // update expr node
                     *exp = new_exp;
-
-                    #[cfg(flag = "trace_optimize")]
-                    self.record.push(FoldInfo {
-                        srcloc: expr.lineinfo(),
-                        derive_n: *derive,
-                        status: StillConst,
-                        new: new_exp,
-                    });
-
                     StillConst
                 } else {
                     NonConst
@@ -530,15 +487,6 @@ impl MutVisitor for ConstantFolder {
         try_fold(limit);
         try_fold(step);
         walk_chunk(self, chunk);
-    }
-
-    fn visit_fndef(
-        &mut self,
-        _pres: &mut Vec<SrcLoc<String>>,
-        _method: &mut Option<Box<SrcLoc<String>>>,
-        chunk: &mut Box<SrcLoc<FuncBody>>,
-    ) {
-        walk_chunk(self, &mut chunk.body);
     }
 
     fn visit_local_decl(
