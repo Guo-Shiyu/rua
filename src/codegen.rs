@@ -1712,7 +1712,7 @@ impl CodeGen {
             ExprGenCtx::Ignore => {
                 let pre_state = self.next_free_reg();
                 let status = match node {
-                    Expr::Index { prefix, key } => {
+                    Expr::Subscript { prefix, key } => {
                         let _ = self.walk_common_expr(*prefix, Ctx::Ignore);
                         let _ = self.walk_common_expr(*key, Ctx::Ignore);
                         ExprStatus::Reg(RegIndex::MAX)
@@ -1810,7 +1810,7 @@ impl CodeGen {
                 | Expr::Literal(_)
                 | Expr::Lambda(_)
                 | Expr::TableCtor(_)
-                | Expr::Index { .. } => {
+                | Expr::Subscript { .. } => {
                     let reg = self.alloc_free_reg();
                     let status = self.emit_expr(node, reg, def)?;
                     // debug_assert!()
@@ -1901,7 +1901,7 @@ impl CodeGen {
 
             Expr::Lambda(fnbody) => self.load_fn_def(fnbody, dest, def)?,
 
-            Expr::Index { prefix, key } => {
+            Expr::Subscript { prefix, key } => {
                 let key_status = self.walk_common_expr(*key, Ctx::Allocate)?;
                 match self.walk_common_expr(*prefix, Ctx::MultiLevelTableIndex { depth: 1 })? {
                     ExprStatus::Reg(pre) | ExprStatus::Call(pre) => {

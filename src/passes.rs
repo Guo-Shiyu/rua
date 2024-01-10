@@ -147,7 +147,7 @@ pub fn walk_expr<T: MutVisitor>(vis: &mut T, expr: &mut ExprNode) {
         Expr::Ident(id) => walk_ident(vis, id),
         Expr::Literal(l) => walk_literal(vis, l),
         Expr::Lambda(la) => walk_lambda(vis, la),
-        Expr::Index { prefix, key } => walk_index(vis, prefix, key),
+        Expr::Subscript { prefix, key } => walk_index(vis, prefix, key),
         Expr::FuncCall(call) => walk_fncall(vis, call),
         Expr::TableCtor(ctor) => walk_ctor(vis, ctor),
         Expr::BinaryOp { lhs, op, rhs } => walk_binary_op(vis, lhs, op, rhs),

@@ -431,7 +431,7 @@ impl Parser<'_> {
         if let Some(mtd) = method {
             body.params.namelist.insert(0, "self".to_string());
             pres = SrcLoc::new(
-                Expr::Index {
+                Expr::Subscript {
                     prefix: Box::new(pres),
                     key: Box::new(mtd.map(|id| Expr::Ident(id))),
                 },
@@ -576,7 +576,7 @@ impl Parser<'_> {
             let def = acc.def_info();
             let key = ident.map(|id| Expr::Ident(id));
             SrcLoc::new(
-                Expr::Index {
+                Expr::Subscript {
                     prefix: Box::new(acc),
                     key: Box::new(key),
                 },
@@ -950,7 +950,7 @@ impl Parser<'_> {
                     let curln = self.lex.line();
                     let key = Box::new(SrcLoc::new(attr, (curln, curln)));
                     self.next()?;
-                    SrcLoc::new(Expr::Index { prefix, key }, (begin, self.lex.line()))
+                    SrcLoc::new(Expr::Subscript { prefix, key }, (begin, self.lex.line()))
                 }
 
                 Token::LS => {
@@ -958,7 +958,7 @@ impl Parser<'_> {
                     let key = self.expr()?;
                     self.check_and_next(Token::RS)?;
 
-                    SrcLoc::new(Expr::Index { prefix, key }, (begin, self.lex.line()))
+                    SrcLoc::new(Expr::Subscript { prefix, key }, (begin, self.lex.line()))
                 }
 
                 // method call

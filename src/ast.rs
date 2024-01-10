@@ -246,7 +246,7 @@ pub enum Expr {
     Lambda(FuncBody),
 
     // table.key | table[key]
-    Index {
+    Subscript {
         prefix: ExprNode,
         key: ExprNode,
     },
@@ -686,7 +686,7 @@ impl AstDumper {
             Expr::Dots => "<VARG>".to_string(),
             Expr::Ident(id) => id.clone(),
             Expr::Lambda(_) => "<FuncDef>".to_string(),
-            Expr::Index { prefix, key } => {
+            Expr::Subscript { prefix, key } => {
                 let mut buf = String::with_capacity(32);
                 buf.push_str(&Self::inspect(prefix.inner_ref()));
                 buf.push_str(&Self::inspect(key));
