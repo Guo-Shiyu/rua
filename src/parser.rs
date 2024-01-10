@@ -50,13 +50,11 @@ impl Parser<'_> {
         // treat whole file as a function body
         let mut block = parser.block()?;
 
-        debug_assert!(block.chunk.as_str() == Block::NAMELESS_CHUNK);
+        debug_assert!(block.name() == Block::ANONYMOUS_CHUNK);
         debug_assert!(parser.current.is_eof());
         debug_assert!(parser.ahead.is_eof());
 
-        if let Some(cn) = chunkname {
-            block.chunk = cn;
-        }
+        block.chunkname = chunkname;
 
         Ok(block)
     }
@@ -178,39 +176,34 @@ impl Parser<'_> {
     /// Parse single expr as statememt.
     fn expr_stat(&mut self) -> Result<StmtNode, Error> {
         let expr = self.expr()?;
-        let (lineinfo, inner) = (expr.def_info(), expr.inner());
+        let def = expr.def_info();
 
-        let stmt = if let Expr::FuncCall(call) = inner {
-            SrcLoc::new(Stmt::FnCall(call), lineinfo)
+        let stmt = if self.test(Token::Comma) {
+            // multi assignment
+            let varlist = self.exprlist(Some(expr))?;
+            self.check_and_next(Token::Assign)?;
+            let exprlist = self.exprlist(None)?;
+            SrcLoc::new(
+                Stmt::Assign {
+                    vars: varlist,
+                    exprs: exprlist,
+                },
+                def,
+            )
+        } else if self.test_and_next(Token::Assign)? {
+            // single assignment
+            SrcLoc::new(
+                Stmt::Assign {
+                    vars: vec![expr],
+                    exprs: self.exprlist(None)?,
+                },
+                def,
+            )
         } else {
-            let first = Box::new(SrcLoc::new(inner, lineinfo));
-            if self.test(Token::Comma) {
-                // multi assignment
-                let varlist = self.exprlist(Some(first))?;
-                self.check_and_next(Token::Assign)?;
-                let exprlist = self.exprlist(None)?;
-                SrcLoc::new(
-                    Stmt::Assign {
-                        vars: varlist,
-                        exprs: exprlist,
-                    },
-                    lineinfo,
-                )
-            } else if self.test_and_next(Token::Assign)? {
-                // single assignment
-                let exprlist = self.exprlist(None)?;
-                SrcLoc::new(
-                    Stmt::Assign {
-                        vars: vec![first],
-                        exprs: exprlist,
-                    },
-                    lineinfo,
-                )
-            } else {
-                // single expr as statememt
-                SrcLoc::new(Stmt::Expr(first), lineinfo)
-            }
+            // single expr as statememt
+            SrcLoc::new(Stmt::Expr(expr), def)
         };
+
         Ok(Box::new(stmt))
     }
 

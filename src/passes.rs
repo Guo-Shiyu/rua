@@ -111,7 +111,6 @@ pub fn walk_stmt<T: MutVisitor>(vis: &mut T, stmt: &mut StmtNode) {
         Stmt::Goto(_) => {}
         Stmt::Break => {}
         Stmt::Assign { vars, exprs } => vis.visit_assign(vars, exprs),
-        Stmt::FnCall(call) => vis.visit_fncall(call),
         Stmt::DoEnd(chunk) => vis.visit_do_end(chunk),
         Stmt::While { exp, block } => vis.visit_while(exp, block),
         Stmt::Repeat { exp, block } => vis.visit_repeat(exp, block),

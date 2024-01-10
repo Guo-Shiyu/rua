@@ -1071,7 +1071,7 @@ impl CodeGen {
         debug_assert_eq!(self.genstk.len(), 0);
 
         // take chunk name, construct an empty para list
-        let name = LValue::from(ast_root.chunk.as_str());
+        let name = LValue::from(ast_root.name());
         let plist = ParameterList {
             vargs: true,
             namelist: Vec::new(),
@@ -1226,12 +1226,6 @@ impl CodeGen {
         let lineinfo = stmt.def_info();
         match stmt.inner() {
             Stmt::Assign { vars, exprs } => self.walk_assign_stmt(vars, exprs),
-            Stmt::FnCall(call) => {
-                let next = self.alloc_free_reg();
-                let _ = self.walk_fn_call(call, next, 0, false);
-                self.free_reg();
-                Ok(())
-            }
             Stmt::Lable(lable) => {
                 let dest = self.cur_pc();
                 if self.lables.contains_key(lable.as_str()) {

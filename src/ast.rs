@@ -75,17 +75,17 @@ impl<T> DerefMut for SrcLoc<T> {
 /// block ::= {stat} [retstat]
 /// ```
 pub struct Block {
-    pub chunk: String,
+    pub chunkname: Option<String>,
     pub stats: Vec<StmtNode>,
     pub ret: Option<Vec<ExprNode>>,
 }
 
 impl Block {
-    pub const NAMELESS_CHUNK: &'static str = "<anonymous>";
+    pub const ANONYMOUS_CHUNK: &'static str = "<anonymous>";
 
     pub fn new(name: Option<String>, stats: Vec<StmtNode>, ret: Option<Vec<ExprNode>>) -> Self {
         Block {
-            chunk: name.unwrap_or_else(|| Self::NAMELESS_CHUNK.to_string()),
+            chunkname: name,
             stats,
             ret,
         }
@@ -94,6 +94,16 @@ impl Block {
     /// Check self weither a empty block. (Empty block was created by ConstantFold.)
     pub fn is_empty(&self) -> bool {
         self.stats.is_empty() && self.ret.is_none()
+    }
+
+    pub fn is_anonymous(&self) -> bool {
+        self.chunkname.is_none()
+    }
+
+    pub fn name(&self) -> &str {
+        self.chunkname
+            .as_ref()
+            .map_or(Self::ANONYMOUS_CHUNK, |ck| ck.as_str())
     }
 }
 
@@ -121,9 +131,6 @@ pub enum Stmt {
         vars: Vec<ExprNode>,
         exprs: Vec<ExprNode>,
     },
-
-    // fn(a, b, c) | x.y.fn(a, b, c)
-    FnCall(FuncCall),
 
     Lable(String),
 
@@ -412,7 +419,7 @@ impl AstDumper {
             "statement: [{}], with-return: {:?}, chunk-name: \"{}\"",
             bk.stats.len(),
             bk.ret.is_some(),
-            bk.chunk.as_str(),
+            bk.name(),
         )?;
 
         let line = bk.stats.first().map_or(0, |node| node.lineinfo.0);
@@ -496,39 +503,6 @@ impl AstDumper {
 
                 self.write_lineinfo(buf, stmt.lineinfo.0)
             }),
-
-            Stmt::FnCall(call) => match call {
-                FuncCall::FreeFnCall { prefix, args } => {
-                    self.write_lable(buf, COLLAPSE).and_then(|_| {
-                        self.write_name(buf, "FreeFuncCall", this)?;
-                        write!(
-                            buf,
-                            "prefix: {}, vararg: {}, positional-args-num: {}",
-                            Self::inspect(prefix.inner_ref()),
-                            args.vargs,
-                            args.namelist.len(),
-                        )?;
-                        self.write_lineinfo(buf, stmt.lineinfo.0)
-                    })
-                }
-
-                FuncCall::MethodCall {
-                    prefix,
-                    method,
-                    args,
-                } => self.write_lable(buf, COLLAPSE).and_then(|_| {
-                    self.write_name(buf, "MethodCall", this)?;
-                    write!(
-                        buf,
-                        "prefix: {}, method: {}, vararg:{}, positional-args-num: {:x}",
-                        Self::inspect(prefix.inner_ref()),
-                        method.as_str(),
-                        args.vargs,
-                        args.namelist.len(),
-                    )?;
-                    self.write_lineinfo(buf, stmt.lineinfo.0)
-                }),
-            },
 
             Stmt::DoEnd(block) => self.write_lable(buf, '+').and_then(|_| {
                 self.write_name(buf, "DoEnd", this)?;
