@@ -3,7 +3,7 @@ use std::{
     str::{Chars, FromStr},
 };
 
-use crate::SyntaxErrKind;
+use crate::SyntaxErr;
 
 /// Token value defined for rua lexer. Keywords, operators, identifier and literals are included.
 /// 
@@ -226,7 +226,7 @@ impl Lexer<'_> {
     }
 
     /// Get next token or a lexical error.
-    pub fn tokenize(&mut self) -> Result<Token, SyntaxErrKind> {
+    pub fn tokenize(&mut self) -> Result<Token, SyntaxErr> {
         const WHITESPACES: [char; 4] = [' ', '\t', '\u{013}', '\u{014}'];
 
         loop {
@@ -281,19 +281,19 @@ impl Lexer<'_> {
 
                 punc if punc.is_ascii_punctuation() => {
                     break if punc == '@' || punc == '`' {
-                        Err(SyntaxErrKind::InvalidCharacter { ch: punc })
+                        Err(SyntaxErr::InvalidCharacter { ch: punc })
                     } else {
                         self.lex_punctuation(punc)
                     }
                 }
 
-                invalid => break Err(SyntaxErrKind::InvalidCharacter { ch: invalid }),
+                invalid => break Err(SyntaxErr::InvalidCharacter { ch: invalid }),
             }
         }
     }
 
     /// Lex all form of number in lua.
-    fn lex_number(&mut self) -> Result<Token, SyntaxErrKind> {
+    fn lex_number(&mut self) -> Result<Token, SyntaxErr> {
         let hex = matches!(
             (self.scan.first(), self.scan.second()),
             ('0', 'X') | ('0', 'x')
@@ -355,13 +355,13 @@ impl Lexer<'_> {
                         '-' => {self.bump(); false},
                         dig if dig.is_ascii_digit() => true,
                         other => {
-                            return  Err(SyntaxErrKind::BadFloatRepresentation { repr: format!("0x{src}p{other}") });
+                            return  Err(SyntaxErr::BadFloatRepresentation { repr: format!("0x{src}p{other}") });
                         }
                     };
 
                     let exp_str = self.scan.eat_while(|c| c.is_ascii_digit());
                     if exp_str.is_empty() {
-                        Err(SyntaxErrKind::BadFloatRepresentation { repr: format!(
+                        Err(SyntaxErr::BadFloatRepresentation { repr: format!(
                             "0x{}p{}",
                             base, if is_positive { '+' } else {'-'}
                         ) } )
@@ -389,13 +389,13 @@ impl Lexer<'_> {
                         self.col_n(copy.len());
                         Ok(Token::Float(f))
                     } else {
-                        Err(SyntaxErrKind::BadFloatRepresentation { repr: copy })
+                        Err(SyntaxErr::BadFloatRepresentation { repr: copy })
                     }
                 } else if let Ok(f) = f64::from_str(base) {
                         self.col_n(base.len());
                         Ok(Token::Float(f))
                     } else {
-                        Err(SyntaxErrKind::BadFloatRepresentation { repr: base.to_string() })
+                        Err(SyntaxErr::BadFloatRepresentation { repr: base.to_string() })
                     }
             },
 
@@ -413,7 +413,7 @@ impl Lexer<'_> {
                         self.col_n(copy.len());
                         Ok(Token::Float(f))
                     } else {
-                        Err(SyntaxErrKind::BadFloatRepresentation { repr: copy })
+                        Err(SyntaxErr::BadFloatRepresentation { repr: copy })
                     }
                 }else {
                     self.col_n(base.len());
@@ -425,20 +425,20 @@ impl Lexer<'_> {
                             IntErrorKind::PosOverflow | IntErrorKind::NegOverflow => {
                                 return i128::from_str(base)
                                             .map(|i| Token::Float(i as f64))
-                                            .map_err(|_| SyntaxErrKind::BadIntergerRepresentation { repr: base.to_string() })
+                                            .map_err(|_| SyntaxErr::BadIntergerRepresentation { repr: base.to_string() })
                             },
-                            _ => return Err(SyntaxErrKind::BadIntergerRepresentation { repr: base.to_string() }),
+                            _ => return Err(SyntaxErr::BadIntergerRepresentation { repr: base.to_string() }),
                         }
                     };
 
-                    ret.map_err(|_| SyntaxErrKind::BadIntergerRepresentation { repr: base.to_string() })
+                    ret.map_err(|_| SyntaxErr::BadIntergerRepresentation { repr: base.to_string() })
                 }
             }
         }
     }
 
     /// Lex sequence bounded with '\'' / '\"'.
-    fn lex_literal(&mut self) -> Result<Token, SyntaxErrKind> {
+    fn lex_literal(&mut self) -> Result<Token, SyntaxErr> {
         // ' or "
         let quote = self.scan.first();
         self.bump();
@@ -457,7 +457,7 @@ impl Lexer<'_> {
                 }
 
                 '\x00' | '\n' | '\r' => {
-                    return Err(SyntaxErrKind::UnclosedStringLiteral {
+                    return Err(SyntaxErr::UnclosedStringLiteral {
                         literal: format!("{quote}{lit}"),
                     })
                 }
@@ -489,7 +489,7 @@ impl Lexer<'_> {
                         ('x', x, y) if x.is_ascii_hexdigit() && y.is_ascii_hexdigit() => {
                             let escape =
                                 u8::from_str_radix(self.scan.eat_n(2), 16).map_err(|_| {
-                                    SyntaxErrKind::InvalidHexEscapeSequence {
+                                    SyntaxErr::InvalidHexEscapeSequence {
                                         seq: format!("\\x{x}{y}"),
                                     }
                                 })?;
@@ -507,7 +507,7 @@ impl Lexer<'_> {
                                 let escape_len = subseq.len().min(2);
                                 let s = &subseq[0..escape_len];
                                 let escape = s.parse::<u8>().map_err(|_| {
-                                    SyntaxErrKind::InvalidDecimalEscapeSequence {
+                                    SyntaxErr::InvalidDecimalEscapeSequence {
                                         seq: format!("\\{s}"),
                                     }
                                 })?;
@@ -553,7 +553,7 @@ impl Lexer<'_> {
                                 lit.push(c);
                                 self.col_n(unicode.len());
                             } else {
-                                return Err(SyntaxErrKind::InvalidUtf8EscapeSequence {
+                                return Err(SyntaxErr::InvalidUtf8EscapeSequence {
                                     seq: format!("\\u{{{unicode}}}",),
                                 });
                             }
@@ -640,7 +640,7 @@ impl Lexer<'_> {
     }
 
     /// Lex operator and delimters
-    fn lex_punctuation(&mut self, start: char) -> Result<Token, SyntaxErrKind> {
+    fn lex_punctuation(&mut self, start: char) -> Result<Token, SyntaxErr> {
         if start == '.' {
             let next = self.scan.second();
             // .25 | .4

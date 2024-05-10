@@ -1,4 +1,4 @@
-use crate::{SyntaxErrKind, SyntaxError};
+use crate::{SyntaxErr, SyntaxError};
 
 use super::{
     ast::*,
@@ -136,11 +136,7 @@ impl Parser<'_> {
     ///     local attnamelist [`=` explist]
     /// ```
     fn stmt(&mut self) -> Result<StmtNode, Error> {
-        // skip ';'
-        while self.test_and_next(Token::Semi)? {}
-
         let begin = self.lex.line();
-
         let stmt = {
             match &self.current {
                 Token::Break => {
@@ -168,7 +164,6 @@ impl Parser<'_> {
                 _ => return self.expr_stat(),
             }
         };
-
         let end = self.lex.line();
         Ok(Box::new(SrcLoc::new(stmt, (begin, end))))
     }
@@ -495,7 +490,7 @@ impl Parser<'_> {
                         "const" => Some(Attribute::Const),
                         "close" => Some(Attribute::Close),
                         other => {
-                            return Err(self.error(SyntaxErrKind::InvalidAttribute {
+                            return Err(self.error(SyntaxErr::InvalidAttribute {
                                 attr: other.to_string(),
                             }))
                         }
@@ -1076,7 +1071,7 @@ impl Parser<'_> {
 }
 
 impl Parser<'_> {
-    fn error(&self, e: SyntaxErrKind) -> Error {
+    fn error(&self, e: SyntaxErr) -> Error {
         Box::new(SyntaxError {
             kind: e,
             line: self.lex.line(),
@@ -1085,7 +1080,7 @@ impl Parser<'_> {
     }
 
     fn unexpected(&self, expect: &[Token]) -> Error {
-        self.error(SyntaxErrKind::UnexpectedToken {
+        self.error(SyntaxErr::UnexpectedToken {
             expect: Vec::from(expect),
             found: self.current.clone(),
         })

@@ -1,9 +1,10 @@
 use core::fmt;
 use std::{
     cell::Cell,
-    collections::{hash_map::DefaultHasher, HashMap},
+    collections::{hash_map::DefaultHasher, BTreeMap},
     fmt::{Debug, Display},
     hash::{Hash, Hasher},
+    ops::{Deref, DerefMut},
     ptr::NonNull,
 };
 
@@ -19,13 +20,15 @@ use super::state::State;
 
 pub type StrHashVal = u32;
 
-// const INTERNAL_STR_MAX_LEN: usize = 16;
-const MAX_SHORT_STR_LEN: usize = 23;
+/// Indecates that the length of inplace buffer in struct`Short`.
+/// if given compile flag "long_inplace_str", the buffer length is 47 to keep the size of `WithGcHeader<StrImpl>` is 64.  
+/// if not (in default) the buffer length is 23, and the size of `WithGcHeader<StrImpl>` is 40.
+const MAX_SHORT_STR_LEN: usize = if cfg!(long_inplace_str) { 47 } else { 23 };
 
 pub struct Short {
     hash: Cell<StrHashVal>,
     len: u8,
-    data: [u8; MAX_SHORT_STR_LEN], // c-style string ends with '\0'
+    data: [u8; MAX_SHORT_STR_LEN], // not ensured to end with '\0'
 }
 
 pub struct Long {
@@ -37,6 +40,10 @@ pub struct Long {
 pub enum StrImpl {
     Short(Short),
     Long(Long),
+}
+
+impl TypeTag for StrImpl {
+    const TAGID: Tag = Tag::String;
 }
 
 impl MarkAndSweepGcOps for StrImpl {}
@@ -95,8 +102,6 @@ impl From<&str> for Gc<StrImpl> {
 }
 
 impl StrImpl {
-    pub const INTERNAL_STR_MAX_LEN: usize = 64;
-
     pub fn hash_str(ss: &str) -> StrHashVal {
         let step = if Self::able_to_internal(ss) {
             1
@@ -164,7 +169,7 @@ impl StrImpl {
 
     /// Return true if s is able to be internalized.
     pub fn able_to_internal(s: &str) -> bool {
-        s.len() <= Self::INTERNAL_STR_MAX_LEN
+        s.len() <= MAX_SHORT_STR_LEN
     }
 
     pub fn able_to_store_inplace(s: &str) -> bool {
@@ -189,9 +194,13 @@ pub trait AsTableKey {
 #[repr(C)]
 #[derive(Default)]
 pub struct TableImpl {
-    hmap: HashMap<usize, LValue>,
+    hmap: BTreeMap<LValue, LValue>,
     array: Vec<LValue>,
     meta: Option<Gc<TableImpl>>,
+}
+
+impl TypeTag for TableImpl {
+    const TAGID: Tag = Tag::Table;
 }
 
 impl HeapMemUsed for TableImpl {
@@ -209,7 +218,10 @@ impl MarkAndSweepGcOps for TableImpl {
     }
 
     fn mark_reachable(&self) {
-        self.hmap.iter().for_each(|(_, val)| val.mark_reachable());
+        self.hmap.iter().for_each(|(key, val)| {
+            key.mark_reachable();
+            val.mark_reachable();
+        });
         self.array.iter().for_each(|val| val.mark_reachable());
     }
 
@@ -223,26 +235,21 @@ impl TableImpl {
         todo!()
     }
 
-    pub fn with_capacity(cap: (usize, usize)) -> Self {
+    pub fn with_capacity(hash_cap: usize, array_cap: usize) -> Self {
         Self {
-            hmap: HashMap::with_capacity(cap.0),
-            array: Vec::with_capacity(cap.1),
+            // hmap: HashMap::with_capacity(hash_cap),
+            hmap: Default::default(),
+            array: Vec::with_capacity(array_cap),
             meta: None,
         }
     }
 
-    pub fn set<K>(&mut self, k: K, v: LValue)
-    where
-        K: AsTableKey,
-    {
-        self.hmap.insert(k.as_key(), v);
+    pub fn set(&mut self, k: LValue, v: LValue) {
+        self.hmap.insert(k, v);
     }
 
-    pub fn get<K>(&self, k: K) -> LValue
-    where
-        K: AsTableKey,
-    {
-        self.hmap.get(&k.as_key()).cloned().unwrap_or_default()
+    pub fn get(&self, k: LValue) -> LValue {
+        self.hmap.get(&k).cloned().unwrap_or_default()
     }
 }
 
@@ -284,6 +291,91 @@ impl UserDataImpl {
 // usize: stack size after call
 pub type RsFunc = fn(&mut State) -> Result<usize, RuaErr>;
 
+pub enum UpVal {
+    Open(u32),     // stack index
+    Close(LValue), // itself
+}
+
+pub struct LClosure {
+    pub p: Gc<Proto>,
+    pub upvals: Vec<UpVal>,
+}
+
+impl Deref for LClosure {
+    type Target = Proto;
+    fn deref(&self) -> &Self::Target {
+        &self.p
+    }
+}
+
+impl DerefMut for LClosure {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.p
+    }
+}
+
+impl HeapMemUsed for LClosure {
+    fn heap_mem_used(&self) -> usize {
+        self.source.heap_mem_used()
+            + self.code.capacity()
+            + self.pcline.capacity()
+            + self
+                .kst
+                .iter()
+                .fold(self.kst.capacity(), |acc, k| acc + k.heap_mem_used())
+            + self
+                .locvars
+                .iter()
+                .fold(self.locvars.capacity(), |acc, l| acc + l.name.capacity())
+            + self
+                .updecl
+                .iter()
+                .fold(self.updecl.capacity(), |acc, u| acc + u.name().len())
+            + self.subfn.iter().fold(self.subfn.capacity(), |acc, f| {
+                // acc + f.heap_mem_used()
+                acc
+            })
+            + self.upvals.capacity()
+    }
+}
+
+impl MarkAndSweepGcOps for LClosure {
+    fn delegate_to(&mut self, heap: &mut Heap) {
+        heap.delegate(&mut self.source);
+        self.kst.iter_mut().for_each(|k| heap.delegate(k));
+        // self.subfn.iter_mut().for_each(|s| s.delegate_to(heap));
+    }
+
+    fn mark_newborned(&self, white: crate::heap::GcColor) {
+        self.source.mark_newborned(white);
+        self.kst.iter().for_each(|k| k.mark_newborned(white));
+        // self.subfn.iter().for_each(|s| s.mark_newborned(white));
+    }
+
+    fn mark_reachable(&self) {
+        self.source.mark_reachable();
+        self.kst.iter().for_each(|k| k.mark_reachable());
+        // self.subfn.iter().for_each(|s| s.mark_reachable());
+    }
+
+    fn mark_untouched(&self) {
+        todo!()
+    }
+}
+
+pub struct RsClosure {
+    f: RsFunc,
+    upvals: Vec<UpVal>,
+}
+
+impl HeapMemUsed for RsClosure {
+    fn heap_mem_used(&self) -> usize {
+        self.upvals.capacity()
+    }
+}
+
+impl MarkAndSweepGcOps for RsClosure {}
+
 #[derive(Clone, Copy, Default)]
 pub enum LValue {
     #[default]
@@ -294,32 +386,21 @@ pub enum LValue {
     RsFn(RsFunc),               // light rs function
     String(Gc<StrImpl>),        // lua immutable string
     Table(Gc<TableImpl>),       // lua table
-    Function(Gc<Proto>),        // lua function
-    UserData(Gc<UserDataImpl>), // light rs user data, managed by lua
+    Function(Gc<LClosure>),     // lua function
+    RsCll(Gc<RsClosure>),       // rust closure
+    UserData(Gc<UserDataImpl>), // user data, managed by lua
 }
 
-impl TypeTag for StrImpl {
-    fn tagid() -> Tag {
-        0
-    }
+impl TypeTag for LClosure {
+    const TAGID: Tag = Tag::LuaClosure;
 }
 
-impl TypeTag for TableImpl {
-    fn tagid() -> Tag {
-        1
-    }
-}
-
-impl TypeTag for Proto {
-    fn tagid() -> Tag {
-        2
-    }
+impl TypeTag for RsClosure {
+    const TAGID: Tag = Tag::RsClosure;
 }
 
 impl TypeTag for UserDataImpl {
-    fn tagid() -> Tag {
-        3
-    }
+    const TAGID: Tag = Tag::UserData;
 }
 
 impl HeapMemUsed for LValue {
@@ -333,6 +414,7 @@ impl HeapMemUsed for LValue {
             LValue::String(sw) => sw.heap_mem_used(),
             LValue::Table(tb) => tb.heap_mem_used(),
             LValue::Function(p) => p.heap_mem_used(),
+            LValue::RsCll(c) => c.heap_mem_used(),
             LValue::UserData(ud) => ud.heap_mem_used(),
         }
     }
@@ -344,6 +426,7 @@ impl MarkAndSweepGcOps for LValue {
             LValue::String(s) => s.mark_newborned(white),
             LValue::Table(t) => t.mark_newborned(white),
             LValue::Function(f) => f.mark_newborned(white),
+            LValue::RsCll(c) => c.mark_newborned(white),
             LValue::UserData(ud) => ud.mark_newborned(white),
             _ => {}
         }
@@ -354,6 +437,7 @@ impl MarkAndSweepGcOps for LValue {
             LValue::String(s) => s.mark_reachable(),
             LValue::Table(t) => t.mark_reachable(),
             LValue::Function(f) => f.mark_reachable(),
+            LValue::RsCll(c) => c.mark_reachable(),
             LValue::UserData(ud) => ud.mark_reachable(),
             _ => {}
         }
@@ -387,36 +471,70 @@ impl PartialEq for LValue {
     }
 }
 
+impl Eq for LValue {}
+
+impl PartialOrd for LValue {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        todo!()
+    }
+}
+
+impl Ord for LValue {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        std::cmp::Ordering::Less
+    }
+}
+
 impl From<TaggedBox> for LValue {
     /// See 'LValue::tagid()' method for each case
     fn from(tp: TaggedBox) -> Self {
-        use LValue::*;
+        type RsCl = self::RsClosure;
         type Udi = UserDataImpl;
+        type LC = self::LClosure;
+        use LValue::*;
         match tp.tag() {
-            s if s == StrImpl::tagid() => String(Gc::from(tp.as_mut::<WithGcHeader<StrImpl>>())),
-            t if t == TableImpl::tagid() => Table(Gc::from(tp.as_mut::<WithGcHeader<TableImpl>>())),
-            f if f == Proto::tagid() => Function(Gc::from(tp.as_mut::<WithGcHeader<Proto>>())),
-            u if u == Udi::tagid() => UserData(Gc::from(tp.as_mut::<WithGcHeader<UserDataImpl>>())),
+            StrImpl::TAGID => String(Gc::from(tp.as_mut::<WithGcHeader<StrImpl>>())),
+            TableImpl::TAGID => Table(Gc::from(tp.as_mut::<WithGcHeader<TableImpl>>())),
+            LC::TAGID => Function(Gc::from(tp.as_mut::<WithGcHeader<LC>>())),
+            RsCl::TAGID => RsCll(Gc::from(tp.as_mut::<WithGcHeader<RsCl>>())),
+            Udi::TAGID => UserData(Gc::from(tp.as_mut::<WithGcHeader<UserDataImpl>>())),
             _ => unreachable!(),
         }
     }
 }
 
-impl AsTableKey for LValue {
-    fn as_key(&self) -> usize {
-        match *self {
-            LValue::Nil => unreachable!("index table by nil key"),
-            LValue::Bool(b) => b as usize,
-            LValue::Int(i) => i as usize,
-            LValue::Float(f) => usize::from_ne_bytes(f.to_ne_bytes()),
-            LValue::String(s) => ((s.hashid() as usize) << 32) | s.len(),
-            LValue::Table(t) => t.heap_address(),
-            LValue::Function(f) => f.heap_address(),
-            LValue::RsFn(rf) => rf as usize,
-            LValue::UserData(ud) => ud.heap_address(),
-        }
-    }
-}
+// impl AsTableKey for LValue {
+//     fn as_key(&self) -> usize {
+//
+//     }
+// }
+
+// impl Hash for LValue {
+//     fn hash<H: Hasher>(&self, state: &mut H) {
+//         match *self {
+//             LValue::Nil => unreachable!("index table by nil key"),
+//             LValue::String(s) => state.write_usize(((s.hashid() as usize) << 32) | s.len()),
+//             LValue::Table(t) => state.write_usize(t.heap_address()),
+//             LValue::Function(f) => state.write_usize(f.heap_address()),
+//             LValue::RsCll(c) => state.write_usize(c.heap_address()),
+//             LValue::UserData(ud) => state.write_usize(ud.heap_address()),
+//             LValue::RsFn(rf) => state.write_usize(rf as usize),
+//             LValue::Bool(i) => {
+//                 state.write_usize(&self as *const _ as usize);
+//                 state.write_u8(i as u8);
+//                 state.write_u8(!i as u8);
+//             }
+//             LValue::Int(i) => {
+//                 state.write_usize(&self as *const _ as usize);
+//                 state.write_i64(i);
+//             }
+//             LValue::Float(f) => {
+//                 state.write_usize(&self as *const _ as usize);
+//                 state.write(&f.to_ne_bytes());
+//             }
+//         }
+//     }
+// }
 
 impl From<bool> for LValue {
     fn from(value: bool) -> Self {
@@ -486,9 +604,15 @@ impl From<Gc<TableImpl>> for LValue {
     }
 }
 
-impl From<Gc<Proto>> for LValue {
-    fn from(value: Gc<Proto>) -> Self {
+impl From<Gc<LClosure>> for LValue {
+    fn from(value: Gc<LClosure>) -> Self {
         LValue::Function(value)
+    }
+}
+
+impl From<Gc<RsClosure>> for LValue {
+    fn from(value: Gc<RsClosure>) -> Self {
+        LValue::RsCll(value)
     }
 }
 
@@ -502,10 +626,10 @@ impl TryInto<TaggedBox> for LValue {
     type Error = ();
     fn try_into(self) -> Result<TaggedBox, Self::Error> {
         match self {
-            LValue::String(s) => Ok(TaggedBox::new(StrImpl::tagid(), s.heap_address())),
-            LValue::Table(t) => Ok(TaggedBox::new(TableImpl::tagid(), t.heap_address())),
-            LValue::Function(f) => Ok(TaggedBox::new(Proto::tagid(), f.heap_address())),
-            LValue::UserData(u) => Ok(TaggedBox::new(UserDataImpl::tagid(), u.heap_address())),
+            LValue::String(s) => Ok(TaggedBox::new(StrImpl::TAGID, s.heap_address())),
+            LValue::Table(t) => Ok(TaggedBox::new(TableImpl::TAGID, t.heap_address())),
+            LValue::Function(f) => Ok(TaggedBox::new(LClosure::TAGID, f.heap_address())),
+            LValue::UserData(u) => Ok(TaggedBox::new(UserDataImpl::TAGID, u.heap_address())),
             _ => Err(()),
         }
     }
@@ -527,7 +651,8 @@ impl Display for LValue {
             Float(fl) => write!(f, "{}", fl),
             String(s) => f.write_str(s.as_str()),
             Table(t) => write!(f, "table: 0x{:X}", t.heap_address()),
-            Function(func) => write!(f, "function: 0x{:X}", { func.heap_address() }),
+            Function(func) => write!(f, "function: 0x{:X}", func.heap_address()),
+            RsCll(c) => write!(f, "function: 0x{:X}", c.heap_address()),
             RsFn(rsf) => write!(f, "rsfn: 0x{:X}", rsf as *const _ as usize),
             UserData(ud) => write!(f, "userdata: 0x{:X}", ud.heap_address()),
         }
@@ -540,7 +665,7 @@ impl LValue {
         use LValue::*;
         match self {
             Nil | Bool(_) | Int(_) | Float(_) => false,
-            String(_) | Table(_) | Function(_) | RsFn(_) | UserData { .. } => true,
+            String(_) | Table(_) | Function(_) | RsFn(_) | RsCll(_) | UserData { .. } => true,
         }
     }
 
@@ -548,10 +673,11 @@ impl LValue {
         use LValue::*;
         match self {
             Nil | Bool(_) | Int(_) | Float(_) | RsFn(_) => None,
-            String(_) => Some(StrImpl::tagid()),
-            Table(_) => Some(TableImpl::tagid()),
-            Function(_) => Some(Proto::tagid()),
-            UserData(_) => Some(UserDataImpl::tagid()),
+            String(_) => Some(StrImpl::TAGID),
+            Table(_) => Some(TableImpl::TAGID),
+            Function(_) => Some(LClosure::TAGID),
+            RsCll(_) => Some(RsClosure::TAGID),
+            UserData(_) => Some(UserDataImpl::TAGID),
         }
     }
 
@@ -654,7 +780,9 @@ impl LValue {
     }
 }
 
-mod size_check {
+mod test {
+    use crate::heap::Tag;
+
     #[test]
     fn value_size_check() {
         use super::LValue;
@@ -662,31 +790,28 @@ mod size_check {
 
         assert_eq!(size_of::<LValue>(), 16);
     }
-}
-
-mod test {
 
     #[test]
     fn basic() {
         use super::TaggedBox;
 
-        let mut nb = TaggedBox::new(0, 0);
-        assert_eq!(nb.tag(), 0);
+        let mut nb = TaggedBox::new(Tag::String, 0);
+        assert_eq!(nb.tag(), Tag::String);
         assert_eq!(nb.payload(), 0);
 
         nb.set_payload(137);
         assert_eq!(nb.payload(), 137);
 
-        nb.set_tag(2);
-        assert_eq!(nb.tag(), 2);
+        nb.set_tag(Tag::Table);
+        assert_eq!(nb.tag(), Tag::Table);
 
         let some_u48 = 0x0000_0000_1234_1111;
         nb.set_payload(some_u48);
         assert_eq!(nb.payload(), some_u48 as u64);
 
-        assert_eq!(nb.replace_tag_with(4), 2);
-        assert_eq!(nb.replace_tag_with(255), 4);
-        assert_eq!(nb.replace_tag_with(9), 255);
+        assert_eq!(nb.replace_tag_with(Tag::String), Tag::Table);
+        assert_eq!(nb.replace_tag_with(Tag::LuaClosure), Tag::String);
+        assert_eq!(nb.replace_tag_with(Tag::RsClosure), Tag::LuaClosure);
 
         let some_u64 = 0xFFFF_0000_1234_1111_u64;
         assert_eq!(nb.replace_payload_with(some_u64 as usize), some_u48);
@@ -701,9 +826,9 @@ mod test {
         let init = 123456789_u64;
         for _ in 0..1024 {
             let heap_addr = Box::into_raw(Box::new(init));
-            let nb = TaggedBox::from_heap_ptr(1, heap_addr);
+            let nb = TaggedBox::from_heap_ptr(Tag::UserData, heap_addr);
 
-            assert_eq!(nb.tag(), 1);
+            assert_eq!(nb.tag(), Tag::UserData);
             assert_eq!(unsafe { *nb.as_ptr::<u64>() }, init);
         }
     }
@@ -716,7 +841,7 @@ mod test {
         use crate::heap::WithGcHeader;
 
         {
-            // Expected to be 32 / 64 to fill the size of cache line in 64-bit platform.
+            // Expected to be 64 to fill the size of cache line in 64-bit platform.
             const STR_IMPL_SIZE: usize = std::mem::size_of::<WithGcHeader<StrImpl>>();
             assert!(STR_IMPL_SIZE <= 64);
         }

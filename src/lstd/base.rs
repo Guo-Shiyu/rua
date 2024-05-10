@@ -2,11 +2,11 @@ use crate::{state::State, value::RsFunc, RuaErr};
 
 fn lua_print(lua: &mut State) -> Result<usize, RuaErr> {
     let n = lua.top();
-    print!("{}", lua.rget(1));
-    if n > 1 {
-        for i in 2..=n {
-            print!("\t{}", lua.rget(i));
+    for i in 1..=n {
+        if i > 1 {
+            print!("\t");
         }
+        print!("{}", lua.stk_get(i));
     }
     println!();
     Ok(0)

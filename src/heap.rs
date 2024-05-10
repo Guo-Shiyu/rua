@@ -1,5 +1,6 @@
 use std::{
     cell::Cell,
+    cmp,
     collections::{BTreeMap, BTreeSet},
     fmt::Debug,
     ops::{Deref, DerefMut},
@@ -9,7 +10,7 @@ use std::{
 use crate::{
     codegen::Proto,
     state::{mark_rootset, Rvm},
-    value::{LValue, StrHashVal, StrImpl, TableImpl, UserDataImpl},
+    value::{LClosure, LValue, RsClosure, StrHashVal, StrImpl, TableImpl, UserDataImpl},
 };
 
 /// # Tagged Ptr Layout
@@ -32,7 +33,15 @@ pub struct TaggedBox {
     repr: u64, // inner representation
 }
 
-pub type Tag = u8;
+#[derive(PartialEq, Debug)]
+pub enum Tag {
+    String = 1,
+    Table = 2,
+    Proto = 3,
+    LuaClosure = 4,
+    RsClosure = 5,
+    UserData = 6,
+}
 
 impl TaggedBox {
     const PAYLOAD_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
@@ -67,7 +76,7 @@ impl TaggedBox {
     }
 
     pub fn tag(&self) -> Tag {
-        ((self.raw_repr() & Self::TAG_MASK) >> 48) as u8
+        unsafe { std::mem::transmute(((self.raw_repr() & Self::TAG_MASK) >> 48) as u8) }
     }
 
     pub fn payload(&self) -> u64 {
@@ -111,7 +120,7 @@ impl TaggedBox {
 
 /// Method for type level
 pub trait TypeTag {
-    fn tagid() -> Tag;
+    const TAGID: Tag;
 }
 
 /// GC color, used for thr-colo mark and sweep gc
@@ -206,7 +215,7 @@ pub trait GcObject: MarkAndSweepGcOps + HeapMemUsed + TypeTag {}
 impl<T: MarkAndSweepGcOps + HeapMemUsed + TypeTag> GcObject for T {}
 
 /// Pointer type for gc managed objects
-#[derive(Debug)]
+#[derive(Debug, Hash)]
 pub struct Gc<T: GcObject> {
     ptr: NonNull<WithGcHeader<T>>,
 }
@@ -219,6 +228,14 @@ impl<T: GcObject> Clone for Gc<T> {
 }
 
 impl<T: GcObject> Copy for Gc<T> {}
+
+impl<T: GcObject> PartialEq for Gc<T> {
+    fn eq(&self, other: &Self) -> bool {
+        todo!()
+    }
+}
+
+impl<T: GcObject> Eq for Gc<T> {}
 
 impl<T: GcObject> Deref for Gc<T> {
     type Target = T;
@@ -258,7 +275,7 @@ impl<T: GcObject> From<T> for Gc<T> {
 
 impl<T: GcObject> From<Gc<T>> for TaggedBox {
     fn from(val: Gc<T>) -> Self {
-        TaggedBox::from_heap_ptr(T::tagid(), val.ptr.as_ptr())
+        TaggedBox::from_heap_ptr(T::TAGID, val.ptr.as_ptr())
     }
 }
 
@@ -278,17 +295,17 @@ impl<T: GcObject> HeapMemUsed for Gc<T> {
     }
 }
 
-impl PartialEq for Gc<StrImpl> {
-    fn eq(&self, r: &Self) -> bool {
-        // NOTE & TODO:
-        // Gen hashid with a random seed to prevent hash collision attck
-        if self.heap_address() == r.heap_address() {
-            true
-        } else {
-            unsafe { self.ptr.as_ref().inner == r.ptr.as_ref().inner }
-        }
-    }
-}
+// impl PartialEq for Gc<StrImpl> {
+//     fn eq(&self, r: &Self) -> bool {
+//         // NOTE & TODO:
+//         // Gen hashid with a random seed to prevent hash collision attck
+//         if self.heap_address() == r.heap_address() {
+//             true
+//         } else {
+//             unsafe { self.ptr.as_ref().inner == r.ptr.as_ref().inner }
+//         }
+//     }
+// }
 
 impl<T: GcObject> Gc<T> {
     pub fn take(mut val: Gc<T>) -> Box<WithGcHeader<T>> {
@@ -360,33 +377,6 @@ impl From<GcStage> for usize {
             Sweep => 2,
             Finalize => 3,
         }
-    }
-}
-
-#[repr(u8)]
-#[derive(Debug, Clone, Copy)]
-enum ManagedObjKind {
-    Str,
-    Table,
-    Function,
-    UserData,
-}
-
-impl From<ManagedObjKind> for Tag {
-    fn from(val: ManagedObjKind) -> Self {
-        val as u8
-    }
-}
-
-impl From<Tag> for ManagedObjKind {
-    fn from(tag: Tag) -> Self {
-        let map: [ManagedObjKind; 4] = [
-            ManagedObjKind::Str,
-            ManagedObjKind::Table,
-            ManagedObjKind::Function,
-            ManagedObjKind::UserData,
-        ];
-        map[tag as usize]
     }
 }
 
@@ -495,19 +485,30 @@ impl ManagedHeap {
     fn free_garbage(&mut self, tbox: TaggedBox) -> usize {
         // release
 
-        match tbox.tag().into() {
-            ManagedObjKind::Str => Self::drop_garbage_with::<StrImpl, _>(tbox, |s| {
+        match tbox.tag() {
+            StrImpl::TAGID => Self::drop_garbage_with::<StrImpl, _>(tbox, |s| {
                 self.sstrpool.remove(&s.hashid());
             }),
-            ManagedObjKind::Table => {
+            TableImpl::TAGID => {
                 Self::drop_garbage_with::<TableImpl, _>(tbox, |_tab| {
                     // TODO:
                     // finalize
                     // self.finalize();
                 })
             }
-            ManagedObjKind::Function => Self::drop_garbage_with::<Proto, _>(tbox, |_| {}),
-            ManagedObjKind::UserData => Self::drop_garbage_with::<UserDataImpl, _>(tbox, |_| {}),
+            LClosure::TAGID => Self::drop_garbage_with::<LClosure, _>(tbox, |_| {}),
+            RsClosure::TAGID => Self::drop_garbage_with::<LClosure, _>(tbox, |_| {}),
+            UserDataImpl::TAGID => Self::drop_garbage_with::<UserDataImpl, _>(tbox, |_| {}),
+            Proto::TAGID => {
+                // let tp = Gc::from(tbox.as_mut::<WithGcHeader<Proto>>());
+                // let used = tp.heap_mem_used();
+                // Gc::drop(tp);
+                // used
+
+                // TODO!
+                0
+            }
+            _ => unreachable!(),
         }
     }
 
@@ -609,7 +610,10 @@ impl Heap<'_> {
             LValue::Table(mut tb) => {
                 tb.delegate_to(self);
             }
-            LValue::Function(mut f) => f.delegate_to(self),
+            LValue::Function(mut f) => {
+                f.delegate_to(self);
+                f.p.delegate_to(self);
+            }
             LValue::UserData(ud) => ud.delegate_to(self),
 
             _ => {}

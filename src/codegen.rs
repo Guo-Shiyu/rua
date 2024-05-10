@@ -548,7 +548,7 @@ impl MarkAndSweepGcOps for Proto {
 }
 
 impl TypeTag for Proto {
-    const TAGID: Tag = 6;
+    const TAGID: Tag = Tag::Proto;
 }
 
 impl Display for Proto {

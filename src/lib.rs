@@ -19,7 +19,7 @@ use value::LValue;
 use crate::state::Rvm;
 
 #[derive(Debug)]
-pub enum SyntaxErrKind {
+pub enum SyntaxErr {
     // Tokenizer Error
     InvalidCharacter { ch: char },
     BadFloatRepresentation { repr: String },
@@ -36,7 +36,7 @@ pub enum SyntaxErrKind {
 
 #[derive(Debug)]
 pub struct SyntaxError {
-    pub kind: SyntaxErrKind,
+    pub kind: SyntaxErr,
     pub line: u32,
     pub column: u32,
 }
