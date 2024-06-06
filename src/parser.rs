@@ -1,41 +1,69 @@
+use crate::{ParseError, SyntaxError};
+
 use super::{
     ast::*,
-    lexer::{Lexer, LexicalError, Token},
+    lexer::{Lexer, Token},
 };
-
-#[derive(Debug)]
-pub struct SyntaxError {
-    pub reason: String,
-    pub line: u32,
-    pub column: u32,
-}
-
-impl SyntaxError {
-    fn new(state: &Parser, reason: String) -> Self {
-        SyntaxError {
-            reason,
-            line: state.lex.line(),
-            column: state.lex.column(),
-        }
-    }
-}
 
 /// An LL(2) parser for Lua 5.4       
 ///
-/// Full syntax of [Lua 5.4](https://github.com/Guo-Shiyu/luac-rs/blob/a84ea7bbcfcc05028865f2ea04cf294d94acdb40/doc/lua54%20syntax.ebnf)
-/// can be find here.
+/// Full syntax of Lua 5.4 can be find [here](https://www.lua.org/manual/5.4/manual.html#9).
 pub struct Parser<'a> {
     lex: Lexer<'a>,
     current: Token,
     ahead: Token,
 }
 
+type Error = Box<ParseError>;
+
 impl Parser<'_> {
+    /// priority table for binary operators.
+    #[rustfmt::skip]
+    const BINARY_PRIORITY: [(usize, usize); 21] = [
+        (10, 10), (10, 10),      // +  -  
+        (11, 11), (11, 11),      // *  %  
+        (14, 13),                // ^       (right associatie) 
+        (11, 11), (11, 11),      // /  //  
+        (6, 6), (4, 4), (5, 5),  // &  |  ~ 
+        (7, 7), (7, 7),          // << >> 
+        (9, 8),                  // ..      (right associatie) 
+        (3, 3), (3, 3), (3, 3),  // ==, <, <= 
+        (3, 3), (3, 3), (3, 3),  // ~=, >, >= 
+        (2, 2), (1, 1)           // and, or   
+    ];
+
+    /// All unary operator has same priority.
+    const UNARY_PRIORITY: usize = 12;
+
+    /// Parse given source string into `BasicBlock` or `Error`.  Return the root node
+    /// of source code. if no chunk name given, chunk will be named to `Block::NAMELESS_CHUNK`.
+    pub fn parse(src: &str, chunkname: Option<String>) -> Result<BasicBlock, Box<ParseError>> {
+        let mut parser = Parser {
+            lex: Lexer::new(src),
+            current: Token::Eof,
+            ahead: Token::Eof,
+        };
+
+        // init parser state to first token
+        parser.next()?;
+
+        // treat whole file as a function body
+        let mut block = parser.block()?;
+
+        debug_assert!(block.name() == Block::ANONYMOUS_CHUNK);
+        debug_assert!(parser.current.is_eof());
+        debug_assert!(parser.ahead.is_eof());
+
+        block.chunkname = chunkname;
+
+        Ok(block)
+    }
+
     /// Motivate lexer to next token and update self.current.
     /// This will clear self.ahead if self.ahead is't EOF.
-    fn next(&mut self) -> Result<(), SyntaxError> {
+    fn next(&mut self) -> Result<(), Error> {
         if let Token::Eof = self.ahead {
-            self.current = self.lex.pump().map_err(|e| self.lexerr(e))?;
+            self.current = self.lex.tokenize().map_err(|e| self.error(e))?;
         } else {
             self.current = std::mem::replace(&mut self.ahead, Token::Eof);
         }
@@ -43,15 +71,17 @@ impl Parser<'_> {
     }
 
     /// Motivate lexer to next token and update self.ahead
-    fn look_ahead(&mut self) -> Result<(), SyntaxError> {
+    fn look_ahead(&mut self) -> Result<(), Error> {
         debug_assert!(self.ahead == Token::Eof);
-        self.ahead = self.lex.pump().map_err(|e| self.lexerr(e))?;
+        self.ahead = self.lex.tokenize().map_err(|e| self.error(e))?;
         Ok(())
     }
 
+    /// ``` text
     /// block ::= {stat} [retstat]
-    fn block(&mut self) -> Result<BasicBlock, SyntaxError> {
-        const DEFAULT_BLOCK_SIZE: usize = 64;
+    /// ```
+    fn block(&mut self) -> Result<BasicBlock, Error> {
+        const DEFAULT_BLOCK_SIZE: usize = 32;
         let mut stats = Vec::with_capacity(DEFAULT_BLOCK_SIZE);
 
         let beg = self.lex.line();
@@ -60,7 +90,7 @@ impl Parser<'_> {
             while self.test_and_next(Token::Semi)? {}
 
             if self.is_block_end() {
-                stats.shrink_to(stats.len());
+                stats.shrink_to_fit();
                 break;
             }
 
@@ -88,6 +118,7 @@ impl Parser<'_> {
         )
     }
 
+    /// ``` text
     /// stat ::=  `;` |
     ///     varlist `=` explist |
     ///     functioncall |
@@ -103,12 +134,9 @@ impl Parser<'_> {
     ///     function funcname funcbody |
     ///     local function Name funcbody |
     ///     local attnamelist [`=` explist]
-    fn stmt(&mut self) -> Result<StmtNode, SyntaxError> {
-        // skip ';'
-        while self.test_and_next(Token::Semi)? {}
-
+    /// ```
+    fn stmt(&mut self) -> Result<StmtNode, Error> {
         let begin = self.lex.line();
-
         let stmt = {
             match &self.current {
                 Token::Break => {
@@ -136,57 +164,62 @@ impl Parser<'_> {
                 _ => return self.expr_stat(),
             }
         };
-
         let end = self.lex.line();
         Ok(Box::new(SrcLoc::new(stmt, (begin, end))))
     }
 
-    /// single expr as statememt|
-    fn expr_stat(&mut self) -> Result<StmtNode, SyntaxError> {
+    /// Parse single expr as statememt.
+    fn expr_stat(&mut self) -> Result<StmtNode, Error> {
         let expr = self.expr()?;
-        let (lineinfo, inner) = (expr.lineinfo, expr.into_inner());
+        let def = expr.def_info();
 
-        let stmt = if let Expr::FuncCall(call) = inner {
-            SrcLoc::new(Stmt::FuncCall(call), lineinfo)
-        } else {
-            let first = Box::new(SrcLoc::new(inner, lineinfo));
-            if self.test(Token::Comma) {
-                // multi assignment
-                let varlist = self.exprlist(Some(first))?;
-                self.check_and_next(Token::Assign)?;
-                let exprlist = self.exprlist(None)?;
-                SrcLoc::new(
-                    Stmt::Assign {
-                        vars: varlist,
-                        exprs: exprlist,
-                    },
-                    lineinfo,
-                )
-            } else if self.test_and_next(Token::Assign)? {
-                // single assignment
-                let exprlist = self.exprlist(None)?;
-                SrcLoc::new(
-                    Stmt::Assign {
-                        vars: vec![first],
-                        exprs: exprlist,
-                    },
-                    lineinfo,
-                )
-            } else {
-                // single expr as statememt
-                SrcLoc::new(Stmt::Expr(first), lineinfo)
+        let is_assignable =
+            |expr: &ExprNode| matches!(expr.inner_ref(), Expr::Ident(_) | Expr::Subscript { .. });
+
+        let stmt = if self.test(Token::Comma) {
+            // multi assignment
+            let varlist = self.exprlist(Some(expr))?;
+            self.check_and_next(Token::Assign)?;
+            if !varlist.iter().all(is_assignable) {
+                return Err(self.error(SyntaxError::BadAssignment));
             }
+            let exprlist = self.exprlist(None)?;
+            SrcLoc::new(
+                Stmt::Assign {
+                    vars: varlist,
+                    exprs: exprlist,
+                },
+                def,
+            )
+        } else if self.test_and_next(Token::Assign)? {
+            if !is_assignable(&expr) {
+                return Err(self.error(SyntaxError::BadAssignment));
+            }
+            // single assignment
+            SrcLoc::new(
+                Stmt::Assign {
+                    vars: vec![expr],
+                    exprs: self.exprlist(None)?,
+                },
+                def,
+            )
+        } else {
+            // single expr as statememt
+            SrcLoc::new(Stmt::Expr(expr), def)
         };
+
         Ok(Box::new(stmt))
     }
 
+    /// ``` text
     /// label ::= `::` Name `::`
-    fn lable(&mut self) -> Result<Stmt, SyntaxError> {
+    /// ```
+    fn lable(&mut self) -> Result<Stmt, Error> {
         self.next()?;
 
         let ret = match &mut self.current {
             Token::Ident(id) => Ok(Stmt::Lable(std::mem::take(id))),
-            _ => Err(self.unexpected("::")),
+            _ => Err(self.unexpected(&[Token::Follow])),
         };
         if ret.is_ok() {
             self.next()?; // skip lable
@@ -195,27 +228,33 @@ impl Parser<'_> {
         ret
     }
 
+    /// ``` text
     /// goto ::= `goto` Name
-    fn goto(&mut self) -> Result<Stmt, SyntaxError> {
+    /// ```
+    fn goto(&mut self) -> Result<Stmt, Error> {
         self.next()?; // skip `goto`
 
         if let Token::Ident(lable) = &mut self.current {
             Ok(Stmt::Goto(std::mem::take(lable)))
         } else {
-            Err(self.unexpected("identifier"))
+            Err(self.unexpected(&[id()]))
         }
     }
 
+    /// ``` text
     /// do ::= `do` block `end`
-    fn do_end(&mut self) -> Result<Stmt, SyntaxError> {
+    /// ```
+    fn do_end(&mut self) -> Result<Stmt, Error> {
         self.next()?; // skip 'do'
         let block = self.block()?;
         self.test_and_next(Token::End)?;
         Ok(Stmt::DoEnd(block))
     }
 
+    /// ``` text
     /// while ::= `while` exp `do` block `end`
-    fn while_do(&mut self) -> Result<Stmt, SyntaxError> {
+    /// ```
+    fn while_do(&mut self) -> Result<Stmt, Error> {
         self.next()?; // skip 'while'
         let exp = self.expr()?;
         self.check_and_next(Token::Do)?;
@@ -225,8 +264,10 @@ impl Parser<'_> {
         Ok(Stmt::While { exp, block })
     }
 
+    /// ``` text
     /// repeat ::= `repeat` block `until` exp
-    fn repeat_until(&mut self) -> Result<Stmt, SyntaxError> {
+    /// ```
+    fn repeat_until(&mut self) -> Result<Stmt, Error> {
         // debug_assert!(self.ahead == Token::Repeat);
         self.next()?;
         let block = self.block()?;
@@ -237,8 +278,10 @@ impl Parser<'_> {
         Ok(Stmt::Repeat { block, exp })
     }
 
+    /// ``` text
     /// if ::= `if` exp `then` block {`elseif` exp `then` block} [`else` block] `end`
-    fn if_else(&mut self) -> Result<Stmt, SyntaxError> {
+    /// ```
+    fn if_else(&mut self) -> Result<Stmt, Error> {
         self.next()?; // skip 'if'
         let cond = self.expr()?;
         self.check_and_next(Token::Then)?;
@@ -284,30 +327,34 @@ impl Parser<'_> {
         }
     }
 
+    /// ``` text
     /// numerical_for ::= `for` Name `=` exp `,` exp [`,` exp] `do` block `end`
     /// generic_for ::= `for` namelist `in` explist `do` block `end`
-    fn for_stmt(&mut self) -> Result<Stmt, SyntaxError> {
+    /// ```
+    fn for_stmt(&mut self) -> Result<Stmt, Error> {
         self.next()?; // skip `for`
 
         let iter = if let Token::Ident(first) = &mut self.current {
             let line = self.lex.line();
             SrcLoc::new(std::mem::take(first), (line, line))
         } else {
-            return Err(self.unexpected("identifier"));
+            return Err(self.unexpected(&[id()]));
         };
 
         self.next()?;
         let stmt = match &self.current {
             Token::Comma | Token::In => self.generic_for(iter)?,
             Token::Assign => self.numeric_for(iter)?,
-            _ => return Err(self.unexpected("'=' or ','")),
+            _ => return Err(self.unexpected(&[Token::Eq, Token::Comma])),
         };
 
         Ok(stmt)
     }
 
+    /// ``` text
     /// generic_for ::= `for` namelist `in` explist `do` block `end`    
-    fn generic_for(&mut self, iter: SrcLoc<String>) -> Result<Stmt, SyntaxError> {
+    /// ```
+    fn generic_for(&mut self, iter: SrcLoc<String>) -> Result<Stmt, Error> {
         // "for k, v in ..." is most common senario
         let mut iters = Vec::with_capacity(2);
         iters.push(iter);
@@ -321,7 +368,7 @@ impl Parser<'_> {
                 }
                 Token::Comma => self.next()?,
                 Token::In => break,
-                _ => return Err(self.unexpected("identifier or 'in'")),
+                _ => return Err(self.unexpected(&[id(), Token::In])),
             }
         }
         self.check_and_next(Token::In)?;
@@ -344,8 +391,10 @@ impl Parser<'_> {
         })))
     }
 
+    /// ``` text
     /// numerical_for ::= `for` Name `=` exp `,` exp [`,` exp] `do` block `end`
-    fn numeric_for(&mut self, iter: SrcLoc<String>) -> Result<Stmt, SyntaxError> {
+    /// ```
+    fn numeric_for(&mut self, iter: SrcLoc<String>) -> Result<Stmt, Error> {
         self.next()?;
         let init = self.expr()?;
         self.check_and_next(Token::Comma)?;
@@ -372,28 +421,45 @@ impl Parser<'_> {
         })))
     }
 
-    /// function ::= `function` funcname funcbody
-    /// funcname ::= Name {`.` Name} [`:` Name]
-    fn global_fndef(&mut self) -> Result<Stmt, SyntaxError> {
+    /// function ::= `function` funcname funcbody   
+    /// funcname ::= Name {`.` Name} [`:` Name]    
+    ///
+    /// global function defination will be parsed as local
+    fn global_fndef(&mut self) -> Result<Stmt, Error> {
         self.next()?; // skip `function`
-        let (pres, method) = self.func_name()?;
+        let (mut pres, method) = self.func_name()?;
         let beg = self.lex.line();
-        let body = self.func_body()?;
+        let mut body = self.func_body()?;
         let end = self.lex.line();
-        Ok(Stmt::FnDef {
-            pres,
-            method,
-            body: Box::new(SrcLoc::new(body, (beg, end))),
-        })
+
+        if let Some(mtd) = method {
+            body.params.namelist.insert(0, "self".to_string());
+            pres = SrcLoc::new(
+                Expr::Subscript {
+                    prefix: Box::new(pres),
+                    key: Box::new(mtd.map(Expr::Ident)),
+                },
+                (beg, beg),
+            )
+        }
+
+        let lambda = SrcLoc::new(Expr::Lambda(body), (beg, end));
+        let stmt = Stmt::Assign {
+            vars: vec![Box::new(pres)],
+            exprs: vec![Box::new(lambda)],
+        };
+        Ok(stmt)
     }
 
+    /// ``` text
     /// local_function ::= `local` `function` Name funcbody
-    fn local_fndef(&mut self) -> Result<Stmt, SyntaxError> {
+    /// ```
+    fn local_fndef(&mut self) -> Result<Stmt, Error> {
         let func_name = if let Token::Ident(name) = &mut self.current {
             let line = self.lex.line();
             SrcLoc::new(std::mem::take(name), (line, line))
         } else {
-            return Err(self.unexpected("identifier"));
+            return Err(self.unexpected(&[id()]));
         };
 
         self.next()?; // eat func name
@@ -401,21 +467,23 @@ impl Parser<'_> {
         let beg = self.lex.line();
         let fndef = self.func_body()?;
         let end = self.lex.line();
-        let fndef = SrcLoc::new(Expr::FuncDefine(fndef), (beg, end));
+        let fndef = SrcLoc::new(Expr::Lambda(fndef), (beg, end));
         Ok(Stmt::LocalVarDecl {
             names: vec![(func_name, None)],
             exprs: vec![Box::new(fndef)],
         })
     }
 
+    /// ``` text
     /// local_assign ::= `local` attnamelist [`=` explist]
     /// attnamelist ::=  Name attr {`,` Name attr }
-    fn local_assign(&mut self) -> Result<Stmt, SyntaxError> {
+    /// ```
+    fn local_assign(&mut self) -> Result<Stmt, Error> {
         let mut names = Vec::with_capacity(4);
         loop {
             let line = self.lex.line();
-            if let Token::Ident(id) = &mut self.current {
-                let name = SrcLoc::new(std::mem::take(id), (line, line));
+            if let Token::Ident(ident) = &mut self.current {
+                let name = SrcLoc::new(std::mem::take(ident), (line, line));
                 self.next()?;
 
                 // optional attribute
@@ -424,13 +492,17 @@ impl Parser<'_> {
                     if let Token::Ident(attrid) = &mut self.current {
                         std::mem::swap(attrid, &mut attr_holder);
                     } else {
-                        return Err(self.unexpected("attribute"));
+                        return Err(self.unexpected(&[id()]));
                     };
 
                     let attr = match attr_holder.as_str() {
                         "const" => Some(Attribute::Const),
                         "close" => Some(Attribute::Close),
-                        other => return Err(self.error(format!("invalid attribute '{}'", other))),
+                        other => {
+                            return Err(self.error(SyntaxError::InvalidAttribute {
+                                attr: other.to_string(),
+                            }))
+                        }
                     };
 
                     self.next()?; // skip attribute
@@ -461,10 +533,10 @@ impl Parser<'_> {
         Ok(Stmt::LocalVarDecl { names, exprs })
     }
 
+    /// ``` text
     /// funcname ::= Name {`.` Name} [`:` Name]
-    fn func_name(
-        &mut self,
-    ) -> Result<(Vec<SrcLoc<String>>, Option<Box<SrcLoc<String>>>), SyntaxError> {
+    /// ```
+    fn func_name(&mut self) -> Result<(SrcLoc<Expr>, Option<SrcLoc<String>>), Error> {
         const DOT: bool = true;
         const COLON: bool = false;
         let mut pres = Vec::with_capacity(4);
@@ -501,11 +573,28 @@ impl Parser<'_> {
             }
         }
 
-        Ok((pres, method.map(Box::new)))
+        debug_assert!(!pres.is_empty());
+        pres.push(SrcLoc::new(String::new(), (0, 0)));
+        let first = pres.swap_remove(0).map(Expr::Ident);
+        let prefix = pres.into_iter().skip(1).fold(first, |acc, ident| {
+            let def = acc.def_info();
+            let key = ident.map(Expr::Ident);
+            SrcLoc::new(
+                Expr::Subscript {
+                    prefix: Box::new(acc),
+                    key: Box::new(key),
+                },
+                def,
+            )
+        });
+
+        Ok((prefix, method))
     }
 
+    /// ``` text
     /// funcbody ::= `(` [parlist] `)` block `end`
-    fn func_body(&mut self) -> Result<FuncBody, SyntaxError> {
+    /// ```
+    fn func_body(&mut self) -> Result<FuncBody, Error> {
         self.check_and_next(Token::LP)?;
         let params = self.param_list()?;
         self.check_and_next(Token::RP)?;
@@ -514,13 +603,57 @@ impl Parser<'_> {
         Ok(FuncBody { params, body })
     }
 
+    /// ``` text
     /// paralist ::= namelist [`,` `...`] | `...`
     /// namelist ::= Name {`,` Name}
-    fn param_list(&mut self) -> Result<ParaList, SyntaxError> {
+    /// ```
+    fn param_list(&mut self) -> Result<ParameterList, Error> {
         let mut vargs = false;
 
         if let Token::RP = self.current {
-            return Ok(ParaList {
+            return Ok(ParameterList {
+                vargs,
+                namelist: vec![],
+            });
+        }
+
+        let mut namelist = Vec::with_capacity(4);
+        loop {
+            match &mut self.current {
+                Token::Dots => {
+                    vargs = true;
+                    self.next()?;
+                }
+
+                Token::Ident(id) => {
+                    namelist.push(std::mem::take(id));
+                    self.next()?;
+                }
+
+                Token::Comma => {
+                    self.next()?;
+                }
+
+                Token::RP => {
+                    break;
+                }
+
+                _ => {
+                    return Err(self.unexpected(&[Token::Dots, Token::RP]));
+                }
+            }
+        }
+
+        Ok(ParameterList { vargs, namelist })
+    }
+
+    /// paralist ::= namelist [`,` `...`] | `...`
+    /// namelist ::= exp {`,` exp}
+    fn argument_list(&mut self) -> Result<ArgumentList, Error> {
+        let mut vargs = false;
+
+        if let Token::RP = self.current {
+            return Ok(ArgumentList {
                 vargs,
                 namelist: vec![],
             });
@@ -537,21 +670,20 @@ impl Parser<'_> {
             Token::RP => {}
 
             _ => {
-                return Err(self.error(format!(
-                    "'...' or ')' are expected but {:?} was found",
-                    self.current
-                )))
+                return Err(self.unexpected(&[Token::Dots, Token::RP]));
             }
         };
 
-        Ok(ParaList {
+        Ok(ArgumentList {
             vargs,
             namelist: paras,
         })
     }
 
+    /// ``` text
     /// retstat ::= return [explist] [`;`]
-    fn return_stmt(&mut self) -> Result<Option<Vec<ExprNode>>, SyntaxError> {
+    /// ```
+    fn return_stmt(&mut self) -> Result<Option<Vec<ExprNode>>, Error> {
         if self.is_block_end() || self.test_and_next(Token::Semi)? {
             Ok(None)
         } else {
@@ -561,27 +693,7 @@ impl Parser<'_> {
         }
     }
 
-    /// priority table for binary operators
-    #[rustfmt::skip]
-    const BINARY_PRIORITY: [(usize, usize); 21] = [
-        (10, 10), (10, 10),      /* + -  */
-        (11, 11), (11, 11),      /* * %  */
-        (14, 13),                /* ^ (right associatie) */
-        (11, 11), (11, 11),      /* / //  */
-        (6, 6), (4, 4), (5, 5),  /* & | ~ */
-        (7, 7), (7, 7),          /* << >> */
-        (9, 8),                  /* .. (right associatie) */
-        (3, 3), (3, 3), (3, 3),  /* ==, <, <= */
-        (3, 3), (3, 3), (3, 3),  /* ~=, >, >= */
-        (2, 2), (1, 1)           /* and, or   */
-    ];
-
-    const UNARY_PRIORITY: usize = 12;
-
-    fn expr(&mut self) -> Result<ExprNode, SyntaxError> {
-        self.subexpr(0)
-    }
-
+    /// ``` text
     /// exp ::=  `nil` |
     ///  `false` |
     ///  `true` |
@@ -593,7 +705,12 @@ impl Parser<'_> {
     ///  tablector |
     ///  exp binop exp |
     ///  unop exp
-    fn subexpr(&mut self, limit: usize) -> Result<ExprNode, SyntaxError> {
+    /// ```
+    fn expr(&mut self) -> Result<ExprNode, Error> {
+        self.subexpr(0)
+    }
+
+    fn subexpr(&mut self, limit: usize) -> Result<ExprNode, Error> {
         let begin = self.lex.line();
         let mut lhs = if let Some(uniop) = self.unary_op() {
             self.next()?;
@@ -634,9 +751,11 @@ impl Parser<'_> {
         Ok(lhs)
     }
 
+    /// ``` text
     /// simpleexp -> Float | Int | String | Nil | `true` | `false` | `...` |
     ///             Constructor | `function` funcbody | suffixedexp
-    fn simple_expr(&mut self) -> Result<ExprNode, SyntaxError> {
+    /// ```
+    fn simple_expr(&mut self) -> Result<ExprNode, Error> {
         if let Some(exp) = match &mut self.current {
             Token::Nil => Some(Expr::Nil),
             Token::False => Some(Expr::False),
@@ -658,7 +777,7 @@ impl Parser<'_> {
                 let beg = self.lex.line();
                 let body = self.func_body()?;
                 let end = self.lex.line();
-                Ok(Box::new(SrcLoc::new(Expr::FuncDefine(body), (beg, end))))
+                Ok(Box::new(SrcLoc::new(Expr::Lambda(body), (beg, end))))
             }
             Token::LB => Ok(self.table_constructor()?),
 
@@ -703,8 +822,10 @@ impl Parser<'_> {
         }
     }
 
+    /// ``` text
     /// exprlist ::= expr {`,` expr}
-    fn exprlist(&mut self, first: Option<ExprNode>) -> Result<Vec<ExprNode>, SyntaxError> {
+    /// ```
+    fn exprlist(&mut self, first: Option<ExprNode>) -> Result<Vec<ExprNode>, Error> {
         let mut exprs = Vec::with_capacity(4);
         if let Some(first) = first {
             exprs.push(first);
@@ -720,10 +841,12 @@ impl Parser<'_> {
         }
     }
 
+    /// ``` text
     /// tablector ::= `{` [fieldlist] `}`
     /// fieldlist ::= field {fieldsep field} [fieldsep]
     /// fieldsep ::= `,` | `;`
-    fn table_constructor(&mut self) -> Result<ExprNode, SyntaxError> {
+    /// ```
+    fn table_constructor(&mut self) -> Result<ExprNode, Error> {
         self.next()?; // skip '{'
         let beg = self.lex.line();
         let mut fieldlist = Vec::with_capacity(4);
@@ -743,8 +866,10 @@ impl Parser<'_> {
         )))
     }
 
+    /// ``` text
     /// field ::= `[` exp `]` `=` exp | Name `=` exp | exp
-    fn field(&mut self) -> Result<Field, SyntaxError> {
+    /// ```
+    fn field(&mut self) -> Result<Field, Error> {
         let mut holder = String::new();
         match &mut self.current {
             // `[` expr `]` `=` expr
@@ -753,7 +878,7 @@ impl Parser<'_> {
                 let key = self.expr()?;
                 self.check_and_next(Token::RS)?;
                 self.check_and_next(Token::Assign)?;
-                return Ok(Field::new(Some(Box::new(key)), Box::new(self.expr()?)));
+                return Ok(Field::new(Some(key), self.expr()?));
             }
 
             Token::Ident(key) => {
@@ -761,7 +886,7 @@ impl Parser<'_> {
             }
 
             // expr
-            _ => return Ok(Field::new(None, Box::new(self.expr()?))),
+            _ => return Ok(Field::new(None, self.expr()?)),
         };
 
         self.look_ahead()?;
@@ -771,15 +896,17 @@ impl Parser<'_> {
             self.next()?; // skip '='
             let line = self.lex.line();
             let expr = Box::new(SrcLoc::new(Expr::Ident(holder), (line, line)));
-            Ok(Field::new(Some(Box::new(expr)), Box::new(self.expr()?)))
+            Ok(Field::new(Some(expr), self.expr()?))
         } else {
             // expr
-            Ok(Field::new(None, Box::new(self.expr()?)))
+            Ok(Field::new(None, self.expr()?))
         }
     }
 
+    /// ``` text
     /// primaryexp ::= NAME | '(' expr ')'
-    fn primary_expr(&mut self) -> Result<ExprNode, SyntaxError> {
+    /// ```
+    fn primary_expr(&mut self) -> Result<ExprNode, Error> {
         let mut holder = String::new();
         match &mut self.current {
             Token::Ident(name) => {
@@ -793,7 +920,7 @@ impl Parser<'_> {
                 return Ok(exp);
             }
 
-            _ => return Err(self.unexpected("identifier or '('")),
+            _ => return Err(self.unexpected(&[id(), Token::LP])),
         };
 
         let begin = self.lex.line();
@@ -804,9 +931,11 @@ impl Parser<'_> {
         )))
     }
 
+    /// ``` text
     /// suffixedexp ->
     ///      primaryexp { '.' NAME | '[' exp ']' | ':' NAME funcargs | funcargs }
-    fn suffixed_expr(&mut self) -> Result<ExprNode, SyntaxError> {
+    /// ```
+    fn suffixed_expr(&mut self) -> Result<ExprNode, Error> {
         let mut prefix = self.primary_expr()?;
 
         loop {
@@ -818,14 +947,14 @@ impl Parser<'_> {
                     if let Token::Ident(id) = &mut self.current {
                         std::mem::swap(id, &mut holder);
                     } else {
-                        return Err(self.unexpected("identifier"));
+                        return Err(self.unexpected(&[id()]));
                     };
 
                     let attr = Expr::Literal(holder);
                     let curln = self.lex.line();
                     let key = Box::new(SrcLoc::new(attr, (curln, curln)));
                     self.next()?;
-                    SrcLoc::new(Expr::Index { prefix, key }, (begin, self.lex.line()))
+                    SrcLoc::new(Expr::Subscript { prefix, key }, (begin, self.lex.line()))
                 }
 
                 Token::LS => {
@@ -833,7 +962,7 @@ impl Parser<'_> {
                     let key = self.expr()?;
                     self.check_and_next(Token::RS)?;
 
-                    SrcLoc::new(Expr::Index { prefix, key }, (begin, self.lex.line()))
+                    SrcLoc::new(Expr::Subscript { prefix, key }, (begin, self.lex.line()))
                 }
 
                 // method call
@@ -844,7 +973,7 @@ impl Parser<'_> {
                     if let Token::Ident(method) = &mut self.current {
                         std::mem::swap(method, &mut holder);
                     } else {
-                        return Err(self.unexpected("identifier"));
+                        return Err(self.unexpected(&[id()]));
                     };
 
                     self.next()?; // skip name
@@ -875,14 +1004,16 @@ impl Parser<'_> {
         }
     }
 
+    /// ``` text
     /// args ::=  `(` [explist] `)` | tablector | LiteralString
-    fn func_args(&mut self) -> Result<SrcLoc<ParaList>, SyntaxError> {
+    /// ```
+    fn func_args(&mut self) -> Result<SrcLoc<ArgumentList>, Error> {
         let beg = self.lex.line();
         let mut holder = String::new();
         match &mut self.current {
             Token::LP => {
                 self.next()?; // skip '('
-                let args = self.param_list()?;
+                let args = self.argument_list()?;
                 self.check_and_next(Token::RP)?;
                 Ok(SrcLoc::new(args, (beg, self.lex.line())))
             }
@@ -890,7 +1021,7 @@ impl Parser<'_> {
             Token::LB => {
                 let table = self.table_constructor()?;
                 Ok(SrcLoc::new(
-                    ParaList {
+                    ArgumentList {
                         vargs: false,
                         namelist: vec![table],
                     },
@@ -906,7 +1037,7 @@ impl Parser<'_> {
                 self.next()?; // skip string literal
 
                 Ok(SrcLoc::new(
-                    ParaList {
+                    ArgumentList {
                         vargs: false,
                         namelist: vec![litnode],
                     },
@@ -914,7 +1045,7 @@ impl Parser<'_> {
                 ))
             }
 
-            _ => Err(self.unexpected("function arguments")),
+            _ => Err(self.unexpected(&[Token::LP, Token::LB, Token::Literal(String::new())])),
         }
     }
 
@@ -922,17 +1053,17 @@ impl Parser<'_> {
         self.current == expect
     }
 
-    fn check(&self, expect: Token) -> Result<(), SyntaxError> {
+    fn check(&self, expect: Token) -> Result<(), Error> {
         // this `clone()` will never deep clone a String object, it's always cheap
         if self.test(expect.clone()) {
             Ok(())
         } else {
-            Err(self.unexpected(format!("{:?}", expect).as_str()))
+            Err(self.unexpected(&[expect]))
         }
     }
 
     /// Perhaps self.ahead is equal to expect, if true, call `next`
-    fn test_and_next(&mut self, expect: Token) -> Result<bool, SyntaxError> {
+    fn test_and_next(&mut self, expect: Token) -> Result<bool, Error> {
         if self.test(expect) {
             self.next()?;
             Ok(true)
@@ -942,56 +1073,37 @@ impl Parser<'_> {
     }
 
     /// Must that self.ahead is equal to expect, if true, call next
-    fn check_and_next(&mut self, expect: Token) -> Result<(), SyntaxError> {
+    fn check_and_next(&mut self, expect: Token) -> Result<(), Error> {
         self.check(expect)?;
         self.next()
     }
 }
 
 impl Parser<'_> {
-    fn error(&self, r: String) -> SyntaxError {
-        SyntaxError::new(self, r)
+    fn error(&self, e: SyntaxError) -> Error {
+        Box::new(ParseError {
+            kind: e,
+            line: self.lex.line(),
+            column: self.lex.column(),
+        })
     }
 
-    fn unexpected(&self, expect: &str) -> SyntaxError {
-        self.error(format!(
-            "Unexpected symbol, {expect} is expected but {:?} was found",
-            self.current
-        ))
-    }
-
-    fn lexerr(&self, le: LexicalError) -> SyntaxError {
-        self.error(le.reason)
+    fn unexpected(&self, expect: &[Token]) -> Error {
+        self.error(SyntaxError::UnexpectedToken {
+            expect: Vec::from(expect),
+            found: self.current.clone(),
+        })
     }
 }
 
-impl Parser<'_> {
-    pub fn parse(src: &str, chunkname: Option<String>) -> Result<BasicBlock, SyntaxError> {
-        let mut parser = Parser {
-            lex: Lexer::new(src),
-            current: Token::Eof,
-            ahead: Token::Eof,
-        };
-
-        // init parser state to first token
-        parser.next()?;
-
-        // parse statements
-        let mut block = parser.block()?;
-
-        debug_assert!(block.chunk.as_str() == Block::NAMELESS_CHUNK);
-        debug_assert!(parser.current.is_eof());
-        debug_assert!(parser.ahead.is_eof());
-
-        if let Some(cn) = chunkname {
-            block.chunk = cn;
-        }
-        Ok(block)
-    }
+/// Make an empty token for error report.
+fn id() -> Token {
+    Token::Ident(String::new())
 }
 
 mod test {
     #[test]
+    /// parse all file in path matched pattern "/test/*.lua" .
     fn parser_all_tests() {
         use super::Parser;
 
