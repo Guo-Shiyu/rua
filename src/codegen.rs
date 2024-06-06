@@ -1177,8 +1177,7 @@ impl CodeGen {
             let _ = std::mem::replace(&mut res.updecl, {
                 let mut vec = Vec::with_capacity(1);
                 vec.push(UpvalDecl::Env);
-                vec.shrink_to_fit();
-                vec.into()
+                vec.into_boxed_slice()
             });
         }
 
@@ -1251,10 +1250,8 @@ impl CodeGen {
         // Check <close> variable and generate CLOSE instruction
         // Check <const> variable
 
-        fn shrink<T>(elem: &mut Vec<T>) -> Box<[T]> {
-            let mut res = std::mem::take(elem);
-            res.shrink_to_fit();
-            res.into_boxed_slice()
+        fn steal<T>(elem: &mut Vec<T>) -> Box<[T]> {
+            std::mem::take(elem).into_boxed_slice()
         }
 
         let res = Proto {
@@ -1264,11 +1261,11 @@ impl CodeGen {
             begline: self.absline.first().copied().unwrap_or(0),
             endline: self.absline.last().copied().unwrap_or(0),
             source: self.srcfile,
-            kst: shrink(&mut self.ksts),
-            code: shrink(&mut self.code),
-            pcline: shrink(&mut self.absline),
-            locvars: shrink(&mut self.local),
-            updecl: shrink(&mut self.upvals),
+            kst: steal(&mut self.ksts),
+            code: steal(&mut self.code),
+            pcline: steal(&mut self.absline),
+            locvars: steal(&mut self.local),
+            updecl: steal(&mut self.upvals),
             subfn: std::mem::take(&mut self.subproto)
                 .into_iter()
                 .map(Gc::from)
@@ -2637,10 +2634,6 @@ impl ChunkDumper {
             }
         }
 
-        kst.shrink_to_fit();
-        code.shrink_to_fit();
-        subfn.shrink_to_fit();
-        ups.shrink_to_fit();
         Ok(Proto {
             vararg: is_vararg,
             nparam,
