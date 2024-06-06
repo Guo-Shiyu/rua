@@ -3,7 +3,6 @@ pub mod codegen;
 pub mod ffi;
 pub mod heap;
 pub mod lexer;
-pub mod luastd;
 pub mod parser;
 pub mod passes;
 pub mod state;

@@ -11,7 +11,7 @@ use std::{
 use crate::{
     ast::Block,
     codegen::{ChunkDumper, CodeGen, Instruction, OpCode, OpMode, Proto, UpvalDecl},
-    ffi::Stdlib,
+    ffi::{self, Stdlib},
     heap::{Gc, GcOp, Heap, LuaClosure, MetaOperator, Table, Tag, UpVal},
     parser::Parser,
     passes,
@@ -355,11 +355,10 @@ impl VM {
         vm
     }
 
-    pub fn open(&mut self, lib: Stdlib) {
-        let entrys = crate::ffi::get_std_libs(lib);
-        for (name, func) in entrys.iter() {
-            let fkey = self.new_str(name);
-            self.set_global(fkey, Value::from(*func));
+    pub fn open(&mut self, lib: Stdlib) -> usize {
+        let mut nfunc = 0;
+        for entry in crate::ffi::get_std_libs(lib) {
+            nfunc += ffi::open_lib(self, entry);
         }
 
         // create string about meta operators lazily
@@ -371,6 +370,8 @@ impl VM {
                 self.new_fixed(builtin);
             }
         }
+
+        nfunc as usize
     }
 
     pub fn open_libs(&mut self, libs: &[Stdlib]) {
@@ -383,8 +384,11 @@ impl VM {
         self.global.into()
     }
 
-    pub fn set_global(&mut self, key: Value, val: Value) -> Option<Value> {
-        self.global.insert(key, val)
+    pub fn set_global<V>(&mut self, key: Value, val: V) -> Option<Value>
+    where
+        V: Into<Value>,
+    {
+        self.global.insert(key, val.into())
     }
 
     pub fn get_global(&mut self, key: Value) -> Value {
