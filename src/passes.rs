@@ -305,7 +305,7 @@ enum AfterFoldStatus {
 }
 
 #[derive(Default)]
-struct ConstantFolder {}
+struct ConstantFolder();
 
 fn try_fold(exp: &mut Expr) -> AfterFoldStatus {
     use AfterFoldStatus::*;

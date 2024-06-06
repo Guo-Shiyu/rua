@@ -1,7 +1,7 @@
-use crate::{lstd::base, value::RsFunc};
+use crate::{luastd::base, value::RsFunc};
 
 #[derive(Clone, Copy, PartialEq)]
-pub enum StdLib {
+pub enum Stdlib {
     Base,
     Package,
     Coroutine,
@@ -17,8 +17,8 @@ pub enum StdLib {
     // Jit,
 }
 
-pub fn get_std_libs(lib: StdLib) -> &'static [(&'static str, RsFunc)] {
-    use StdLib::*;
+pub fn get_std_libs(lib: Stdlib) -> &'static [(&'static str, RsFunc)] {
+    use Stdlib::*;
     match lib {
         Base => &base::BASE_LIBS,
         Package => todo!(),

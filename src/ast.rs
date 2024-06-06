@@ -287,7 +287,6 @@ pub enum Expr {
 /// setmetatable(y, {__close = function(y_self, err)  ... end}
 ///
 /// ```
-#[repr(u8)]
 #[derive(Debug, Clone, Copy)]
 pub enum Attribute {
     Const,

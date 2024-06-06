@@ -1,8 +1,9 @@
 use rua::{
     ast::{dump_ast, DumpPrecison},
     codegen::{dump_chunk, CodeGen},
+    heap::Heap,
     parser::Parser,
-    passes, RuaErr,
+    passes, InterpretError,
 };
 
 struct CliArg {
@@ -75,10 +76,10 @@ impl CliArg {
     }
 }
 
-fn main() -> Result<(), RuaErr> {
+fn main() -> Result<(), InterpretError> {
     let args = CliArg::parse();
 
-    let src = std::fs::read_to_string(&args.input).map_err(RuaErr::IOErr)?;
+    let src = std::fs::read_to_string(&args.input).map_err(InterpretError::IOErr)?;
 
     let mut ast = Parser::parse(&src, Some(args.input))?;
 
@@ -88,7 +89,8 @@ fn main() -> Result<(), RuaErr> {
 
     if args.dump_stmt {
         let mut outer = std::io::BufWriter::new(std::io::stdout());
-        return dump_ast(&ast, DumpPrecison::Statement, &mut outer, false).map_err(RuaErr::IOErr);
+        return dump_ast(&ast, DumpPrecison::Statement, &mut outer, false)
+            .map_err(InterpretError::IOErr);
     };
 
     if args.optimize {
@@ -98,7 +100,9 @@ fn main() -> Result<(), RuaErr> {
         passes::constant_fold(&mut ast);
     }
 
-    let chunk = CodeGen::generate(*ast, args.strip_debug)?;
+    let mut heap = Heap::default();
+
+    let chunk = CodeGen::codegen(ast, args.strip_debug, &mut heap)?;
 
     if args.list > 0 {
         if args.list == 1 {
@@ -108,9 +112,10 @@ fn main() -> Result<(), RuaErr> {
         }
     }
 
-    let mut ruacout =
-        std::io::BufWriter::new(std::fs::File::create(&args.output).map_err(RuaErr::IOErr)?);
-    dump_chunk(&chunk, &mut ruacout).map_err(RuaErr::IOErr)?;
+    let mut ruacout = std::io::BufWriter::new(
+        std::fs::File::create(&args.output).map_err(InterpretError::IOErr)?,
+    );
+    dump_chunk(&chunk, &mut ruacout).map_err(InterpretError::IOErr)?;
 
     Ok(())
 }

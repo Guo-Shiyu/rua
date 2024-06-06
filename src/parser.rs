@@ -1,4 +1,4 @@
-use crate::{SyntaxErr, SyntaxError};
+use crate::{ParseError, SyntaxError};
 
 use super::{
     ast::*,
@@ -14,7 +14,7 @@ pub struct Parser<'a> {
     ahead: Token,
 }
 
-type Error = Box<SyntaxError>;
+type Error = Box<ParseError>;
 
 impl Parser<'_> {
     /// priority table for binary operators.
@@ -37,7 +37,7 @@ impl Parser<'_> {
 
     /// Parse given source string into `BasicBlock` or `Error`.  Return the root node
     /// of source code. if no chunk name given, chunk will be named to `Block::NAMELESS_CHUNK`.
-    pub fn parse(src: &str, chunkname: Option<String>) -> Result<BasicBlock, Box<SyntaxError>> {
+    pub fn parse(src: &str, chunkname: Option<String>) -> Result<BasicBlock, Box<ParseError>> {
         let mut parser = Parser {
             lex: Lexer::new(src),
             current: Token::Eof,
@@ -173,10 +173,16 @@ impl Parser<'_> {
         let expr = self.expr()?;
         let def = expr.def_info();
 
+        let is_assignable =
+            |expr: &ExprNode| matches!(expr.inner_ref(), Expr::Ident(_) | Expr::Subscript { .. });
+
         let stmt = if self.test(Token::Comma) {
             // multi assignment
             let varlist = self.exprlist(Some(expr))?;
             self.check_and_next(Token::Assign)?;
+            if !varlist.iter().all(is_assignable) {
+                return Err(self.error(SyntaxError::BadAssignment));
+            }
             let exprlist = self.exprlist(None)?;
             SrcLoc::new(
                 Stmt::Assign {
@@ -186,6 +192,9 @@ impl Parser<'_> {
                 def,
             )
         } else if self.test_and_next(Token::Assign)? {
+            if !is_assignable(&expr) {
+                return Err(self.error(SyntaxError::BadAssignment));
+            }
             // single assignment
             SrcLoc::new(
                 Stmt::Assign {
@@ -428,7 +437,7 @@ impl Parser<'_> {
             pres = SrcLoc::new(
                 Expr::Subscript {
                     prefix: Box::new(pres),
-                    key: Box::new(mtd.map(|id| Expr::Ident(id))),
+                    key: Box::new(mtd.map(Expr::Ident)),
                 },
                 (beg, beg),
             )
@@ -490,7 +499,7 @@ impl Parser<'_> {
                         "const" => Some(Attribute::Const),
                         "close" => Some(Attribute::Close),
                         other => {
-                            return Err(self.error(SyntaxErr::InvalidAttribute {
+                            return Err(self.error(SyntaxError::InvalidAttribute {
                                 attr: other.to_string(),
                             }))
                         }
@@ -564,12 +573,12 @@ impl Parser<'_> {
             }
         }
 
-        debug_assert!(pres.len() >= 1);
+        debug_assert!(!pres.is_empty());
         pres.push(SrcLoc::new(String::new(), (0, 0)));
-        let first = pres.swap_remove(0).map(|s| Expr::Ident(s));
+        let first = pres.swap_remove(0).map(Expr::Ident);
         let prefix = pres.into_iter().skip(1).fold(first, |acc, ident| {
             let def = acc.def_info();
-            let key = ident.map(|id| Expr::Ident(id));
+            let key = ident.map(Expr::Ident);
             SrcLoc::new(
                 Expr::Subscript {
                     prefix: Box::new(acc),
@@ -1071,8 +1080,8 @@ impl Parser<'_> {
 }
 
 impl Parser<'_> {
-    fn error(&self, e: SyntaxErr) -> Error {
-        Box::new(SyntaxError {
+    fn error(&self, e: SyntaxError) -> Error {
+        Box::new(ParseError {
             kind: e,
             line: self.lex.line(),
             column: self.lex.column(),
@@ -1080,7 +1089,7 @@ impl Parser<'_> {
     }
 
     fn unexpected(&self, expect: &[Token]) -> Error {
-        self.error(SyntaxErr::UnexpectedToken {
+        self.error(SyntaxError::UnexpectedToken {
             expect: Vec::from(expect),
             found: self.current.clone(),
         })

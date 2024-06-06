@@ -1,19 +1,18 @@
 use std::{
     cell::Cell,
-    cmp,
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, LinkedList},
     fmt::Debug,
+    hash::{DefaultHasher, Hash, Hasher},
     ops::{Deref, DerefMut},
     ptr::NonNull,
 };
 
 use crate::{
     codegen::Proto,
-    state::{mark_rootset, Rvm},
-    value::{LClosure, LValue, RsClosure, StrHashVal, StrImpl, TableImpl, UserDataImpl},
+    value::{RsFunc, Value},
 };
 
-/// # Tagged Ptr Layout
+/// # Tagged Ptr Layout of NanBox
 ///
 /// ``` text
 /// on 64-bit OS, there are only 48 address lines used for addressing
@@ -28,8 +27,8 @@ use crate::{
 ///
 /// ```
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct TaggedBox {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TagBox {
     repr: u64, // inner representation
 }
 
@@ -43,7 +42,7 @@ pub enum Tag {
     UserData = 6,
 }
 
-impl TaggedBox {
+impl TagBox {
     const PAYLOAD_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
     const TAG_MASK: u64 = 0xFFFF_0000_0000_0000;
 
@@ -83,6 +82,23 @@ impl TaggedBox {
         self.raw_repr() & Self::PAYLOAD_MASK
     }
 
+    pub fn as_gcheader(&self) -> &GcHeader {
+        unsafe {
+            &(self.payload() as *mut WithGcHeader<Table>)
+                .as_ref()
+                .unwrap() // TODO: unwrap unchecked
+                .gcheader
+        }
+    }
+
+    pub fn get<T: GcObject>(&self) -> Option<Gc<T>> {
+        (self.tag() == T::TAGID).then(|| unsafe {
+            Gc {
+                ptr: NonNull::<WithGcHeader<T>>::new_unchecked(self.as_ptr_mut()),
+            }
+        })
+    }
+
     pub fn set_tag(&mut self, tag: Tag) -> &Self {
         *self = Self::new(tag, self.payload() as usize);
         self
@@ -109,7 +125,7 @@ impl TaggedBox {
         (self.payload() | Self::HEAP_ADDR_HEAD) as *const T
     }
 
-    pub fn as_mut<T>(&self) -> *mut T {
+    pub fn as_ptr_mut<T>(&self) -> *mut T {
         (self.payload() | Self::HEAP_ADDR_HEAD) as *mut T
     }
 
@@ -124,7 +140,6 @@ pub trait TypeTag {
 }
 
 /// GC color, used for thr-colo mark and sweep gc
-#[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GcColor {
     Wild, // not mamaged by any vm
@@ -156,31 +171,23 @@ impl Default for GcHeader {
     }
 }
 
-pub trait HeapMemUsed {
-    fn heap_mem_used(&self) -> usize;
+pub trait MemStat {
+    /// How many extra memory resource hold by this object.
+    fn mem_ref(&self) -> usize;
 }
 
-pub trait MarkAndSweepGcOps {
+pub trait GcOp {
     fn mark_newborned(&self, _white: GcColor) {}
     fn mark_reachable(&self) {}
-    fn mark_untouched(&self) {}
-    fn delegate_to(&mut self, _heap: &mut Heap) {}
+    fn mark_unreachable(&self) {}
 }
 
-impl MarkAndSweepGcOps for () {}
-impl HeapMemUsed for () {
-    fn heap_mem_used(&self) -> usize {
-        unreachable!()
-    }
-}
-
-#[repr(C)]
-pub struct WithGcHeader<T: MarkAndSweepGcOps + HeapMemUsed> {
+pub struct WithGcHeader<T: GcOp + MemStat> {
     pub gcheader: GcHeader,
     pub inner: T,
 }
 
-impl<T: MarkAndSweepGcOps + HeapMemUsed> MarkAndSweepGcOps for WithGcHeader<T> {
+impl<T: GcOp + MemStat> GcOp for WithGcHeader<T> {
     /// Mark Gc Color to White
     fn mark_newborned(&self, white: GcColor) {
         self.gcheader.color.set(white);
@@ -194,25 +201,21 @@ impl<T: MarkAndSweepGcOps + HeapMemUsed> MarkAndSweepGcOps for WithGcHeader<T> {
     }
 
     /// Mark Gc Color to Gray
-    fn mark_untouched(&self) {
+    fn mark_unreachable(&self) {
         self.gcheader.color.set(GcColor::Gray);
-        self.inner.mark_untouched()
-    }
-
-    fn delegate_to(&mut self, heap: &mut Heap) {
-        self.inner.delegate_to(heap)
+        self.inner.mark_unreachable()
     }
 }
 
-impl<T: MarkAndSweepGcOps + HeapMemUsed> HeapMemUsed for WithGcHeader<T> {
-    fn heap_mem_used(&self) -> usize {
-        std::mem::size_of::<Self>() + self.inner.heap_mem_used()
+impl<T: GcOp + MemStat> MemStat for WithGcHeader<T> {
+    fn mem_ref(&self) -> usize {
+        std::mem::size_of::<Self>() + self.inner.mem_ref()
     }
 }
 
-pub trait GcObject: MarkAndSweepGcOps + HeapMemUsed + TypeTag {}
+pub trait GcObject: GcOp + MemStat + TypeTag {}
 
-impl<T: MarkAndSweepGcOps + HeapMemUsed + TypeTag> GcObject for T {}
+impl<T: GcOp + MemStat + TypeTag> GcObject for T {}
 
 /// Pointer type for gc managed objects
 #[derive(Debug, Hash)]
@@ -231,7 +234,7 @@ impl<T: GcObject> Copy for Gc<T> {}
 
 impl<T: GcObject> PartialEq for Gc<T> {
     fn eq(&self, other: &Self) -> bool {
-        todo!()
+        self.address() == other.address()
     }
 }
 
@@ -273,25 +276,32 @@ impl<T: GcObject> From<T> for Gc<T> {
     }
 }
 
-impl<T: GcObject> From<Gc<T>> for TaggedBox {
+impl<T: GcObject> From<Gc<T>> for TagBox {
     fn from(val: Gc<T>) -> Self {
-        TaggedBox::from_heap_ptr(T::TAGID, val.ptr.as_ptr())
+        TagBox::from_heap_ptr(T::TAGID, val.ptr.as_ptr())
     }
 }
 
-impl<T: GcObject> MarkAndSweepGcOps for Gc<T> {
-    fn delegate_to(&mut self, heap: &mut Heap) {
-        debug_assert_eq!(self.header().color.get(), GcColor::Wild);
-        debug_assert_eq!(self.header().age.get(), 0);
-        heap.allocs.insert(Into::<TaggedBox>::into(*self));
-        self.mark_newborned(heap.curwhite);
-        heap.record_mem_incr(self.heap_mem_used());
+impl<T: GcObject> GcOp for Gc<T> {
+    fn mark_newborned(&self, white: GcColor) {
+        self.header().color.set(white);
+        unsafe { self.ptr.as_ref().mark_newborned(white) };
+    }
+
+    fn mark_reachable(&self) {
+        self.header().color.set(GcColor::Black);
+        unsafe { self.ptr.as_ref().mark_reachable() };
+    }
+
+    fn mark_unreachable(&self) {
+        self.header().color.set(GcColor::Gray);
+        unsafe { self.ptr.as_ref().mark_unreachable() };
     }
 }
 
-impl<T: GcObject> HeapMemUsed for Gc<T> {
-    fn heap_mem_used(&self) -> usize {
-        unsafe { self.ptr.as_ref().heap_mem_used() }
+impl<T: GcObject> MemStat for Gc<T> {
+    fn mem_ref(&self) -> usize {
+        unsafe { self.ptr.as_ref().mem_ref() }
     }
 }
 
@@ -308,12 +318,10 @@ impl<T: GcObject> HeapMemUsed for Gc<T> {
 // }
 
 impl<T: GcObject> Gc<T> {
-    pub fn take(mut val: Gc<T>) -> Box<WithGcHeader<T>> {
-        unsafe { Box::from_raw(val.ptr.as_mut()) }
-    }
-
-    pub fn drop(val: Gc<T>) {
-        let _ = Self::take(val);
+    pub fn dangling() -> Gc<T> {
+        Gc {
+            ptr: NonNull::dangling(),
+        }
     }
 
     pub fn new(val: T) -> Gc<T> {
@@ -327,8 +335,12 @@ impl<T: GcObject> Gc<T> {
         }
     }
 
+    pub fn drop(val: Gc<T>) {
+        let _ = val.into_inner();
+    }
+
     // Return heap address of GcHeader (not the object)
-    pub fn heap_address(&self) -> usize {
+    pub fn address(&self) -> usize {
         self.ptr.as_ptr() as usize
     }
 
@@ -336,93 +348,797 @@ impl<T: GcObject> Gc<T> {
         unsafe { &self.ptr.as_ref().gcheader }
     }
 
-    // fn mark_color(&self, color: GcColor) {
-    //     let wh = unsafe { self.ptr.as_ref() };
-    //     wh.gcheader.color.set(color)
-    // }
+    pub fn into_inner(mut self) -> Box<WithGcHeader<T>> {
+        unsafe { Box::from_raw(self.ptr.as_mut()) }
+    }
 }
 
-pub enum GcKind {
-    Incremental,
-    Generational,
+pub type StrHashVal = u32;
+
+/// Indecates that the length of inplace buffer in struct`Short`.
+/// if given compile flag "long_inplace_str", the buffer length is 47 to keep the size of `WithGcHeader<StrImpl>` is 64.  
+/// if not (in default) the buffer length is 23, and the size of `WithGcHeader<StrImpl>` is 40, same with Lua 5.4.4.
+const MAX_INPLACE_STR_LEN: usize = if cfg!(long_inplace_str) { 47 } else { 23 };
+#[derive(Debug)]
+pub struct Short {
+    hash: Cell<StrHashVal>,
+    len: u8,
+    data: [u8; MAX_INPLACE_STR_LEN], // not ensured to end with '\0'
 }
 
-#[derive(Clone, Copy, PartialEq)]
-pub enum GcStage {
-    Pause,
-    Propgate,
-    Sweep,
-    Finalize,
+impl Short {
+    pub fn is_reserved(&self) -> bool {
+        0x80_u8 & self.len == 0x80_u8
+    }
+
+    pub fn len(&self) -> usize {
+        (0x0F_u8 & self.len) as usize
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+#[derive(Debug)]
+pub struct Long {
+    hash: Cell<StrHashVal>,
+    data: Box<str>,
 }
 
-impl From<usize> for GcStage {
-    fn from(n: usize) -> Self {
-        use GcStage::*;
-        match n {
-            0 => Pause,
-            1 => Propgate,
-            2 => Sweep,
-            3 => Finalize,
+#[derive(Debug)]
+pub enum StrImpl {
+    Short(Short),
+    Long(Long),
+}
+
+impl TypeTag for StrImpl {
+    const TAGID: Tag = Tag::String;
+}
+
+impl GcOp for StrImpl {}
+
+impl MemStat for StrImpl {
+    fn mem_ref(&self) -> usize {
+        match self {
+            StrImpl::Short(_) => 0, //  no extra heap memory used for short string
+            StrImpl::Long(l) => l.data.len(),
+        }
+    }
+}
+
+impl PartialEq for StrImpl {
+    fn eq(&self, r: &Self) -> bool {
+        if self.len() == r.len() && self.hashval() == r.hashval() {
+            if self.is_internalized() {
+                true
+            } else {
+                self.as_str() == r.as_str()
+            }
+        } else {
+            false
+        }
+    }
+}
+
+impl Deref for StrImpl {
+    type Target = str;
+    fn deref(&self) -> &Self::Target {
+        self.as_str()
+    }
+}
+
+impl From<String> for StrImpl {
+    fn from(value: String) -> Self {
+        if StrImpl::able_to_internalize(&value) {
+            StrImpl::from_short(&value, None)
+        } else {
+            StrImpl::from_long(value)
+        }
+    }
+}
+
+impl From<&str> for StrImpl {
+    fn from(value: &str) -> Self {
+        if StrImpl::able_to_internalize(value) {
+            StrImpl::from_short(value, None)
+        } else {
+            StrImpl::from_long(value.to_string())
+        }
+    }
+}
+
+impl StrImpl {
+    const NOT_HASHED: StrHashVal = 0;
+
+    pub fn from_long(val: String) -> StrImpl {
+        StrImpl::Long(Long {
+            hash: Cell::new(Self::NOT_HASHED),
+            data: val.into(),
+        })
+    }
+
+    /// Construct a short string from given string.
+    pub fn from_short(short: &str, hashval: Option<StrHashVal>) -> StrImpl {
+        debug_assert!(Self::able_to_internalize(short));
+        let hash = Cell::new(hashval.unwrap_or_else(|| Self::hash_str(short)));
+        let len = short.len() as u8;
+        let mut data = [0_u8; MAX_INPLACE_STR_LEN];
+        data[..short.len()].copy_from_slice(short.as_bytes());
+        StrImpl::Short(Short { hash, len, data })
+    }
+
+    /// Construct a reserved short string from given string.
+    pub fn new_reserved(short: &str, hashval: Option<StrHashVal>) -> StrImpl {
+        debug_assert!(Self::able_to_internalize(short));
+        let hash = Cell::new(hashval.unwrap_or_else(|| Self::hash_str(short)));
+        let len = short.len() as u8 | 0x80;
+        let mut data = [0_u8; MAX_INPLACE_STR_LEN];
+        data[..short.len()].copy_from_slice(short.as_bytes());
+        StrImpl::Short(Short { hash, len, data })
+    }
+
+    pub fn hashval(&self) -> StrHashVal {
+        match self {
+            StrImpl::Short(s) => s.hash.get(),
+            StrImpl::Long(l) => {
+                if self.has_hashed() {
+                    l.hash.get()
+                } else {
+                    let hashid = Self::hash_str(&l.data);
+                    l.hash.set(hashid);
+                    hashid
+                }
+            }
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            StrImpl::Short(s) => s.len(),
+            StrImpl::Long(l) => l.data.len(),
+        }
+    }
+
+    pub fn is_reserved(&self) -> bool {
+        matches!(&self, Self::Short(s) if s.is_reserved())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn as_str(&self) -> &str {
+        match self {
+            StrImpl::Short(s) => unsafe { std::str::from_utf8_unchecked(&s.data[..self.len()]) },
+            StrImpl::Long(l) => &l.data,
+        }
+    }
+
+    pub fn is_internalized(&self) -> bool {
+        match self {
+            StrImpl::Short(_) => true,
+            StrImpl::Long(_) => false,
+        }
+    }
+
+    pub fn is_long(&self) -> bool {
+        !self.is_internalized()
+    }
+
+    pub fn has_hashed(&self) -> bool {
+        if let StrImpl::Long(l) = self {
+            l.hash.get() != Self::NOT_HASHED
+        } else {
+            true
+        }
+    }
+
+    /// Return true if s is able to be internalized.
+    pub fn able_to_internalize(s: &str) -> bool {
+        s.len() <= MAX_INPLACE_STR_LEN
+    }
+
+    /// Incomplete hash for long string and complete for short string.
+    pub fn hash_str(ss: &str) -> StrHashVal {
+        // incomplete hash for long string
+        let step = if StrImpl::able_to_internalize(ss) {
+            1
+        } else {
+            ss.len() >> 5
+        };
+
+        let mut hasher = DefaultHasher::new();
+        ss.chars().step_by(step).for_each(|c| c.hash(&mut hasher));
+        let full = hasher.finish();
+        (full as u32 & u32::MAX) ^ (((full >> 32) as u32) & u32::MAX)
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum MetaOperator {
+    MetaTable,
+    Index,
+    NewIndex,
+    Gc,
+    Mode,
+    Len,
+    Equal,
+    Add,
+    Sub,
+    Mul,
+    Mod,
+    Pow,
+    Div,
+    IDiv,
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
+    Unm,
+    BitNot,
+    Less,
+    LessEqual,
+    Concat,
+    Call,
+    Close,
+    ToString,
+    Pairs,
+    IPairs,
+}
+
+impl MetaOperator {
+    // Do *not* change the order of literals
+    #[rustfmt::skip]
+    pub const METATOPS_STRS: [&'static str; 29]  = [
+        "__metatable",
+        "__index", "__newindex",
+        "__gc", "__mode", "__len", "__eq",
+        "__add", "__sub", "__mul", "__mod", "__pow",
+        "__div", "__idiv",
+        "__band", "__bor", "__bxor", "__shl", "__shr",
+        "__unm", "__bnot", "__lt", "__le",
+        "__concat", "__call", "__close",
+        "__tostring", "__pairs", "__ipairs",
+    ];
+
+    fn as_str(&self) -> &'static str {
+        Self::METATOPS_STRS[*self as u8 as usize]
+    }
+}
+
+impl From<MetaOperator> for &str {
+    fn from(val: MetaOperator) -> Self {
+        val.as_str()
+    }
+}
+
+#[derive(Default, Debug)]
+pub struct Table {
+    hmap: BTreeMap<Value, Value>,
+    meta: Option<Gc<Table>>,
+}
+
+impl TypeTag for Table {
+    const TAGID: Tag = Tag::Table;
+}
+
+impl MemStat for Table {
+    fn mem_ref(&self) -> usize {
+        std::mem::size_of::<Self>()
+    }
+}
+
+impl GcOp for Table {
+    fn mark_newborned(&self, _: GcColor) {
+        debug_assert!(self.hmap.is_empty());
+    }
+
+    fn mark_reachable(&self) {
+        self.hmap.iter().for_each(|(key, val)| {
+            key.mark_reachable();
+            val.mark_reachable();
+        });
+    }
+
+    fn mark_unreachable(&self) {
+        self.hmap.iter().for_each(|(key, val)| {
+            key.mark_unreachable();
+            val.mark_unreachable();
+        });
+    }
+}
+
+impl Deref for Table {
+    type Target = BTreeMap<Value, Value>;
+    fn deref(&self) -> &Self::Target {
+        &self.hmap
+    }
+}
+
+impl DerefMut for Table {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.hmap
+    }
+}
+
+impl Table {
+    pub fn meta_get(&self, op: MetaOperator) -> Option<Value> {
+        let target = op.as_str();
+        self.meta.and_then(|meta| {
+            for (k, v) in meta.iter() {
+                match k {
+                    Value::Str(s) => {
+                        if s.as_str() == target {
+                            return Some(v.clone());
+                        }
+                    }
+                    _ => continue,
+                }
+            }
+            None
+        })
+    }
+
+    pub fn index<T>(&mut self, key: T) -> Value
+    where
+        Value: From<T>,
+    {
+        self.get(&Value::from(key)).cloned().unwrap_or_default()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct UserData {
+    ptr: NonNull<()>,
+    size: usize,
+}
+
+impl MemStat for UserData {
+    fn mem_ref(&self) -> usize {
+        self.size
+    }
+}
+
+impl GcOp for UserData {}
+
+impl UserData {
+    pub fn new<T>(data: T) -> UserData {
+        UserData {
+            ptr: NonNull::from(Box::leak(Box::new(data))).cast(),
+            size: std::mem::size_of::<T>(),
+        }
+    }
+
+    pub fn as_ptr<T>(&self) -> *const T {
+        self.ptr.cast().as_ptr()
+    }
+
+    pub unsafe fn as_mut<T>(&mut self) -> *mut T {
+        self.ptr.cast().as_mut()
+    }
+
+    pub unsafe fn as_ref<T>(&self) -> &T {
+        self.ptr.cast().as_ref()
+    }
+}
+
+#[derive(Debug)]
+pub enum UpVal {
+    Open(u32),    // stack index
+    Close(Value), // value itself
+}
+
+#[derive(Debug)]
+pub struct LuaClosure {
+    pub p: Gc<Proto>,
+    pub upvals: Vec<UpVal>,
+}
+
+impl LuaClosure {
+    fn new(proto: Gc<Proto>) -> Self {
+        Self {
+            p: proto,
+            upvals: Vec::new(),
+        }
+    }
+}
+
+impl TypeTag for LuaClosure {
+    const TAGID: Tag = Tag::LuaClosure;
+}
+
+impl MemStat for LuaClosure {
+    fn mem_ref(&self) -> usize {
+        self.p.mem_ref() + self.upvals.capacity()
+    }
+}
+
+impl GcOp for LuaClosure {
+    fn mark_newborned(&self, white: GcColor) {
+        self.p.mark_newborned(white);
+        self.upvals.iter().for_each(|up| {
+            if let UpVal::Close(val) = up {
+                val.mark_newborned(white)
+            }
+        });
+    }
+
+    fn mark_reachable(&self) {
+        self.p.mark_reachable();
+        self.upvals.iter().for_each(|up| {
+            if let UpVal::Close(val) = up {
+                val.mark_reachable()
+            }
+        });
+    }
+
+    fn mark_unreachable(&self) {
+        self.p.mark_unreachable();
+        self.upvals.iter().for_each(|up| {
+            if let UpVal::Close(val) = up {
+                val.mark_unreachable()
+            }
+        });
+    }
+}
+
+impl Deref for LuaClosure {
+    type Target = Proto;
+    fn deref(&self) -> &Self::Target {
+        &self.p
+    }
+}
+
+impl DerefMut for LuaClosure {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.p
+    }
+}
+
+#[derive(Debug)]
+pub struct RsClosure {
+    fnptr: RsFunc,
+    upvals: Box<[Value]>,
+}
+
+impl MemStat for RsClosure {
+    fn mem_ref(&self) -> usize {
+        self.upvals.len() * std::mem::size_of::<Value>()
+    }
+}
+
+impl GcOp for RsClosure {
+    fn mark_newborned(&self, white: GcColor) {
+        self.upvals.iter().for_each(|val| val.mark_newborned(white));
+    }
+
+    fn mark_reachable(&self) {
+        self.upvals.iter().for_each(|val| val.mark_reachable());
+    }
+
+    fn mark_unreachable(&self) {
+        self.upvals.iter().for_each(|val| val.mark_unreachable());
+    }
+}
+
+impl TypeTag for RsClosure {
+    const TAGID: Tag = Tag::RsClosure;
+}
+
+impl TypeTag for UserData {
+    const TAGID: Tag = Tag::UserData;
+}
+
+impl MemStat for Value {
+    fn mem_ref(&self) -> usize {
+        match self {
+            // thry are not allocated on heap
+            Value::Nil | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::RsFn(_) => 0,
+
+            Value::Str(sw) => sw.mem_ref(),
+            Value::Table(tb) => tb.mem_ref(),
+            Value::Fn(p) => p.mem_ref(),
+            Value::RsCl(c) => c.mem_ref(),
+            Value::UserData(ud) => ud.mem_ref(),
+        }
+    }
+}
+
+impl GcOp for Value {
+    fn mark_newborned(&self, white: GcColor) {
+        match self {
+            Value::Str(s) => s.mark_newborned(white),
+            Value::Table(t) => t.mark_newborned(white),
+            Value::Fn(f) => f.mark_newborned(white),
+            Value::RsCl(c) => c.mark_newborned(white),
+            Value::UserData(ud) => ud.mark_newborned(white),
+            _ => {}
+        }
+    }
+
+    fn mark_reachable(&self) {
+        match self {
+            Value::Str(s) => s.mark_reachable(),
+            Value::Table(t) => t.mark_reachable(),
+            Value::Fn(f) => f.mark_reachable(),
+            Value::RsCl(c) => c.mark_reachable(),
+            Value::UserData(ud) => ud.mark_reachable(),
+            _ => {}
+        }
+    }
+
+    fn mark_unreachable(&self) {
+        match self {
+            Value::Str(s) => s.mark_unreachable(),
+            Value::Table(t) => t.mark_unreachable(),
+            Value::Fn(f) => f.mark_unreachable(),
+            Value::UserData(ud) => ud.mark_unreachable(),
+            _ => {}
+        }
+    }
+}
+
+impl From<TagBox> for Value {
+    /// See 'Value::tagid()' method for each case
+    fn from(tp: TagBox) -> Self {
+        type RsCl = self::RsClosure;
+        type LC = self::LuaClosure;
+        match tp.tag() {
+            StrImpl::TAGID => Value::Str(Gc::from(tp.as_ptr_mut::<WithGcHeader<StrImpl>>())),
+            Table::TAGID => Value::Table(Gc::from(tp.as_ptr_mut::<WithGcHeader<Table>>())),
+            LC::TAGID => Value::Fn(Gc::from(tp.as_ptr_mut::<WithGcHeader<LC>>())),
+            RsCl::TAGID => Value::RsCl(Gc::from(tp.as_ptr_mut::<WithGcHeader<RsCl>>())),
+            UserData::TAGID => Value::UserData(Gc::from(tp.as_ptr_mut::<WithGcHeader<UserData>>())),
             _ => unreachable!(),
         }
     }
 }
 
-impl From<GcStage> for usize {
-    fn from(val: GcStage) -> Self {
-        use GcStage::*;
-        match val {
-            Pause => 0,
-            Propgate => 1,
-            Sweep => 2,
-            Finalize => 3,
-        }
-    }
+#[derive(Clone, Copy, PartialEq, Default)]
+pub enum GcStage {
+    #[default]
+    Start,
+    Propgate,
+    Sweep,
+    Finalize,
 }
 
-#[derive(Default)]
-struct IncrGcImpl {}
+pub struct Heap {
+    total: usize,                                // total bytes of total allocated object
+    debt: isize,                                 //
+    estimate: usize,                             //
+    allocs: LinkedList<TagBox>,                  // all object allocated by gc
+    fixed: Vec<Gc<StrImpl>>,                     // fixed gc objects
+    sstrpool: BTreeMap<StrHashVal, Gc<StrImpl>>, // short string cache
 
-struct GenGcImpl {}
-
-enum GcImpl {
-    Incremental(IncrGcImpl),
-    Generational(GenGcImpl),
-}
-
-pub struct ManagedHeap {
-    enablegc: bool, // allow gc or not
-
-    impls: GcImpl, // gc implementation
-    curwhite: GcColor,
     stage: GcStage,
-    allocs: BTreeSet<TaggedBox>,
-    sstrpool: BTreeMap<StrHashVal, Gc<StrImpl>>,
-    fixed: Vec<TaggedBox>,
-
-    total: usize,
-    debt: isize,
-    estimate: usize,
+    curwhite: GcColor,
 }
 
-impl Default for ManagedHeap {
+impl Default for Heap {
     fn default() -> Self {
-        ManagedHeap {
-            enablegc: true,
-            impls: GcImpl::Incremental(IncrGcImpl::default()),
-            curwhite: GcColor::White,
-            stage: GcStage::Pause,
-            allocs: BTreeSet::new(),
-            sstrpool: BTreeMap::new(),
-            fixed: Vec::with_capacity(64),
+        Heap {
             total: 0,
-            debt: -1024,
+            debt: Self::FIRST_GC_LIMIT,
             estimate: 0,
+
+            allocs: LinkedList::<_>::new(),
+
+            fixed: Vec::<_>::new(),
+            sstrpool: BTreeMap::<_, _>::new(),
+
+            curwhite: GcColor::White,
+            stage: GcStage::Start,
         }
     }
 }
 
-impl ManagedHeap {
+impl Drop for Heap {
+    fn drop(&mut self) {
+        // println!(
+        //     "#-- Heap: total allocs: {}, fixed object: {}",
+        //     self.total,
+        //     self.fixed.len()
+        // );
+        std::mem::take(&mut self.allocs)
+            .into_iter()
+            .for_each(|obj| {
+                self.free_obj(obj);
+            });
+        std::mem::take(&mut self.fixed)
+            .into_iter()
+            .for_each(|tbox| {
+                self.free_obj(tbox.into());
+            });
+        self.sstrpool.clear();
+    }
+}
+
+impl Heap {
+    /// How many allocated bytes to trig first GC
+    const FIRST_GC_LIMIT: isize = 1024;
+
+    /// Factor
+    // const GC_GROW_FACTOR: f64 = 2.0;
+
+    pub fn new() -> Heap {
+        Self::default()
+    }
+
+    pub fn check_gc(&self) -> bool {
+        self.debt > 0 && self.estimate < self.total / 2
+    }
+
+    pub fn total_alloc_bytes(&self) -> usize {
+        self.total
+    }
+
+    pub fn alloc_fixed(&mut self, reserved: &str) -> Value {
+        debug_assert!(StrImpl::able_to_internalize(reserved));
+        let hash = StrImpl::hash_str(reserved);
+        let val = if self.sstrpool.contains_key(&hash) {
+            // SAFETY: key has been checked to be exisited in `sstrpool`
+            Value::from(unsafe { *self.sstrpool.get(&hash).unwrap_unchecked() })
+        } else {
+            let ptr = Gc::new(StrImpl::new_reserved(reserved, Some(hash)));
+            self.sstrpool.entry(hash).or_insert(ptr);
+            self.fixed.push(ptr);
+            ptr.into()
+        };
+        val.mark_newborned(self.curwhite);
+        val
+    }
+
+    pub fn alloc_str(&mut self, view: &str) -> Gc<StrImpl> {
+        if StrImpl::able_to_internalize(view) {
+            self.alloc_internal_str(view)
+        } else {
+            self.take_str(view.to_string())
+        }
+    }
+
+    fn alloc_internal_str(&mut self, short: &str) -> Gc<StrImpl> {
+        let hash = StrImpl::hash_str(short);
+        let ptr = if self.sstrpool.contains_key(&hash) {
+            // SAFETY: key has been checked to be exisited in `sstrpool`
+            unsafe { *self.sstrpool.get(&hash).unwrap_unchecked() }
+        } else {
+            let ptr = Gc::new(StrImpl::from_short(short, Some(hash)));
+            self.allocs.push_front(ptr.into());
+            self.sstrpool.entry(hash).or_insert(ptr);
+            self.record_mem_incr(ptr.mem_ref());
+            ptr
+        };
+        ptr.mark_newborned(self.curwhite);
+        ptr
+    }
+
+    pub fn take_str(&mut self, val: String) -> Gc<StrImpl> {
+        if StrImpl::able_to_internalize(&val) {
+            self.alloc_internal_str(&val)
+        } else {
+            let ptr = Gc::new(StrImpl::from_long(val));
+            self.allocs.push_front(ptr.into());
+            self.record_mem_incr(ptr.mem_ref());
+            ptr.mark_newborned(self.curwhite);
+            ptr
+        }
+    }
+
+    pub fn alloc_table(&mut self) -> Gc<Table> {
+        let ptr = Gc::new(Table::default());
+        self.allocs.push_front(ptr.into());
+        self.record_mem_incr(ptr.mem_ref());
+        ptr.mark_newborned(self.curwhite);
+        ptr
+    }
+
+    pub fn alloc_closure(&mut self, pfn: Gc<Proto>) -> Gc<LuaClosure> {
+        let ptr = Gc::new(LuaClosure::new(pfn));
+        self.allocs.push_front(ptr.into());
+        self.record_mem_incr(ptr.mem_ref());
+        ptr.mark_newborned(self.curwhite);
+        ptr
+    }
+
+    pub(crate) fn mark_all_obj_unreachable(&self) {
+        // mark all allocs object to gray.
+        for ptr in self.allocs.iter() {
+            ptr.as_gcheader().color.set(GcColor::Gray);
+        }
+    }
+
+    pub(crate) fn sweep_unreachable(&mut self) -> Vec<Gc<Table>> {
+        // sweep unreachable strings, table without __gc method, and other data
+        let mut stack = std::mem::take(&mut self.allocs);
+        let mut to_finalize = Vec::new();
+
+        while let Some(tbox) = stack.back() {
+            // alive objects
+            if tbox.as_gcheader().color.get() != GcColor::Gray
+                || tbox.get::<StrImpl>().is_some_and(|s| s.is_reserved())
+            {
+                self.allocs.append(&mut stack.split_off(stack.len() - 1));
+                continue;
+            }
+
+            // table with __gc method needs to drop within VM levle
+            if tbox
+                .get::<Table>()
+                .and_then(|table| table.meta_get(MetaOperator::Gc))
+                .is_none()
+            {
+                self.sweep_garbage(*tbox);
+                stack.pop_back();
+            } else {
+                // # SAFETY: we has checked the tail of stack is a table object
+                to_finalize.push(unsafe {
+                    stack
+                        .pop_back()
+                        .unwrap_unchecked()
+                        .get::<Table>()
+                        .unwrap_unchecked()
+                });
+            }
+        }
+        to_finalize
+    }
+
+    pub(crate) fn sweep_garbage(&mut self, tbox: TagBox) {
+        debug_assert!(tbox.as_gcheader().color.get() == GcColor::Gray);
+        // common object
+        self.total -= self.free_obj(tbox);
+    }
+
+    fn free_obj(&mut self, tbox: TagBox) -> usize {
+        match tbox.tag() {
+            Tag::String => Self::do_free_with::<StrImpl, _>(tbox, |s| {
+                if s.is_internalized() && !s.is_reserved() {
+                    self.sstrpool.remove(&s.hashval());
+                }
+            }),
+            Tag::Table => Self::do_free_with::<Table, _>(tbox, |_| {}),
+            Tag::Proto => Self::do_free_with::<Proto, _>(tbox, |_| {}),
+            Tag::LuaClosure => Self::do_free_with::<LuaClosure, _>(tbox, |_| {}),
+            Tag::UserData => Self::do_free_with::<UserData, _>(tbox, |_| {
+                // TODO: light userdata ?
+            }),
+            Tag::RsClosure => Self::do_free_with::<RsClosure, _>(tbox, |_| {}),
+        }
+    }
+
+    fn do_free_with<T: GcObject + Debug, F: FnOnce(Gc<T>)>(tbox: TagBox, f: F) -> usize {
+        let val = Gc::from(tbox.as_ptr_mut::<WithGcHeader<T>>());
+        f(val);
+
+        // {
+        //     print!(
+        //         "#-- drop {:?} at: 0x{:X} , free mem size: {}, val:",
+        //         tbox.tag(),
+        //         val.address(),
+        //         val.mem_ref(),
+        //     );
+        //     if tbox.tag() == Tag::String {
+        //         println!(" {}", tbox.get::<StrImpl>().unwrap().as_str());
+        //     } else {
+        //         println!(" {:?}", val);
+        //     }
+        // }
+
+        let used = val.mem_ref();
+        Gc::drop(val);
+        used
+    }
+
+    pub fn is_generational(&self) -> bool {
+        false
+    }
+
+    pub fn is_incremental(&self) -> bool {
+        false
+    }
+
     fn switch_white(&mut self) {
         self.curwhite = match self.curwhite {
             GcColor::White => GcColor::AnotherWhite,
@@ -431,248 +1147,24 @@ impl ManagedHeap {
         };
     }
 
-    fn is_cur_white(&self, obj: &GcHeader) -> bool {
-        obj.color.get() == self.curwhite
-    }
+    // fn cur_white(&self) -> GcColor {
+    //     self.curwhite
+    // }
+
+    // fn is_cur_white(&self, header: &GcHeader) -> bool {
+    //     header.color.get() == self.curwhite
+    // }
 
     fn record_mem_incr(&mut self, incr: usize) {
         self.total += incr;
         self.debt += incr as isize;
     }
-
-    fn check_gc(&self) -> bool {
-        self.debt > 0 && self.estimate < self.total / 2
-    }
-
-    fn full_gc(&mut self, set: &mut Rvm) {
-        self.stage = GcStage::Pause;
-
-        // mark all allocs object to gray.
-        // skip new borned obj just now.
-        for ptr in self.allocs.iter() {
-            let gcobj = unsafe { (ptr.payload() as *mut WithGcHeader<()>).as_ref().unwrap() };
-            let gch = &gcobj.gcheader;
-            gch.color.set(GcColor::Gray);
-        }
-
-        mark_rootset(set);
-
-        // sweep and collect remained object
-        let (remain, release) = std::mem::take(&mut self.allocs).into_iter().fold(
-            (BTreeSet::new(), 0),
-            |mut acc: (_, usize), tp| {
-                let _tag = tp.tag();
-                let gch = &unsafe { tp.as_ptr::<WithGcHeader<()>>().as_ref() }
-                    .unwrap()
-                    .gcheader;
-
-                if gch.color.get() == GcColor::Gray {
-                    (acc.0, acc.1 + self.free_garbage(tp))
-                } else {
-                    acc.0.insert(tp);
-                    (acc.0, acc.1)
-                }
-            },
-        );
-
-        self.allocs = remain;
-
-        // update gc infomation
-        self.total -= release;
-        self.estimate = self.total;
-    }
-
-    fn free_garbage(&mut self, tbox: TaggedBox) -> usize {
-        // release
-
-        match tbox.tag() {
-            StrImpl::TAGID => Self::drop_garbage_with::<StrImpl, _>(tbox, |s| {
-                self.sstrpool.remove(&s.hashid());
-            }),
-            TableImpl::TAGID => {
-                Self::drop_garbage_with::<TableImpl, _>(tbox, |_tab| {
-                    // TODO:
-                    // finalize
-                    // self.finalize();
-                })
-            }
-            LClosure::TAGID => Self::drop_garbage_with::<LClosure, _>(tbox, |_| {}),
-            RsClosure::TAGID => Self::drop_garbage_with::<LClosure, _>(tbox, |_| {}),
-            UserDataImpl::TAGID => Self::drop_garbage_with::<UserDataImpl, _>(tbox, |_| {}),
-            Proto::TAGID => {
-                // let tp = Gc::from(tbox.as_mut::<WithGcHeader<Proto>>());
-                // let used = tp.heap_mem_used();
-                // Gc::drop(tp);
-                // used
-
-                // TODO!
-                0
-            }
-            _ => unreachable!(),
-        }
-    }
-
-    fn drop_garbage_with<T: GcObject, F: FnOnce(Gc<T>)>(taggedptr: TaggedBox, f: F) -> usize
-    where
-        LValue: From<Gc<T>>,
-    {
-        let val = Gc::from(taggedptr.as_mut::<WithGcHeader<T>>());
-        f(val);
-
-        // {
-        //     println!(
-        //         "Drop Object at: 0x{:X} , free mem size: {},  val: {}",
-        //         val.heap_address(),
-        //         val.heap_mem_used(),
-        //         LValue::from(val)
-        //     );
-        // }
-
-        let used = val.heap_mem_used();
-        Gc::drop(val);
-        used
-    }
-
-    fn single_step_gc(&mut self, _set: &mut Rvm, _mannual: bool) {
-        todo!("single step gc")
-        // self.stage = GcStage::Pause;
-        // self.switch_white();
-
-        // // mark rootset
-        // self.mark_rootset(set);
-
-        // // mark fixed
-        // self.mark_fixed();
-
-        // // mark allocs
-        // self.mark_allocs();
-
-        // // sweep
-        // self.sweep();
-
-        // // finalize
-        // self.finalize();
-
-        // // estimate
-        // self.estimate = self.total / 2;
-    }
 }
 
-pub struct Heap<'h> {
-    rootset: &'h mut Rvm,
-    heap: &'h mut ManagedHeap,
-}
+#[cfg(test)]
+mod test {
+    use super::*;
 
-impl Deref for Heap<'_> {
-    type Target = ManagedHeap;
-
-    fn deref(&self) -> &Self::Target {
-        self.heap
-    }
-}
-
-impl DerefMut for Heap<'_> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.heap
-    }
-}
-
-impl Heap<'_> {
-    pub fn new<'h>(rootset: &'h mut Rvm, heap: &'h mut ManagedHeap) -> Heap<'h> {
-        Heap { rootset, heap }
-    }
-
-    pub fn delegate(&mut self, gcval: &mut LValue) {
-        match gcval {
-            LValue::String(new) => {
-                if new.is_short() {
-                    let hash = new.hashid();
-                    let contains = self.sstrpool.contains_key(&hash);
-                    if contains {
-                        // SAFETY: key has been checked above
-                        let old = unsafe { self.sstrpool.get(&hash).unwrap_unchecked() };
-
-                        if old.heap_address() != new.heap_address() {
-                            // release new str and use old one
-                            old.mark_newborned(self.curwhite);
-                            Gc::drop(*new);
-                            *gcval = (*old).into();
-                        }
-                    } else {
-                        new.delegate_to(self);
-                        self.sstrpool.insert(hash, *new);
-                    }
-                } else {
-                    new.delegate_to(self);
-                }
-            }
-
-            LValue::Table(mut tb) => {
-                tb.delegate_to(self);
-            }
-            LValue::Function(mut f) => {
-                f.delegate_to(self);
-                f.p.delegate_to(self);
-            }
-            LValue::UserData(ud) => ud.delegate_to(self),
-
-            _ => {}
-        };
-    }
-
-    pub fn alloc<S, D>(&mut self, data: S) -> LValue
-    where
-        D: GcObject,
-        Gc<D>: From<S>,
-        LValue: From<Gc<D>>,
-    {
-        let mut val = LValue::from(data.into());
-        self.delegate(&mut val);
-        self.gc_checkpoint();
-        val
-    }
-
-    pub fn alloc_fixed(&mut self, s: &str) -> LValue {
-        let val: Gc<StrImpl> = s.into();
-
-        if val.is_short() {
-            self.sstrpool.insert(val.hashid(), val);
-        }
-        self.fixed.push(val.into());
-
-        LValue::from(val)
-    }
-
-    fn gc_checkpoint(&mut self) {
-        if self.heap.enablegc && self.heap.check_gc() {
-            self.collect_garbage(true);
-        }
-    }
-
-    pub fn collect_garbage(&mut self, full: bool) {
-        if full {
-            self.heap.full_gc(self.rootset);
-        } else {
-            self.heap.single_step_gc(self.rootset, true);
-        }
-    }
-
-    // This method will be called when State was dropped.
-    // Release all managed object in heap.
-    pub fn destroy(&mut self) {
-        self.collect_garbage(true);
-
-        let iters = std::mem::take(&mut self.allocs)
-            .into_iter()
-            .chain(std::mem::take(&mut self.fixed));
-
-        let _ = iters.fold(0, |acc, obj| acc + self.free_garbage(obj));
-
-        // println!("destroy the heap ... total realesed memory: {}", freed);
-    }
-}
-
-mod platform_check {
     #[test]
     fn x64_os_check() {
         assert!(cfg!(target_pointer_width = "64"))
@@ -680,41 +1172,111 @@ mod platform_check {
 
     #[test]
     fn constants_check() {
-        use super::TaggedBox;
+        use super::TagBox;
 
-        assert!(TaggedBox::PAYLOAD_MASK & TaggedBox::TAG_MASK == 0);
-        assert!(TaggedBox::PAYLOAD_MASK | TaggedBox::TAG_MASK == u64::MAX);
+        assert!(TagBox::PAYLOAD_MASK & TagBox::TAG_MASK == 0);
+        assert!(TagBox::PAYLOAD_MASK | TagBox::TAG_MASK == u64::MAX);
     }
-}
-
-mod gc_check {
 
     #[test]
-    fn trig_gull_gc_simple() {
-        use crate::heap::HeapMemUsed;
-        use crate::state::State;
+    fn reserved_string() {
+        let mut heap = Heap::default();
+        let raw = "function";
+        let rst = heap.alloc_fixed(raw);
+        let ptr = rst.as_str().unwrap();
+        assert_eq!(ptr.len(), raw.len());
+        assert!(ptr.is_reserved());
+    }
 
-        let mut state = State::new();
+    #[test]
+    fn tagbox_and_gcptr() {
+        let ptr = Gc::new(StrImpl::from("value"));
+        let tagbox = TagBox::from(ptr);
 
-        for n in 1..5 {
-            let long_str = ".".repeat(64 * n);
-            let cloned = long_str.clone();
+        assert_eq!(tagbox.tag(), StrImpl::TAGID);
+        assert_eq!(tagbox.payload(), ptr.address() as u64);
 
-            // create a long string on managed heap to trig full GC
-            let mut incr = 0;
-            state
-                .context(|vm, heap| {
-                    let val = heap.alloc(long_str);
-                    incr = val.heap_mem_used();
-                    vm.stk_push(val)
-                })
-                .unwrap();
+        assert_eq!(
+            tagbox.as_ptr::<StrImpl>(), //
+            ptr.address() as *const StrImpl
+        );
+        assert_eq!(
+            tagbox.as_ptr_mut::<StrImpl>(),
+            ptr.address() as *mut StrImpl
+        );
 
-            let val = state.vm_view().stk_pop().unwrap();
-            assert_eq!(val.as_str().unwrap(), cloned.as_str());
+        let gcp = tagbox.get::<StrImpl>().unwrap();
+        assert_eq!(gcp, ptr);
 
-            // trig full gc
-            state.heap_view().collect_garbage(true);
+        Gc::drop(ptr);
+    }
+
+    // #[test]
+    // #[should_panic(expected = "free(): double free detected")]
+    // fn double_free_gcptr() {
+    //     let ptr = Gc::new(StrImpl::from("value"));
+    //     Gc::drop(ptr); // first free
+    //     Gc::drop(ptr); // double free, this should panic
+    // }
+
+    #[test]
+    fn test_table() {
+        use crate::state::VM;
+        use crate::InterpretError;
+
+        let mut heap = Heap::default();
+        let mut tb = heap.alloc_table();
+        assert_ne!(tb.mem_ref(), 0);
+
+        {
+            fn f1(_: &mut VM) -> Result<usize, InterpretError> {
+                Ok(1)
+            }
+
+            fn f2(_: &mut VM) -> Result<usize, InterpretError> {
+                Ok(2)
+            }
+
+            let v1 = Value::from(f1 as RsFunc);
+            let v2 = Value::from(f2 as RsFunc);
+            assert_eq!(v2, v2);
+            assert_eq!(v1, Value::from(f1 as RsFunc));
+            assert_ne!(v1, v2);
+
+            let v1c = Value::from(f1 as RsFunc);
+            assert_eq!(v1, v1c);
+            assert_eq!(v1.to_ne_bytes(), v1c.to_ne_bytes());
+
+            tb.insert(Value::from(1), v1);
+            tb.insert(Value::from(2), v2);
+            tb.insert(v1, v2);
+            tb.insert(v2, v1);
+
+            assert_eq!(tb.index(Value::from(1)), v1);
+            assert_eq!(tb.index(Value::from(2)), v2);
+            assert_eq!(tb.index(v1), v2);
+            assert_eq!(tb.index(1), v1);
+            assert_eq!(tb.index(2), v2);
+
+            assert_eq!(Value::from(f1 as RsFunc), Value::from(f1 as RsFunc),);
+            let l = tb.index(f1 as RsFunc);
+            let r = tb.index(f1 as RsFunc);
+            assert_eq!(l, r);
+
+            assert_eq!(tb.index(v2), v1);
         }
+    }
+
+    #[test]
+    fn destroy_heap_with_fixed_object() {
+        use crate::heap::{Heap, MetaOperator};
+
+        let mut heap = Heap::default();
+        let origin = heap.total;
+
+        for builtin in MetaOperator::METATOPS_STRS {
+            heap.alloc_fixed(builtin);
+        }
+        assert_eq!(origin, heap.total);
     }
 }

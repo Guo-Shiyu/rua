@@ -3,7 +3,7 @@ use std::{
     str::{Chars, FromStr},
 };
 
-use crate::SyntaxErr;
+use crate::SyntaxError;
 
 /// Token value defined for rua lexer. Keywords, operators, identifier and literals are included.
 /// 
@@ -183,6 +183,11 @@ pub struct Lexer<'a> {
 }
 
 impl Lexer<'_> {
+    pub const KEY_WORDS: [&'static str; 21] = [
+        "and", "break", "do", "else", "elseif", "end", "false", "for", "function", "if", "in",
+        "local", "nil", "not", "or", "repeat", "return", "then", "true", "until", "while",
+    ];
+
     /// Initialize a tokenizer at line 1 and col 1.
     pub fn new(input: &str) -> Lexer {
         Lexer {
@@ -226,7 +231,7 @@ impl Lexer<'_> {
     }
 
     /// Get next token or a lexical error.
-    pub fn tokenize(&mut self) -> Result<Token, SyntaxErr> {
+    pub fn tokenize(&mut self) -> Result<Token, SyntaxError> {
         const WHITESPACES: [char; 4] = [' ', '\t', '\u{013}', '\u{014}'];
 
         loop {
@@ -281,19 +286,19 @@ impl Lexer<'_> {
 
                 punc if punc.is_ascii_punctuation() => {
                     break if punc == '@' || punc == '`' {
-                        Err(SyntaxErr::InvalidCharacter { ch: punc })
+                        Err(SyntaxError::InvalidCharacter { ch: punc })
                     } else {
                         self.lex_punctuation(punc)
                     }
                 }
 
-                invalid => break Err(SyntaxErr::InvalidCharacter { ch: invalid }),
+                invalid => break Err(SyntaxError::InvalidCharacter { ch: invalid }),
             }
         }
     }
 
     /// Lex all form of number in lua.
-    fn lex_number(&mut self) -> Result<Token, SyntaxErr> {
+    fn lex_number(&mut self) -> Result<Token, SyntaxError> {
         let hex = matches!(
             (self.scan.first(), self.scan.second()),
             ('0', 'X') | ('0', 'x')
@@ -355,13 +360,13 @@ impl Lexer<'_> {
                         '-' => {self.bump(); false},
                         dig if dig.is_ascii_digit() => true,
                         other => {
-                            return  Err(SyntaxErr::BadFloatRepresentation { repr: format!("0x{src}p{other}") });
+                            return  Err(SyntaxError::BadFloatRepresentation { repr: format!("0x{src}p{other}") });
                         }
                     };
 
                     let exp_str = self.scan.eat_while(|c| c.is_ascii_digit());
                     if exp_str.is_empty() {
-                        Err(SyntaxErr::BadFloatRepresentation { repr: format!(
+                        Err(SyntaxError::BadFloatRepresentation { repr: format!(
                             "0x{}p{}",
                             base, if is_positive { '+' } else {'-'}
                         ) } )
@@ -389,13 +394,13 @@ impl Lexer<'_> {
                         self.col_n(copy.len());
                         Ok(Token::Float(f))
                     } else {
-                        Err(SyntaxErr::BadFloatRepresentation { repr: copy })
+                        Err(SyntaxError::BadFloatRepresentation { repr: copy })
                     }
                 } else if let Ok(f) = f64::from_str(base) {
                         self.col_n(base.len());
                         Ok(Token::Float(f))
                     } else {
-                        Err(SyntaxErr::BadFloatRepresentation { repr: base.to_string() })
+                        Err(SyntaxError::BadFloatRepresentation { repr: base.to_string() })
                     }
             },
 
@@ -413,7 +418,7 @@ impl Lexer<'_> {
                         self.col_n(copy.len());
                         Ok(Token::Float(f))
                     } else {
-                        Err(SyntaxErr::BadFloatRepresentation { repr: copy })
+                        Err(SyntaxError::BadFloatRepresentation { repr: copy })
                     }
                 }else {
                     self.col_n(base.len());
@@ -425,20 +430,20 @@ impl Lexer<'_> {
                             IntErrorKind::PosOverflow | IntErrorKind::NegOverflow => {
                                 return i128::from_str(base)
                                             .map(|i| Token::Float(i as f64))
-                                            .map_err(|_| SyntaxErr::BadIntergerRepresentation { repr: base.to_string() })
+                                            .map_err(|_| SyntaxError::BadIntergerRepresentation { repr: base.to_string() })
                             },
-                            _ => return Err(SyntaxErr::BadIntergerRepresentation { repr: base.to_string() }),
+                            _ => return Err(SyntaxError::BadIntergerRepresentation { repr: base.to_string() }),
                         }
                     };
 
-                    ret.map_err(|_| SyntaxErr::BadIntergerRepresentation { repr: base.to_string() })
+                    ret.map_err(|_| SyntaxError::BadIntergerRepresentation { repr: base.to_string() })
                 }
             }
         }
     }
 
     /// Lex sequence bounded with '\'' / '\"'.
-    fn lex_literal(&mut self) -> Result<Token, SyntaxErr> {
+    fn lex_literal(&mut self) -> Result<Token, SyntaxError> {
         // ' or "
         let quote = self.scan.first();
         self.bump();
@@ -457,7 +462,7 @@ impl Lexer<'_> {
                 }
 
                 '\x00' | '\n' | '\r' => {
-                    return Err(SyntaxErr::UnclosedStringLiteral {
+                    return Err(SyntaxError::UnclosedStringLiteral {
                         literal: format!("{quote}{lit}"),
                     })
                 }
@@ -489,7 +494,7 @@ impl Lexer<'_> {
                         ('x', x, y) if x.is_ascii_hexdigit() && y.is_ascii_hexdigit() => {
                             let escape =
                                 u8::from_str_radix(self.scan.eat_n(2), 16).map_err(|_| {
-                                    SyntaxErr::InvalidHexEscapeSequence {
+                                    SyntaxError::InvalidHexEscapeSequence {
                                         seq: format!("\\x{x}{y}"),
                                     }
                                 })?;
@@ -507,7 +512,7 @@ impl Lexer<'_> {
                                 let escape_len = subseq.len().min(2);
                                 let s = &subseq[0..escape_len];
                                 let escape = s.parse::<u8>().map_err(|_| {
-                                    SyntaxErr::InvalidDecimalEscapeSequence {
+                                    SyntaxError::InvalidDecimalEscapeSequence {
                                         seq: format!("\\{s}"),
                                     }
                                 })?;
@@ -553,7 +558,7 @@ impl Lexer<'_> {
                                 lit.push(c);
                                 self.col_n(unicode.len());
                             } else {
-                                return Err(SyntaxErr::InvalidUtf8EscapeSequence {
+                                return Err(SyntaxError::InvalidUtf8EscapeSequence {
                                     seq: format!("\\u{{{unicode}}}",),
                                 });
                             }
@@ -640,7 +645,7 @@ impl Lexer<'_> {
     }
 
     /// Lex operator and delimters
-    fn lex_punctuation(&mut self, start: char) -> Result<Token, SyntaxErr> {
+    fn lex_punctuation(&mut self, start: char) -> Result<Token, SyntaxError> {
         if start == '.' {
             let next = self.scan.second();
             // .25 | .4
@@ -757,6 +762,7 @@ impl Lexer<'_> {
 }
 
 mod test {
+
     #[test]
     fn common_float() {
         let floats = [
@@ -785,12 +791,18 @@ mod test {
     #[test]
     fn interger() {
         let ints = ["0xff", "0xBEBADA"];
-
-        // assert!("0xFF".parse::<i64>().is_ok());
-        // assert!(i64::from_str_radix("0xBEBADA", 16).is_ok());
-
         for item in ints {
             assert!(i64::from_str_radix(item, 16).is_err())
         }
+    }
+
+    #[test]
+    fn keywords() {
+        use crate::lexer::Lexer;
+
+        assert!(Lexer::KEY_WORDS
+            .iter()
+            .map(|s| Lexer::keyword_or_ident(s))
+            .all(|t| t.is_keyword()));
     }
 }

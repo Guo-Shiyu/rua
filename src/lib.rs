@@ -3,7 +3,7 @@ pub mod codegen;
 pub mod ffi;
 pub mod heap;
 pub mod lexer;
-pub mod lstd;
+pub mod luastd;
 pub mod parser;
 pub mod passes;
 pub mod state;
@@ -11,15 +11,15 @@ pub mod value;
 
 use std::fmt::{Debug, Display};
 
-use codegen::CodeGenErr;
+use codegen::{BinLoadErr, CodeGenError};
 use lexer::Token;
 use state::RegIndex;
-use value::LValue;
+use value::Value;
 
-use crate::state::Rvm;
+use crate::state::VM;
 
 #[derive(Debug)]
-pub enum SyntaxErr {
+pub enum SyntaxError {
     // Tokenizer Error
     InvalidCharacter { ch: char },
     BadFloatRepresentation { repr: String },
@@ -32,96 +32,138 @@ pub enum SyntaxErr {
     // Parser Error
     UnexpectedToken { expect: Vec<Token>, found: Token },
     InvalidAttribute { attr: String },
+    BadAssignment,
 }
 
 #[derive(Debug)]
-pub struct SyntaxError {
-    pub kind: SyntaxErr,
+pub struct ParseError {
+    pub kind: SyntaxError,
     pub line: u32,
     pub column: u32,
 }
 
-impl From<Box<SyntaxError>> for RuaErr {
-    fn from(err: Box<SyntaxError>) -> Self {
-        RuaErr::SyntaxErr(err)
+impl From<Box<ParseError>> for InterpretError {
+    fn from(err: Box<ParseError>) -> Self {
+        InterpretError::SyntaxErr(err)
     }
 }
 
-impl From<CodeGenErr> for RuaErr {
-    fn from(err: CodeGenErr) -> Self {
-        RuaErr::CodeGenErr(Box::new(err))
+impl From<CodeGenError> for InterpretError {
+    fn from(err: CodeGenError) -> Self {
+        InterpretError::CodeGenErr(Box::new(err))
+    }
+}
+
+impl From<BinLoadErr> for InterpretError {
+    fn from(value: BinLoadErr) -> Self {
+        match value {
+            BinLoadErr::IOErr(e) => Self::IOErr(e),
+            BinLoadErr::NotBinaryChunk => Self::NotBinaryChunk,
+            BinLoadErr::VersionMismatch => Self::BinaryChunkVersionMismatch,
+            BinLoadErr::UnsupportedFormat => Self::UnsupportedBinaryChunkFormat,
+            BinLoadErr::IncompatiablePlatform => Self::IncompatiablePlatform,
+        }
     }
 }
 
 #[derive(Debug)]
-pub enum RuaErr {
+pub enum InterpretError {
     IOErr(std::io::Error),
 
     // static error (compile error )
-    SyntaxErr(Box<SyntaxError>),
-    CodeGenErr(Box<CodeGenErr>),
+    SyntaxErr(Box<ParseError>),
+
+    CodeGenErr(Box<CodeGenError>),
+
+    NotBinaryChunk,
+
+    BinaryChunkVersionMismatch,
+
+    UnsupportedBinaryChunkFormat,
+
+    IncompatiablePlatform,
 
     // dynamic error (runtime error)
-    FuncDepthLimit,
+    RsCallDepthLimit {
+        max: u32,
+    },
+
     StackOverflow,
+
     InvalidRegisterAccess {
         target: RegIndex, // target register to access
         max: RegIndex,    // max local register number
     },
-    BadTanleIndex,
+
+    // table index is nil
+    BadTableIndex,
+
+    // try to call a value which is not callable
     InvalidInvocation {
-        callee: LValue,
+        callee: Value,
     },
+
+    // argument check for rs function
     ArgumentMismatch {
-        expect: u32,
-        got: u32,
+        expect: u8,
+        got: u8,
     },
+
+    AssertionFail,
 }
 
-impl Display for RuaErr {
+impl Display for InterpretError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use InterpretError::*;
         match self {
-            RuaErr::IOErr(e) => writeln!(f, "IO error: {}", e),
-            RuaErr::FuncDepthLimit => {
-                writeln!(
-                    f,
-                    "Too deep function call. (MAX_CALL_DEPTH: {})",
-                    Rvm::MAX_CALL_DEPTH
-                )
+            IOErr(e) => writeln!(f, "IO error: {}", e),
+            SyntaxErr(_) => todo!(),
+            CodeGenErr(_) => todo!(),
+
+            RsCallDepthLimit { max } => {
+                writeln!(f, "Too deep function call. (MAX_CALL_DEPTH: {})", max)
             }
-            RuaErr::StackOverflow => writeln!(
+
+            StackOverflow => writeln!(
                 f,
                 "Stack over flow. (MAX_STACK_SPACE: {})",
-                Rvm::MAX_STACK_SPACE
+                VM::MAX_STACK_SPACE
             ),
-            RuaErr::InvalidRegisterAccess { target, max } => {
+
+            InvalidRegisterAccess { target, max } => {
                 writeln!(
                     f,
                     "Invalid register access: {} (max available: {})",
                     target, max
                 )
             }
-            RuaErr::BadTanleIndex => {
+
+            BadTableIndex => {
                 writeln!(f, "Table index is nil")
             }
-            RuaErr::InvalidInvocation { callee } => {
+
+            InvalidInvocation { callee } => {
                 writeln!(f, "Try to call a non-callable object: {}", callee)
             }
-            RuaErr::ArgumentMismatch { expect, got } => {
+
+            ArgumentMismatch { expect, got } => {
                 writeln!(
                     f,
-                    "Wrong number of arguments.  expected {}, got {}",
+                    "Wrong number of arguments, expected {}, got {}",
                     expect, got
                 )
             }
-            RuaErr::SyntaxErr(_) => todo!(),
-            RuaErr::CodeGenErr(_) => todo!(),
+
+            AssertionFail => {
+                writeln!(f, "Assertion failed!")
+            }
+            _ => todo!(),
         }
     }
 }
 
-impl From<std::io::Error> for RuaErr {
+impl From<std::io::Error> for InterpretError {
     fn from(err: std::io::Error) -> Self {
-        RuaErr::IOErr(err)
+        InterpretError::IOErr(err)
     }
 }
