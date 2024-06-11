@@ -11,7 +11,7 @@ use std::{
 use crate::{
     ast::Block,
     codegen::{ChunkDumper, CodeGen, Instruction, OpCode, OpMode, Proto, UpvalDecl},
-    ffi::Stdlib,
+    ffi::{self, Stdlib},
     heap::{Gc, GcOp, Heap, LuaClosure, MetaOperator, Table, Tag, UpVal},
     parser::Parser,
     passes,
@@ -349,17 +349,10 @@ impl VM {
         vm
     }
 
-    pub fn with_libs(libs: &[Stdlib]) -> Self {
-        let mut vm = Self::new();
-        vm.open_libs(libs);
-        vm
-    }
-
-    pub fn open(&mut self, lib: Stdlib) {
-        let entrys = crate::ffi::get_std_libs(lib);
-        for (name, func) in entrys.iter() {
-            let fkey = self.new_str(name);
-            self.set_global(fkey, Value::from(*func));
+    pub fn open(&mut self, lib: Stdlib) -> Result<usize, InterpretError> {
+        let mut nfunc = 0;
+        for entry in crate::ffi::get_std_libs(lib) {
+            nfunc += ffi::open_lib(self, entry)?;
         }
 
         // create string about meta operators lazily
@@ -371,20 +364,26 @@ impl VM {
                 self.new_fixed(builtin);
             }
         }
+
+        Ok(nfunc as usize)
     }
 
-    pub fn open_libs(&mut self, libs: &[Stdlib]) {
+    pub fn open_libs(&mut self, libs: &[Stdlib]) -> Result<(), InterpretError> {
         for lib in libs.iter() {
-            self.open(*lib);
+            self.open(*lib)?;
         }
+        Ok(())
     }
 
     pub fn genv(&self) -> Value {
         self.global.into()
     }
 
-    pub fn set_global(&mut self, key: Value, val: Value) -> Option<Value> {
-        self.global.insert(key, val)
+    pub fn set_global<V>(&mut self, key: Value, val: V) -> Option<Value>
+    where
+        V: Into<Value>,
+    {
+        self.global.insert(key, val.into())
     }
 
     pub fn get_global(&mut self, key: Value) -> Value {
@@ -1043,7 +1042,7 @@ mod test {
     }
 
     #[test]
-    fn before_and_after_call() {
+    fn before_and_after_call() -> Result<(), InterpretError> {
         fn check_init_state(vm: &mut VM) {
             assert_eq!(vm.top(), 0);
 
@@ -1060,7 +1059,7 @@ mod test {
         }
 
         let mut vm = VM::new();
-        vm.open(Stdlib::Base);
+        vm.open(Stdlib::Base)?;
 
         check_init_state(&mut vm);
         let call = r#"
@@ -1068,5 +1067,6 @@ mod test {
         "#;
         assert_eq!(vm.unsafe_script(call, None).unwrap(), ());
         check_init_state(&mut vm);
+        Ok(())
     }
 }
