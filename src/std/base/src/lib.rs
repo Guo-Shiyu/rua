@@ -91,6 +91,13 @@ mod base {
 mod tests {
     use super::*;
 
+    /// Test `ruastd` macro here to avoid introduce dependency to `stddecl`.
+    #[test]
+    fn empty_foreign_module() {
+        #[ruastd]
+        mod empty {}
+    }
+
     #[test]
     fn show_entry_info() {
         let mut vm: VM = VM::new();

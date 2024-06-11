@@ -35,13 +35,33 @@ pub fn ruastd(_attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     }
 
+    if fns.is_empty() {
+        return quote! { #input }.into();
+    }
+
+    let hookdef = if fns
+        .iter()
+        .any(|sig| sig.span().source_text().unwrap() == "rua_on_lib_open")
+    {
+        quote! {}
+    } else {
+        quote! {
+            #[no_mangle]
+            fn rua_on_lib_open(vm: &mut VM) -> Result<usize, InterpretError> {
+                Ok(0)
+            }
+        }
+    };
+
     let entry = format_ident!("luaopen_{}", module_name);
     let rua_entrys = format_ident!("__rua_{}_names", module_name);
     let rua_entrycnt_id = format_ident!("__rua_{}_num", module_name);
     let entrycnt = fns.len();
 
     let output = quote! {
-        pub #input
+        #input
+
+        #hookdef
 
         #[no_mangle]
         #[used]
@@ -65,6 +85,7 @@ pub fn ruastd(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 let key: Value = vm.new_str(key);
                 vm.set_global(key, Value::from(*ptr));
             }
+            let _ = rua_on_lib_open(vm).expect("Hook failed on opening foreign module.");
             #rua_entrycnt_id
         }
     };
