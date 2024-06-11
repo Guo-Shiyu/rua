@@ -65,11 +65,10 @@ impl From<BinLoadErr> for InterpretError {
     }
 }
 
-#[derive(Debug)]
 pub enum InterpretError {
     IOErr(std::io::Error),
 
-    // static error (compile error )
+    /* static error (compile error ) */
     SyntaxErr(Box<ParseError>),
 
     CodeGenErr(Box<CodeGenError>),
@@ -82,7 +81,7 @@ pub enum InterpretError {
 
     IncompatiablePlatform,
 
-    // dynamic error (runtime error)
+    /* dynamic error (runtime error) */
     RsCallDepthLimit {
         max: u32,
     },
@@ -106,6 +105,14 @@ pub enum InterpretError {
     ArgumentMismatch {
         expect: u8,
         got: u8,
+    },
+
+    ForeignModuleNotFound {
+        path: Box<String>,
+    },
+
+    BadForeignModule {
+        entry: Box<String>,
     },
 
     AssertionFail,
@@ -156,8 +163,23 @@ impl Display for InterpretError {
             AssertionFail => {
                 writeln!(f, "Assertion failed!")
             }
+
+            ForeignModuleNotFound { path } => {
+                writeln!(f, "Foreign module not found in dir: {}.", path)
+            }
+
+            BadForeignModule { entry } => {
+                writeln!(f, "Entry {} not found in dynamic library.", entry)
+            }
+
             _ => todo!(),
         }
+    }
+}
+
+impl Debug for InterpretError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self)
     }
 }
 
