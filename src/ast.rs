@@ -74,6 +74,7 @@ impl<T> DerefMut for SrcLoc<T> {
 /// ``` text
 /// block ::= {stat} [retstat]
 /// ```
+#[derive(Default)]
 pub struct Block {
     pub chunkname: Option<String>,
     pub stats: Vec<StmtNode>,
@@ -167,6 +168,48 @@ pub enum Stmt {
 
     // single expression as a statement
     Expr(ExprNode),
+}
+
+impl Stmt {
+    pub fn has_side_effect(&self) -> bool {
+        match self {
+            Stmt::DoEnd(blk) => !blk.inner_ref().is_empty(),
+
+            // while false has no side effect
+            Stmt::While { exp, block: _ } => exp.try_eval_as_const_bool().is_some_and(|b| b),
+
+            // TODO:
+            // check empty numberic loop with `init == limit`
+            Stmt::NumericFor(_) => true,
+
+            Stmt::IfElse { cond, then, els } => {
+                if let Some(flag) = cond.try_eval_as_const_bool() {
+                    return if flag {
+                        !then.is_empty()
+                    } else if let Some(blk) = els {
+                        !blk.is_empty()
+                    } else {
+                        false
+                    };
+                }
+                true
+            }
+
+            Stmt::Expr(e) => match e.inner_ref() {
+                Expr::Nil
+                | Expr::False
+                | Expr::True
+                | Expr::Int(_)
+                | Expr::Float(_)
+                | Expr::Literal(_)
+                | Expr::Dots
+                | Expr::Ident(_) => false,
+                _ => true,
+            },
+
+            _ => true,
+        }
+    }
 }
 
 /// ``` text
@@ -267,6 +310,16 @@ pub enum Expr {
         op: UnOp,
         expr: ExprNode,
     },
+}
+
+impl Expr {
+    pub fn try_eval_as_const_bool(&self) -> Option<bool> {
+        match self {
+            Expr::Nil | Expr::False => Some(false),
+            Expr::True | Expr::Int(_) | Expr::Float(_) | Expr::Literal(_) => Some(true),
+            _ => None,
+        }
+    }
 }
 
 /// There are two possible attributes: const, which declares a constant variable, that is, a variable that cannot be assigned to after its initialization;

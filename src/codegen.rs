@@ -640,7 +640,7 @@ impl Proto {
         for (idx, code) in p.code.iter().enumerate() {
             let line = p.pcline.get(idx).unwrap_or(&0);
             write!(f, "\t{idx}\t[{}]\t{:?>8} ; ", line, code)?;
-            self.isc_extra_info(code, f)?;
+            self.isc_extra_info(f, code, idx)?;
             writeln!(f)?;
         }
 
@@ -686,8 +686,9 @@ impl Proto {
 
     fn isc_extra_info(
         &self,
-        code: &Instruction,
         f: &mut std::fmt::Formatter,
+        code: &Instruction,
+        idx: usize,
     ) -> Result<(), std::fmt::Error> {
         match code.mode() {
             OpMode::IABC => {
@@ -762,13 +763,16 @@ impl Proto {
             OpMode::IAx => {
                 let (op, _) = code.repr_ax();
                 match op {
-                    OpCode::EXTRAARG => {}
+                    EXTRAARG => {}
                     _ => unreachable!(),
                 };
             }
             OpMode::IsJ => {
-                // let (isc, jmp) = code.repr_sj();
-                todo!()
+                let (isc, jmp) = code.repr_sj();
+                match isc {
+                    JMP => write!(f, "to {}", idx + jmp as usize)?,
+                    _ => unreachable!(),
+                }
             }
         };
         Ok(())
@@ -846,6 +850,19 @@ impl GenState {
         let mut res = Self::new(srcfile);
         res.upvals.push(UpvalDecl::Env);
         res
+    }
+
+    fn try_eval_as_const_bool(&self, status: &ExprStatus) -> Option<bool> {
+        match status {
+            ExprStatus::LitNil | ExprStatus::LitFalse => Some(false),
+            ExprStatus::LitTrue | ExprStatus::LitInt(_) | ExprStatus::LitFlt(_) => Some(true),
+            ExprStatus::Kst(kidx) => Some(match self.ksts[*kidx as usize] {
+                Value::Nil => false,
+                Value::Bool(b) => b,
+                _ => true,
+            }),
+            _ => None,
+        }
     }
 
     fn cur_pc(&self) -> u32 {
@@ -1522,11 +1539,19 @@ impl CodeGen {
         mem: &mut Heap,
     ) -> Result<(), CodeGenError> {
         let cond_def = exp.def_begin();
-        let cond = self.walk_common_expr(exp, Ctx::Allocate, mem)?;
+        let cond = self.walk_common_expr(exp, Ctx::Keep, mem)?;
+
+        // try skip unused branch
+        if let Some(state) = self.try_eval_as_const_bool(&cond) {
+            return if state {
+                self.walk_basic_block(then, mem).map(|_| ())
+            } else {
+                els.map_or(Ok(()), |blk| self.walk_basic_block(blk, mem).map(|_| ()))
+            };
+        };
+
         let reg = self.try_load_expr_to_local(cond, cond_def);
-
         self.emit(Isc::iabck(TEST, reg, 0, 0), cond_def);
-
         let mut branch = BranchBackPatchPoint {
             cond_jmp_idx: self.cur_pc(),
             then_end_jmp_idx: None,

@@ -94,6 +94,7 @@ pub fn walk_chunk<T: MutVisitor>(vis: &mut T, chunk: &mut BasicBlock) {
     for stmt in chunk.stats.iter_mut() {
         vis.visit_stmt(stmt);
     }
+    chunk.stats.retain(|stat| stat.has_side_effect());
     vis.visit_return(&mut chunk.ret);
 }
 
@@ -106,6 +107,20 @@ pub fn walk_return<T: MutVisitor>(vis: &mut T, ret: &mut Option<Vec<ExprNode>>) 
 }
 
 pub fn walk_stmt<T: MutVisitor>(vis: &mut T, stmt: &mut StmtNode) {
+    let mut replace = None;
+    let ln = (0, 0);
+    let make_nil_node = || Stmt::Expr(ExprNode::new(SrcLoc::new(Expr::Nil, ln)));
+
+    // flatten a basic block in if-else branch to do-end statement.
+    let mut flatten_branch = |block: &mut Box<SrcLoc<Block>>, vis: &mut T| {
+        if !block.is_empty() {
+            vis.visit_chunk(block);
+            replace = Some(Stmt::DoEnd(std::mem::take(block)))
+        } else {
+            replace = Some(make_nil_node())
+        }
+    };
+
     match stmt.inner_mut() {
         Stmt::Lable(_) => {}
         Stmt::Goto(_) => {}
@@ -115,7 +130,16 @@ pub fn walk_stmt<T: MutVisitor>(vis: &mut T, stmt: &mut StmtNode) {
         Stmt::While { exp, block } => vis.visit_while(exp, block),
         Stmt::Repeat { exp, block } => vis.visit_repeat(exp, block),
         Stmt::IfElse { cond, then, els } => {
-            vis.visit_if_else(cond, then, els);
+            vis.visit_expr(cond);
+            if let Some(flag) = cond.try_eval_as_const_bool() {
+                if flag {
+                    flatten_branch(then, vis);
+                } else if let Some(elsblk) = els {
+                    flatten_branch(elsblk, vis);
+                }
+            } else {
+                vis.visit_if_else(cond, then, els);
+            }
         }
         Stmt::NumericFor(num) => {
             vis.visit_numeric_for(
@@ -133,6 +157,9 @@ pub fn walk_stmt<T: MutVisitor>(vis: &mut T, stmt: &mut StmtNode) {
             vis.visit_local_decl(names, exprs);
         }
         Stmt::Expr(exp) => vis.visit_expr(exp),
+    };
+    if let Some(inner) = replace {
+        ***stmt = inner
     }
 }
 
@@ -201,11 +228,10 @@ pub fn walk_repeat<T: MutVisitor>(vis: &mut T, cond: &mut ExprNode, chunk: &mut 
 
 pub fn walk_if_else<T: MutVisitor>(
     vis: &mut T,
-    cond: &mut ExprNode,
+    _cond: &mut ExprNode,
     chunk: &mut BasicBlock,
     else_chunk: &mut Option<BasicBlock>,
 ) {
-    vis.visit_expr(cond);
     vis.visit_chunk(chunk);
     if let Some(els_chunk) = else_chunk {
         vis.visit_chunk(els_chunk);
@@ -464,12 +490,25 @@ impl MutVisitor for ConstantFolder {
     fn visit_if_else(
         &mut self,
         cond: &mut ExprNode,
-        chunk: &mut BasicBlock,
-        else_chunk: &mut Option<BasicBlock>,
+        then_blk: &mut BasicBlock,
+        else_blk: &mut Option<BasicBlock>,
     ) {
-        try_fold(cond);
-        walk_chunk(self, chunk);
-        if let Some(els_chunk) = else_chunk {
+        if let AfterFoldStatus::StillConst = try_fold(cond) {
+            if let Some(b) = cond.try_eval_as_const_bool() {
+                if b {
+                    // `if true then ...`, drop else block
+                    let _ = std::mem::take(else_blk);
+                } else {
+                    // `if false then ...` drop then block
+                    let _ = std::mem::take(then_blk);
+                    if let None = else_blk {
+                        *else_blk = Some(BasicBlock::default());
+                    }
+                }
+            }
+        };
+        walk_chunk(self, then_blk);
+        if let Some(els_chunk) = else_blk {
             walk_chunk(self, els_chunk);
         }
     }
@@ -503,14 +542,13 @@ impl MutVisitor for ConstantFolder {
     }
 }
 
+#[cfg(test)]
 mod test {
+    use super::*;
+    use crate::parser::Parser;
 
     #[test]
     fn constant_fold_exec_test() {
-        use crate::parser::Parser;
-        use crate::passes::ConstantFolder;
-        use crate::passes::MutVisitor;
-
         let emsg = format!(
             "unable to find directory: \"test\" with base dir:{}",
             std::env::current_dir().unwrap().display()
