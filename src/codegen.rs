@@ -539,10 +539,10 @@ impl TypeTag for Proto {
 
 impl Display for Proto {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.basic_fmt(self, f)?;
+        Self::basic_fmt(self, f)?;
         for each in self.subfn.iter() {
             writeln!(f)?;
-            self.basic_fmt(each, f)?;
+            Self::basic_fmt(each, f)?;
         }
         Ok(())
     }
@@ -611,7 +611,7 @@ impl Proto {
         self.pcline[pc as usize]
     }
 
-    fn basic_fmt(&self, p: &Proto, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+    fn basic_fmt(p: &Proto, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
         debug_assert!(p.source.is_str());
         writeln!(
             f,
@@ -629,7 +629,7 @@ impl Proto {
         }
         writeln!(
             f,
-            "{} slots, {} upvalue, {} locals, {}, constants, {} functions",
+            "{} slots, {} upvalue, {} locals, {} constants, {} functions",
             p.nreg,
             p.updecl.len(),
             p.locvars.len(),
@@ -640,7 +640,7 @@ impl Proto {
         for (idx, code) in p.code.iter().enumerate() {
             let line = p.pcline.get(idx).unwrap_or(&0);
             write!(f, "\t{idx}\t[{}]\t{:?>8} ; ", line, code)?;
-            self.isc_extra_info(f, code, idx)?;
+            p.isc_extra_info(f, code, idx)?;
             writeln!(f)?;
         }
 
@@ -648,7 +648,7 @@ impl Proto {
     }
 
     fn debug_fmt(&self, p: &Proto, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
-        self.basic_fmt(p, f)?;
+        Self::basic_fmt(p, f)?;
 
         let self_addr = p as *const Proto as usize;
         writeln!(
@@ -770,7 +770,7 @@ impl Proto {
             OpMode::IsJ => {
                 let (isc, jmp) = code.repr_sj();
                 match isc {
-                    JMP => write!(f, "to {}", idx + jmp as usize)?,
+                    JMP => write!(f, "to {}", idx + 1 + jmp as usize)?,
                     _ => unreachable!(),
                 }
             }
@@ -1585,12 +1585,12 @@ impl CodeGen {
 
             self.emit_backpatch(
                 branch.cond_jmp_idx as usize,
-                Isc::isj(JMP, (pc - branch.cond_jmp_idx) as i32),
+                Isc::isj(JMP, (pc - branch.cond_jmp_idx - 1) as i32),
             );
         } else {
             self.emit_backpatch(
                 branch.cond_jmp_idx as usize,
-                Isc::isj(JMP, (branch.def_end_pc - branch.cond_jmp_idx) as i32),
+                Isc::isj(JMP, (branch.def_end_pc - branch.cond_jmp_idx - 1) as i32),
             );
         };
 
@@ -1604,7 +1604,6 @@ impl CodeGen {
         mem: &mut Heap,
     ) -> Result<(), CodeGenError> {
         debug_assert!(!names.is_empty());
-        debug_assert!(!exprs.is_empty());
 
         let ndecl = names.len();
 
@@ -1861,10 +1860,13 @@ impl CodeGen {
                         let kreg = self.alloc_const_reg(mem.take_str(l).into());
                         ExprStatus::Kst(kreg)
                     }
-                    // Expr::Ident()
-                    otherwhise => {
+                    Expr::Ident(id) => {
+                        let reg = self.lookup_and_load(id, None, def.0, mem);
+                        ExprStatus::Reg(reg)
+                    }
+                    otherwise => {
                         let free = self.alloc_free_reg();
-                        self.emit_expr(otherwhise, free, def, mem)?
+                        self.emit_expr(otherwise, free, def, mem)?
                     }
                 };
                 Ok(status)

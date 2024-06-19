@@ -840,6 +840,13 @@ impl VM {
 
                         MUL => {
                             self.rset(a, 6)?;
+                            // todo!();
+                        }
+
+                        TEST => {
+                            if self.rget(a)?.is_falsey() != k {
+                                self.pc += 1;
+                            }
                         }
 
                         CALL => {
@@ -915,7 +922,16 @@ impl VM {
                         _ => unreachable!(),
                     };
                 }
-                OpMode::IsJ => todo!(),
+
+                OpMode::IsJ => {
+                    let (op, sj) = code.repr_sj();
+                    match op {
+                        JMP => {
+                            self.pc += sj;
+                        }
+                        _ => unreachable!(),
+                    }
+                }
             }
         }
     }
