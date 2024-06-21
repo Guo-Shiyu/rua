@@ -1,16 +1,25 @@
 [package]
 name = "rua"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
+
+[workspace]
+members = [
+    ".",
+    "src/std/stddecl",
+    "src/std/base",
+    "src/std/string",
+    "src/std/table",
+]
 
 [lib]
 name = "rua"
 path = "src/lib.rs"
 
-[[bin]] 
+[[bin]]
 name = "ruac"
-path = "src/bin/ruac.rs" 
+path = "src/bin/ruac.rs"
 
-[[bin]] 
+[[bin]]
 name = "rua"
-path = "src/bin/rua.rs" 
+path = "src/bin/rua.rs"

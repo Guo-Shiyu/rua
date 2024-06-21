@@ -3,7 +3,8 @@ use std::env;
 use rua::{ffi::Stdlib, state::VM, InterpretError};
 
 fn main() -> Result<(), InterpretError> {
-    let mut vm = VM::with_libs(&[Stdlib::Base]);
+    let mut vm = VM::new();
+    vm.open(Stdlib::Base)?;
     if let Some(file) = env::args().nth(1) {
         vm.script_file(&file)?;
         Ok(())
@@ -22,9 +23,9 @@ mod test {
     use super::*;
 
     #[test]
-    fn hello_world() {
+    fn hello_world() -> Result<(), InterpretError> {
         let mut vm = VM::new();
-        vm.open(Stdlib::Base);
+        vm.open(Stdlib::Base)?;
 
         let src = r#"
             print "Hello Rua! 1"
@@ -33,10 +34,11 @@ mod test {
         "#;
 
         let res = vm.unsafe_script(src, None);
-        // dbg!(&res);
+        dbg!(&res);
         assert!(res.is_ok());
         vm.full_gc();
         // println!("# after gc");
+        Ok(())
     }
 
     #[test]
@@ -64,7 +66,8 @@ mod test {
                 matches! { p.extension().map(|ex| ex.to_str().unwrap_or_default()), Some("lua")}
             })
             .for_each(|filepath| {
-                let mut vm = VM::with_libs(&[Stdlib::Base]);
+                let mut vm = VM::new();
+                assert_ne!(vm.open(Stdlib::Base).unwrap(), 0);
                 let res = vm.script_file(filepath);
                 if res.is_err() {
                     dbg!(res.as_ref().err().unwrap());
