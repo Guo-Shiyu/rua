@@ -107,13 +107,9 @@ pub enum InterpretError {
         got: u8,
     },
 
-    ForeignModuleNotFound {
-        path: Box<String>,
-    },
+    ForeignModuleNotFound(Box<ModuleNotFound>),
 
-    BadForeignModule {
-        entry: Box<String>,
-    },
+    BadForeignModule(Box<BadModule>),
 
     AssertionFail,
 }
@@ -164,12 +160,20 @@ impl Display for InterpretError {
                 writeln!(f, "Assertion failed!")
             }
 
-            ForeignModuleNotFound { path } => {
-                writeln!(f, "Foreign module not found in dir: {}.", path)
+            ForeignModuleNotFound(info) => {
+                writeln!(
+                    f,
+                    "Foreign module: {} not found in dir: {} and it's sub dirs.",
+                    info.lib, info.path
+                )
             }
 
-            BadForeignModule { entry } => {
-                writeln!(f, "Entry {} not found in dynamic library.", entry)
+            BadForeignModule(info) => {
+                writeln!(
+                    f,
+                    "Entry {} not found in C extension: {}.",
+                    info.entry, info.path
+                )
             }
 
             _ => todo!(),
@@ -186,5 +190,27 @@ impl Debug for InterpretError {
 impl From<std::io::Error> for InterpretError {
     fn from(err: std::io::Error) -> Self {
         InterpretError::IOErr(err)
+    }
+}
+
+pub struct ModuleNotFound {
+    path: String,
+    lib: String,
+}
+
+impl From<ModuleNotFound> for InterpretError {
+    fn from(info: ModuleNotFound) -> Self {
+        InterpretError::ForeignModuleNotFound(Box::new(info))
+    }
+}
+
+pub struct BadModule {
+    path: String,
+    entry: String,
+}
+
+impl From<BadModule> for InterpretError {
+    fn from(info: BadModule) -> Self {
+        InterpretError::BadForeignModule(Box::new(info))
     }
 }
