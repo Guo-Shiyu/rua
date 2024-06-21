@@ -176,7 +176,10 @@ impl Stmt {
             Stmt::DoEnd(blk) => !blk.inner_ref().is_empty(),
 
             // while false has no side effect
-            Stmt::While { exp, block: _ } => exp.try_eval_as_const_bool().is_some_and(|b| b),
+            Stmt::While { exp, block: _ } => match exp.try_eval_as_const_bool() {
+                Some(flag) => flag, // `while true` has side effect but `while false` doesn't
+                None => true,
+            },
 
             // TODO:
             // check empty numberic loop with `init == limit`

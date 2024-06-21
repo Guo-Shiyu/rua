@@ -1424,18 +1424,29 @@ impl CodeGen {
         mem: &mut Heap,
     ) -> Result<(), CodeGenError> {
         self.enter_loop();
-        let ln = cond.def_begin();
-        let cond_reg = {
-            let sts = self.walk_common_expr(cond, Ctx::Allocate, mem)?;
-            self.try_load_expr_to_local(sts, ln)
+        let condbeg = cond.def_begin();
+        let blockend = cond.def_end();
+        let cond = {
+            let sts = self.walk_common_expr(cond, Ctx::Keep, mem)?;
+            // TODO:
+            // if let Some(flag) = self.try_eval_as_const_bool(&sts) {
+            //     if flag {
+            //         // while true, elimitate TEST, JMP instruction
+            //     } else {
+            //         // while false, skip loop body.
+            //     }
+            // }
+            self.try_load_expr_to_local(sts, condbeg)
         };
-        self.emit(Isc::iabc(TEST, cond_reg, false as i32, 0), ln);
-        let loop_begin = self.set_recover_point(ln);
+        self.emit(Isc::iabck(TEST, cond, 0, 0), condbeg);
+        let (bpidx, oldpc) = self.set_recover_point(condbeg);
         self.walk_basic_block(block, mem)?;
         self.leave_loop();
+        let step = (self.cur_pc() - oldpc) as i32;
+        self.emit_backpatch(bpidx, Isc::isj(JMP, step));
 
-        let step = (self.cur_pc() - loop_begin.1) as i32;
-        self.emit_backpatch(loop_begin.0, Isc::isj(JMP, step));
+        // -2: current pc is the next isc and JMP self is another instruction
+        self.emit(Isc::isj(JMP, -step - 2), blockend);
         Ok(())
     }
 
