@@ -65,14 +65,8 @@ impl Frame {
     /// slot pointer in current frame
     fn slot_ptr_of(&self, idx: RegIndex) -> *mut Slot {
         debug_assert!(idx >= 0);
-        unsafe {
-            // FIXME: remove the condition
-            if idx < 0 {
-                self.slotend.sub(idx.unsigned_abs() as usize)
-            } else {
-                self.func.add(idx as usize + 1) // +1 to convert to register index
-            }
-        }
+        // +1 to convert to register index
+        unsafe { self.func.add(idx as usize + 1) }
     }
 
     fn access<T>(

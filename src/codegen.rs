@@ -770,7 +770,7 @@ impl Proto {
             OpMode::IsJ => {
                 let (isc, jmp) = code.repr_sj();
                 match isc {
-                    JMP => write!(f, "to {}", idx + 1 + jmp as usize)?,
+                    JMP => write!(f, "to {}", idx as i32 + 1 + jmp)?,
                     _ => unreachable!(),
                 }
             }
@@ -1405,14 +1405,15 @@ impl CodeGen {
         mem: &mut Heap,
     ) -> Result<(), CodeGenError> {
         let def = cond.def_begin();
-        self.enter_loop();
+        let entry = self.cur_pc();
         self.walk_basic_block(block, mem)?;
-        self.leave_loop();
         let cond_reg = {
-            let s = self.walk_common_expr(cond, Ctx::Allocate, mem)?;
-            self.try_load_expr_to_local(s, def)
+            let cond = self.walk_common_expr(cond, Ctx::Keep, mem)?;
+            self.try_load_expr_to_local(cond, def)
         };
-        self.emit(Isc::iabc(TEST, cond_reg, true as i32, 0), def);
+        self.emit(Isc::iabck(TEST, cond_reg, 0, 0), def);
+        let fwdstep = entry as i32 - self.cur_pc() as i32 - 1; // -1: pc is the next isc
+        self.emit(Isc::isj(JMP, fwdstep), def);
         Ok(())
     }
 

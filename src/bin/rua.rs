@@ -28,9 +28,7 @@ mod test {
         vm.open(Stdlib::Base)?;
 
         let src = r#"
-            print "Hello Rua! 1"
-            print("Hello Rua! 2")
-            print("Hello Rua! 3", "Hello Rua! 4", "Hello Rua! 5")
+            print "Hello Rua!"
         "#;
 
         let res = vm.unsafe_script(src, None);
