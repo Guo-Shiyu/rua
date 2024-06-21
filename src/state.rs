@@ -44,10 +44,14 @@ impl Frame {
     const INIT_FRAME_PC: i32 = i32::MAX;
     const LUA_MULTI_RET: i32 = i32::MAX;
 
+    unsafe fn cur_isc(&self) -> Instruction {
+        *self.code_ptr.offset(self.pc as isize)
+    }
+
     /// Get next instruction and increase pc counter with 1.
     fn fetch(&mut self) -> Instruction {
         debug_assert!(self.pc < self.codelen);
-        let isc = unsafe { *self.code_ptr.offset(self.pc as isize) };
+        let isc = unsafe { self.cur_isc() };
         self.pc += 1;
         isc
     }
@@ -754,7 +758,72 @@ impl VM {
         Ok(())
     }
 
+    /// Set warn handler, return old handler
+    pub fn set_warn_handler(&mut self, warn: WarnFn) -> WarnFn {
+        std::mem::replace(&mut self.warn, warn)
+    }
+
+    /// Set panic handler, return old handler
+    pub fn set_panic_handler(&mut self, panic: PanicFn) -> PanicFn {
+        std::mem::replace(&mut self.panic, panic)
+    }
+
+    pub fn set_hook_handler(&mut self, hook: Hook) -> Hook {
+        std::mem::replace(&mut self.hook, hook)
+    }
+
+    fn mark_rootset_reachable(&mut self) {
+        // mark all reachable object to black
+        self.stack_iter().for_each(|val| val.mark_reachable());
+        self.global.mark_reachable();
+    }
+
+    pub fn full_gc(&mut self) {
+        self.heap.mark_all_obj_unreachable();
+        self.mark_rootset_reachable();
+
+        // table with finalizer
+        let twfs = self.heap.sweep_unreachable();
+        for tofinal in twfs.into_iter() {
+            // TODO:
+            // process twfs and drop internal strings
+            Gc::drop(tofinal);
+        }
+        // dbg!(self.heap.total_alloc_bytes());
+    }
+}
+
+impl VM {
     fn execute(&mut self) -> Result<(), InterpretError> {
+        use OpCode::*;
+        use Value::*;
+
+        macro_rules! arth_op_impl {
+            ($dest: expr, $left: expr, $right: expr, $op: tt, $isc: ident) => {
+                {
+                    let (lhs, rhs) = ($left, $right) ;
+                    debug_assert!(lhs.is_number() && rhs.is_number());
+
+                    let result: Value = match (lhs, rhs) {
+                        (Int(l), Int(r)) => (l $op r).into(),
+                        (Float(l), Float(r)) => (l $op r).into(),
+                        (Float(l), Int(r)) => (l $op r as f64).into(),
+                        (Int(l), Float(r)) => (l as f64 $op r).into(),
+                        _ => Nil,
+                    };
+
+                    if !result.is_nil() {
+                        self.rset($dest, result)?;
+
+                        // TODO: support meta operation
+                        // self.pc += 1;
+                    } else {
+                        // debug_assert_eq!({ unsafe { self.cur_isc() }.get_op() }, $isc);
+                    }
+                }
+            };
+        }
+
         if self.calldepth >= VM::MAX_RS_CALL_DEPTH {
             return Err(InterpretError::RsCallDepthLimit {
                 max: VM::MAX_RS_CALL_DEPTH,
@@ -763,7 +832,6 @@ impl VM {
         self.calldepth += 1;
         let origin_frame = self.callchain.len();
 
-        use OpCode::*;
         loop {
             let code = self.fetch();
             dbg!(code.to_string());
@@ -778,6 +846,11 @@ impl VM {
 
                         LOADFALSE => {
                             self.rset(a, false)?;
+                        }
+
+                        LFALSESKIP => {
+                            self.rset(a, false)?;
+                            self.pc += 1;
                         }
 
                         LOADTRUE => {
@@ -831,11 +904,64 @@ impl VM {
                             self.rset(a, table)?;
                         }
 
-                        MUL => {
-                            self.rset(a, 6)?;
-                            // todo!();
+                        ADDI => {
+                            arth_op_impl!(a, self.rget(b)?, Value::from(c), + , MMBINI)
                         }
 
+                        ADDK => {
+                            arth_op_impl!(a, self.rget(b)?, self.kget(c), + , MMBINK)
+                        }
+
+                        SUBK => {
+                            arth_op_impl!(a, self.rget(b)?, self.kget(c), - , MMBINK)
+                        }
+
+                        MULK => {
+                            arth_op_impl!(a, self.rget(b)?, self.kget(c), * , MMBINK)
+                        }
+
+                        MODK => {
+                            arth_op_impl!(a, self.rget(b)?, self.kget(c), % , MMBINK)
+                        }
+
+                        // POWK => {}
+                        DIVK => {
+                            arth_op_impl!(a, self.rget(b)?, self.kget(c), / , MMBINK)
+                        }
+
+                        // IDIVK => {}
+                        // BANDK => {}
+                        // BORK => {}
+                        // BXORK => {}
+                        // SHRI => {}
+                        // SHLI => {}
+                        ADD => {
+                            arth_op_impl!(a, self.rget(b)?, self.rget(c)?, + , MMBIN)
+                        }
+
+                        SUB => {
+                            arth_op_impl!(a, self.rget(b)?, self.rget(c)?, - , MMBIN)
+                        }
+
+                        MUL => {
+                            arth_op_impl!(a, self.rget(b)?, self.rget(c)?, * , MMBIN)
+                        }
+
+                        MOD => {
+                            arth_op_impl!(a, self.rget(b)?, self.rget(c)?, % , MMBIN)
+                        }
+
+                        // POW => {}
+                        DIV => {
+                            arth_op_impl!(a, self.rget(b)?, self.rget(c)?, / , MMBIN)
+                        }
+
+                        // IDIV => {}
+                        // BAND => {}
+                        // BOR => {}
+                        // BXOR => {}
+                        // SHL => {}
+                        // SHR => {}
                         TEST => {
                             if self.rget(a)?.is_falsey() != k {
                                 self.pc += 1;
@@ -927,40 +1053,6 @@ impl VM {
                 }
             }
         }
-    }
-
-    /// Set warn handler, return old handler
-    pub fn set_warn_handler(&mut self, warn: WarnFn) -> WarnFn {
-        std::mem::replace(&mut self.warn, warn)
-    }
-
-    /// Set panic handler, return old handler
-    pub fn set_panic_handler(&mut self, panic: PanicFn) -> PanicFn {
-        std::mem::replace(&mut self.panic, panic)
-    }
-
-    pub fn set_hook_handler(&mut self, hook: Hook) -> Hook {
-        std::mem::replace(&mut self.hook, hook)
-    }
-
-    fn mark_rootset_reachable(&mut self) {
-        // mark all reachable object to black
-        self.stack_iter().for_each(|val| val.mark_reachable());
-        self.global.mark_reachable();
-    }
-
-    pub fn full_gc(&mut self) {
-        self.heap.mark_all_obj_unreachable();
-        self.mark_rootset_reachable();
-
-        // table with finalizer
-        let twfs = self.heap.sweep_unreachable();
-        for tofinal in twfs.into_iter() {
-            // TODO:
-            // process twfs and drop internal strings
-            Gc::drop(tofinal);
-        }
-        // dbg!(self.heap.total_alloc_bytes());
     }
 }
 

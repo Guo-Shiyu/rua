@@ -242,6 +242,10 @@ impl Value {
         matches!(self, Value::Float(_))
     }
 
+    pub fn is_number(&self) -> bool {
+        self.is_int() || self.is_float()
+    }
+
     pub fn is_str(&self) -> bool {
         matches!(self, Value::Str(_))
     }
@@ -285,10 +289,24 @@ impl Value {
         }
     }
 
+    pub unsafe fn as_int_unchecked(&self) -> i64 {
+        match self {
+            Value::Int(i) => *i,
+            _ => unreachable!(),
+        }
+    }
+
     pub fn as_float(&self) -> Option<f64> {
         match self {
             Value::Float(f) => Some(*f),
             _ => None,
+        }
+    }
+
+    pub unsafe fn as_float_unchecked(&self) -> f64 {
+        match self {
+            Value::Float(f) => *f,
+            _ => unreachable!(),
         }
     }
 
