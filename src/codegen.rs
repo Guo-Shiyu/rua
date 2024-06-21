@@ -2058,12 +2058,12 @@ impl CodeGen {
             }
 
             Expr::Float(f) => {
-                if f as i32 > Isc::MAX_SBX {
-                    let kreg = self.alloc_const_reg(f.into());
-                    self.emit(Isc::iabx(LOADK, dest, kreg), def.0);
-                } else {
-                    todo!("load small float to register")
-                }
+                let kreg = self.alloc_const_reg(f.into());
+                self.emit(Isc::iabx(LOADK, dest, kreg), def.0);
+                // todo!("load small float to register")
+                // if f as i32 > Isc::MAX_SBX {
+                // } else {
+                // }
                 ExprStatus::Reg(dest)
             }
 
