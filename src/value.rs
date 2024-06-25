@@ -299,6 +299,7 @@ impl Value {
     pub fn as_float(&self) -> Option<f64> {
         match self {
             Value::Float(f) => Some(*f),
+            Value::Int(i) => Some(*i as f64),
             _ => None,
         }
     }
@@ -306,6 +307,7 @@ impl Value {
     pub unsafe fn as_float_unchecked(&self) -> f64 {
         match self {
             Value::Float(f) => *f,
+            Value::Int(i) => *i as f64,
             _ => unreachable!(),
         }
     }

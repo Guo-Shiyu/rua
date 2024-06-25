@@ -3,7 +3,7 @@ use std::{
     collections::BTreeMap,
     fs::File,
     io::BufReader,
-    ops::{Deref, DerefMut},
+    ops::{Deref, DerefMut, Div},
     path::Path,
     ptr,
 };
@@ -794,6 +794,48 @@ impl VM {
 }
 
 impl VM {
+    fn bit_op<F, R>(
+        &mut self,
+        dest: RegIndex,
+        lhs: Value,
+        rhs: Value,
+        op: F,
+        _metaisc: OpCode,
+    ) -> Result<(), InterpretError>
+    where
+        F: FnOnce(i64, i64) -> R,
+        Value: From<R>,
+    {
+        use Value::*;
+        debug_assert!(lhs.is_int() && rhs.is_int());
+        let res: Value = match (lhs, rhs) {
+            (Int(l), Int(r)) => Value::from(op(l, r)),
+            _ => Nil,
+        };
+
+        if !res.is_nil() {
+            // missing `::<Value>` will cause a compile error, i don't know why...  -,-?
+            self.rset::<Value>(dest, res)?;
+
+            // TODO: support meta operation
+            // self.pc += 1;
+        } else {
+            // debug_assert_eq!({ unsafe { self.cur_isc() }.get_op() }, _metaisc);
+        }
+        Ok(())
+    }
+
+    fn pow_impl(lhs: Value, rhs: Value) -> Value {
+        use Value::*;
+        match (lhs, rhs) {
+            (Int(l), Int(r)) => (l as f64).powf(r as f64).into(),
+            (Float(l), Float(r)) => l.powf(r).into(),
+            (Float(l), Int(r)) => l.powf(r as f64).into(),
+            (Int(l), Float(r)) => (l as f64).powf(r).into(),
+            _ => Nil,
+        }
+    }
+
     fn execute(&mut self) -> Result<(), InterpretError> {
         use OpCode::*;
         use Value::*;
@@ -812,6 +854,23 @@ impl VM {
                         _ => Nil,
                     };
 
+                    if !result.is_nil() {
+                        self.rset($dest, result)?;
+
+                        // TODO: support meta operation
+                        // self.pc += 1;
+                    } else {
+                        // debug_assert_eq!({ unsafe { self.cur_isc() }.get_op() }, $isc);
+                    }
+                }
+            };
+
+            ($dest: expr, $left: expr, $right: expr, $op: expr, $isc: ident) => {
+                {
+                    let (lhs, rhs) = ($left, $right) ;
+                    debug_assert!(lhs.is_number() && rhs.is_number());
+
+                    let result: Value = $op(lhs, rhs).into();
                     if !result.is_nil() {
                         self.rset($dest, result)?;
 
@@ -924,17 +983,50 @@ impl VM {
                             arth_op_impl!(a, self.rget(b)?, self.kget(c), % , MMBINK)
                         }
 
-                        // POWK => {}
+                        POWK => {
+                            arth_op_impl!(a, self.rget(b)?, self.kget(c), Self::pow_impl, MMBINK)
+                        }
+
                         DIVK => {
                             arth_op_impl!(a, self.rget(b)?, self.kget(c), / , MMBINK)
                         }
 
-                        // IDIVK => {}
-                        // BANDK => {}
-                        // BORK => {}
-                        // BXORK => {}
-                        // SHRI => {}
-                        // SHLI => {}
+                        IDIVK => {
+                            self.bit_op(a, self.rget(b)?, self.kget(c), |l, r| l / r, MMBINK)?
+                        }
+
+                        BANDK => {
+                            self.bit_op(a, self.rget(b)?, self.kget(c), |l, r| l & r, MMBINK)?
+                        }
+
+                        BORK => {
+                            self.bit_op(a, self.rget(b)?, self.kget(c), |l, r| l | r, MMBINK)?
+                        }
+
+                        BXORK => {
+                            self.bit_op(a, self.rget(b)?, self.kget(c), |l, r| l ^ r, MMBINK)?
+                        }
+
+                        SHRI => {
+                            self.bit_op(
+                                a,
+                                self.rget(b)?,
+                                Value::Int(c as i64),
+                                |l, r| l >> r, // R[A] := R[B] >> sC
+                                MMBINI,
+                            )?;
+                        }
+
+                        SHLI => {
+                            self.bit_op(
+                                a,
+                                self.rget(b)?,
+                                Value::Int(c as i64),
+                                |l, r| r << l, // R[A] := sC << R[B]
+                                MMBINI,
+                            )?;
+                        }
+
                         ADD => {
                             arth_op_impl!(a, self.rget(b)?, self.rget(c)?, + , MMBIN)
                         }
@@ -951,17 +1043,41 @@ impl VM {
                             arth_op_impl!(a, self.rget(b)?, self.rget(c)?, % , MMBIN)
                         }
 
-                        // POW => {}
-                        DIV => {
-                            arth_op_impl!(a, self.rget(b)?, self.rget(c)?, / , MMBIN)
+                        POW => {
+                            arth_op_impl!(a, self.rget(b)?, self.rget(c)?, Self::pow_impl, MMBIN)
                         }
 
-                        // IDIV => {}
-                        // BAND => {}
-                        // BOR => {}
-                        // BXOR => {}
-                        // SHL => {}
-                        // SHR => {}
+                        DIV => {
+                            let div = |l: Value, r: Value| unsafe {
+                                l.as_float_unchecked().div(r.as_float_unchecked())
+                            };
+                            arth_op_impl!(a, self.rget(b)?, self.rget(c)?, |l, r| div(l, r), MMBIN)
+                        }
+
+                        IDIV => {
+                            self.bit_op(a, self.rget(b)?, self.rget(c)?, |l, r| l / r, MMBIN)?
+                        }
+
+                        BAND => {
+                            self.bit_op(a, self.rget(b)?, self.rget(c)?, |l, r| l & r, MMBIN)?
+                        }
+
+                        BOR => {
+                            self.bit_op(a, self.rget(b)?, self.rget(c)?, |l, r| l | r, MMBIN)?;
+                        }
+
+                        BXOR => {
+                            self.bit_op(a, self.rget(b)?, self.rget(c)?, |l, r| l ^ r, MMBIN)?
+                        }
+
+                        SHL => {
+                            self.bit_op(a, self.rget(b)?, self.rget(c)?, |l, r| l << r, MMBIN)?
+                        }
+
+                        SHR => {
+                            self.bit_op(a, self.rget(b)?, self.rget(c)?, |l, r| l >> r, MMBIN)?
+                        }
+
                         TEST => {
                             if self.rget(a)?.is_falsey() != k {
                                 self.pc += 1;

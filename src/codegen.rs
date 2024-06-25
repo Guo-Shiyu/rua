@@ -2214,7 +2214,6 @@ impl CodeGen {
             (ExprStatus::Reg(lk), ExprStatus::Reg(rk)) => {
                 self.emit(Isc::iabc(select_arithemic_op(op), destreg, lk, rk), def.0);
             }
-
             _ => unreachable!(),
         };
         Ok(ExprStatus::Reg(destreg))
