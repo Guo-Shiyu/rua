@@ -8,7 +8,7 @@ pub mod passes;
 pub mod state;
 pub mod value;
 
-use std::fmt::{Debug, Display};
+use std::fmt::{write, Debug, Display};
 
 use codegen::{BinLoadErr, CodeGenError};
 use lexer::Token;
@@ -22,7 +22,7 @@ pub enum SyntaxError {
     // Tokenizer Error
     InvalidCharacter { ch: char },
     BadFloatRepresentation { repr: String },
-    BadIntergerRepresentation { repr: String },
+    BadIntegerRepresentation { repr: String },
     UnclosedStringLiteral { literal: String },
     InvalidHexEscapeSequence { seq: String },
     InvalidUtf8EscapeSequence { seq: String },
@@ -34,11 +34,73 @@ pub enum SyntaxError {
     BadAssignment,
 }
 
+impl Display for SyntaxError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SyntaxError::InvalidCharacter { ch } => write!(f, "invalid character {ch}"),
+            SyntaxError::BadFloatRepresentation { repr } => {
+                write!(f, "bad float representation {repr}")
+            }
+            SyntaxError::BadIntegerRepresentation { repr } => {
+                write!(f, "bad integer representation {repr}")
+            }
+            SyntaxError::UnclosedStringLiteral { literal } => {
+                let slice = if literal.len() >= 5 {
+                    &literal[0..5]
+                } else {
+                    &literal[0..literal.len()]
+                };
+                write!(f, "unclosed string literal {}...", slice)
+            }
+            SyntaxError::InvalidHexEscapeSequence { seq } => {
+                write!(f, "invalid hex escape sequence {seq}")
+            }
+            SyntaxError::InvalidUtf8EscapeSequence { seq } => {
+                write!(f, "invalid utf8 escape sequence {seq}")
+            }
+            SyntaxError::InvalidDecimalEscapeSequence { seq } => {
+                write!(f, "invalid decimal escape sequence {seq}")
+            }
+            SyntaxError::UnexpectedToken { expect, found } => {
+                let pretty: Vec<_> = expect
+                    .into_iter()
+                    .map(|tk| {
+                        if tk.is_ident() {
+                            "Identifier".to_string()
+                        } else {
+                            format!("{:?}", tk)
+                        }
+                    })
+                    .collect();
+                write!(
+                    f,
+                    "token: {:?} was found, but {:?} was expect",
+                    found, pretty
+                )
+            }
+            SyntaxError::InvalidAttribute { attr } => write!(f, "invalid attribute: {}", attr),
+            SyntaxError::BadAssignment => {
+                write!(f, "bad assignment statement")
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct ParseError {
     pub kind: SyntaxError,
     pub line: u32,
     pub column: u32,
+}
+
+impl Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} at line: {}, column: {}",
+            self.kind, self.line, self.column
+        )
+    }
 }
 
 impl From<Box<ParseError>> for InterpretError {
@@ -119,7 +181,7 @@ impl Display for InterpretError {
         use InterpretError::*;
         match self {
             IOErr(e) => writeln!(f, "IO error: {}", e),
-            SyntaxErr(_) => todo!(),
+            SyntaxErr(se) => writeln!(f, "Syntax error: {}", se),
             CodeGenErr(_) => todo!(),
 
             RsCallDepthLimit { max } => {

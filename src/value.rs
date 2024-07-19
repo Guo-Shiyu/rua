@@ -333,6 +333,13 @@ impl Value {
         }
     }
 
+    pub unsafe fn as_table_unchecked(&self) -> Gc<Table> {
+        match self {
+            Value::Table(t) => *t,
+            _ => unreachable!(),
+        }
+    }
+
     pub fn as_luafn(&self) -> Option<&LuaClosure> {
         match self {
             Value::Fn(f) => Some(f),

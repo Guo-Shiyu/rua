@@ -430,13 +430,13 @@ impl Lexer<'_> {
                             IntErrorKind::PosOverflow | IntErrorKind::NegOverflow => {
                                 return i128::from_str(base)
                                             .map(|i| Token::Float(i as f64))
-                                            .map_err(|_| SyntaxError::BadIntergerRepresentation { repr: base.to_string() })
+                                            .map_err(|_| SyntaxError::BadIntegerRepresentation { repr: base.to_string() })
                             },
-                            _ => return Err(SyntaxError::BadIntergerRepresentation { repr: base.to_string() }),
+                            _ => return Err(SyntaxError::BadIntegerRepresentation { repr: base.to_string() }),
                         }
                     };
 
-                    ret.map_err(|_| SyntaxError::BadIntergerRepresentation { repr: base.to_string() })
+                    ret.map_err(|_| SyntaxError::BadIntegerRepresentation { repr: base.to_string() })
                 }
             }
         }

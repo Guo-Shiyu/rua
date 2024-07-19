@@ -933,6 +933,24 @@ impl VM {
                             self.rset(a, table.index(self.kget(c)))?;
                         }
 
+                        GETI => {
+                            let mut table = unsafe {
+                                let optab = self.rget(b)?;
+                                debug_assert!(optab.is_table());
+                                optab.as_table_unchecked()
+                            };
+                            self.rset(a, table.index(c))?;
+                        }
+
+                        GETFIELD => {
+                            let mut table = unsafe {
+                                let optab = self.rget(b)?;
+                                debug_assert!(optab.is_table());
+                                optab.as_table_unchecked()
+                            };
+                            self.rset(a, table.index(self.kget(c)))?;
+                        }
+
                         SETTABUP => match self.upget(a) {
                             UpVal::Close(val) => {
                                 debug_assert_eq!(val.tag(), Some(Tag::Table));
@@ -943,6 +961,24 @@ impl VM {
                             }
                             UpVal::Open(_) => todo!(),
                         },
+
+                        SETTABLE => {
+                            let mut optab = unsafe {
+                                let optab = self.rget(a)?;
+                                debug_assert!(optab.is_table());
+                                optab.as_table_unchecked()
+                            };
+                            optab.insert(self.rget(b)?, self.rkget(k, c)?);
+                        }
+
+                        SETI => {
+                            let mut table = unsafe {
+                                let optab = self.rget(a)?;
+                                debug_assert!(optab.is_table());
+                                optab.as_table_unchecked()
+                            };
+                            table.insert(Value::from(b), self.kget(c));
+                        }
 
                         SETFIELD => {
                             let key = self.kget(b);
@@ -1112,6 +1148,7 @@ impl VM {
                         _ => unimplemented!("opcode: {:?}", op),
                     }
                 }
+
                 OpMode::IABx => {
                     let (op, a, bx) = code.repr_abx();
                     match op {

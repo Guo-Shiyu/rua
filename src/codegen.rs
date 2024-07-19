@@ -219,13 +219,26 @@ impl Instruction {
     const OFFSET_AX: u32 = 7;
     const OFFSET_SJ: u32 = 7;
 
-    const MAX_A: i32 = u8::MAX as i32; // 8 bit
-    const MAX_B: i32 = Self::MAX_A; // 8 bit
-    const MAX_C: i32 = Self::MAX_A; // 8 bit
-    const MAX_BX: i32 = 0x0001_FFFF; // 17 bit
-    const MAX_SBX: i32 = Self::MAX_BX - 1; // 17 bit but signed
-    const MAX_AX: i32 = 0x0FFF_FFF1; // 25 bit
-    const MAX_SJ: i32 = Self::MAX_AX; // 25 bit
+    /// 8 bit => u8::MAX
+    const MAX_A: i32 = u8::MAX as i32;
+
+    /// 8 bit => u8::MAX
+    const MAX_B: i32 = Self::MAX_A;
+
+    /// 8 bit => u8::MAX
+    const MAX_C: i32 = Self::MAX_A;
+
+    /// 17 bit
+    const MAX_BX: i32 = 0x0001_FFFF;
+
+    /// 17 bit but signed
+    const MAX_SBX: i32 = Self::MAX_BX >> 1;
+
+    /// 25 bit
+    const MAX_AX: i32 = 0x0FFF_FFF1;
+
+    /// 25 bit
+    const MAX_SJ: i32 = Self::MAX_AX;
 
     const MASK_OP: u32 = 0x7F << Self::OFFSET_OP;
     const MASK_A: u32 = 0xFF << Self::OFFSET_A;
@@ -705,6 +718,8 @@ impl Proto {
                         self.updecl[b as usize].name(),
                         self.kst[c as usize]
                     )?,
+                    GETI => write!(f, "r({}) = r({})[{}]", a, b, c)?,
+                    GETFIELD => write!(f, "r({}) = r({})[{}]", a, b, self.kst[c as usize])?,
                     SETTABUP => write!(
                         f,
                         "{}[{}] = {}",
@@ -712,6 +727,8 @@ impl Proto {
                         self.kst[b as usize],
                         self.kst[c as usize]
                     )?,
+                    SETTABLE => write!(f, "r({})[r({})] = rk({})", a, b, c)?,
+                    SETI => write!(f, "r({})[{}] = k({})", a, b, c)?,
                     SETFIELD => {
                         if k {
                             write!(
@@ -990,16 +1007,23 @@ impl GenState {
         dest: RegIndex,
     ) -> ExprStatus {
         match keys {
-            ExprStatus::Kst(kreg) => {
-                if let Some(imidiate) = self.try_emit_inmidiate_index(kreg) {
-                    self.emit(Isc::iabc(GETI, dest, imidiate, 0), ln);
+            ExprStatus::LitInt(ki) => {
+                if ki.abs() <= Isc::MAX_C as i64 {
+                    self.emit(Isc::iabc(GETI, dest, pre_reg, ki as i32), ln);
                 } else {
-                    self.emit(Isc::iabck(GETFIELD, dest, pre_reg, kreg), ln)
-                };
+                    let kreg = self.alloc_const_reg(ki.into());
+                    self.emit(Isc::iabc(GETFIELD, dest, pre_reg, kreg), ln);
+                }
             }
+
+            ExprStatus::Kst(kreg) => {
+                self.emit(Isc::iabc(GETFIELD, dest, pre_reg, kreg), ln);
+            }
+
             ExprStatus::Reg(reg) => {
                 self.emit(Isc::iabc(GETFIELD, dest, pre_reg, reg), ln);
             }
+
             _ => unreachable!(),
         };
         ExprStatus::Reg(dest)
@@ -1110,8 +1134,8 @@ enum ExprGenCtx {
     // expr is the single value to be returned
     PotentialTailCall,
 
-    // intermidiate table may be cached
-    MultiLevelTableIndex { depth: u32 },
+    // intermidiate table can be cached
+    MultiLevelTableIndex { _depth: u8, dest: RegIndex },
 }
 
 impl ExprGenCtx {
@@ -1858,11 +1882,11 @@ impl CodeGen {
         ctx: ExprGenCtx,
         mem: &mut Heap,
     ) -> Result<ExprStatus, CodeGenError> {
-        let (def, node) = (node.def_info(), node.inner());
+        let def = node.def_info();
 
         match ctx {
             Ctx::Keep => {
-                let status = match node {
+                let status = match node.inner() {
                     Expr::Nil => ExprStatus::LitNil,
                     Expr::False => ExprStatus::LitFalse,
                     Expr::True => ExprStatus::LitTrue,
@@ -1886,11 +1910,11 @@ impl CodeGen {
 
             // case that the value of expression will be ignored,
             // but sub expr may make an side effect
-            Ctx::Ignore => self.emit_ignored_expr(node, mem),
+            Ctx::Ignore => self.emit_ignored_expr(node.inner(), mem),
 
             Ctx::Allocate => {
                 let free = self.alloc_free_reg();
-                let status = self.emit_expr(node, free, def, mem)?;
+                let status = self.emit_expr(node.inner(), free, def, mem)?;
                 // if let ExprStatus::Reg(ref r) = status {
                 //     if *r < free {
                 //         self.free_reg();
@@ -1901,7 +1925,7 @@ impl CodeGen {
             }
 
             Ctx::NonRealloc { dest } => {
-                let mut status = self.emit_expr(node, dest, def, mem)?;
+                let mut status = self.emit_expr(node.inner(), dest, def, mem)?;
                 if let ExprStatus::Reg(real) = status {
                     if real != dest {
                         self.emit(Isc::iabc(MOVE, dest, real, 0), def.0);
@@ -1911,7 +1935,7 @@ impl CodeGen {
                 Ok(status)
             }
 
-            Ctx::PotentialTailCall => match node {
+            Ctx::PotentialTailCall => match node.inner() {
                 Expr::FuncCall(call) => {
                     let reg = self.alloc_free_reg();
                     self.walk_fn_call(call, reg, 1, true, mem)
@@ -1936,26 +1960,6 @@ impl CodeGen {
                     Ok(ExprStatus::Reg(reg))
                 }
 
-                Expr::True
-                | Expr::False
-                | Expr::Nil
-                | Expr::Int(_)
-                | Expr::Float(_)
-                | Expr::Literal(_)
-                | Expr::Lambda(_)
-                | Expr::TableCtor(_)
-                | Expr::Subscript { .. } => {
-                    let reg = self.alloc_free_reg();
-                    let status = self.emit_expr(node, reg, def, mem)?;
-                    // debug_assert!()
-                    if let ExprStatus::Reg(ref r) = status {
-                        debug_assert_eq!(*r, reg);
-                    } else {
-                        unreachable!()
-                    }
-                    Ok(status)
-                }
-
                 Expr::UnaryOp { op, expr } => {
                     let next = self.nextreg;
                     self.emit_unary_expr(expr, op, next, mem)
@@ -1971,10 +1975,23 @@ impl CodeGen {
                     let right = self.walk_common_expr(rhs, Ctx::PotentialTailCall, mem)?;
                     self.emit_binop_optimized(ExprStatus::Reg(reg), right, reg, def, op)
                 }
+
+                expr => {
+                    let reg = self.alloc_free_reg();
+                    let status = self.emit_expr(expr, reg, def, mem)?;
+                    if let ExprStatus::Reg(r) = status {
+                        debug_assert_eq!(r, reg);
+                    } else {
+                        unreachable!()
+                    }
+                    Ok(status)
+                }
             },
 
-            Ctx::MultiLevelTableIndex { depth: _ } => {
-                todo!("expr codegen: multi level Table Index optimize")
+            Ctx::MultiLevelTableIndex { _depth: _, dest: _ } => {
+                // TODO:
+                // expr codegen: multi level Table Index optimize
+                return self.walk_common_expr(node, Ctx::Keep, mem);
             }
         }
     }
@@ -2087,8 +2104,15 @@ impl CodeGen {
             Expr::Lambda(fnbody) => self.walk_fn_def(fnbody, dest, def, mem)?,
 
             Expr::Subscript { prefix, key } => {
-                let key_status = self.walk_common_expr(key, Ctx::Allocate, mem)?;
-                match self.walk_common_expr(prefix, Ctx::MultiLevelTableIndex { depth: 1 }, mem)? {
+                let key_status = self.walk_common_expr(key, Ctx::Keep, mem)?;
+                match self.walk_common_expr(
+                    prefix,
+                    Ctx::MultiLevelTableIndex {
+                        _depth: 1,
+                        dest: dest,
+                    },
+                    mem,
+                )? {
                     ExprStatus::Reg(pre) | ExprStatus::Call(pre) => {
                         self.emit_index_local(key_status, def.0, pre, dest)
                     }
@@ -2270,49 +2294,67 @@ impl CodeGen {
         let mut aryidx = 1;
         for field in flist.into_iter() {
             let fdefloc = field.val.def_begin();
-            let valstatus = self.walk_common_expr(field.val, Ctx::Allocate, mem)?;
+            let valstatus = self.walk_common_expr(field.val, Ctx::Keep, mem)?;
 
-            if let Some(key) = field.key {
-                let keystatus = self.walk_common_expr(key, Ctx::Allocate, mem)?;
-                match keystatus {
-                    ExprStatus::Kst(kidx) => {
-                        if let ExprStatus::Kst(valreg) = valstatus {
-                            self.emit(Isc::iabck(SETFIELD, dest, kidx, valreg), fdefloc)
-                        } else {
+            if let Some(mut key) = field.key {
+                if let Expr::Ident(id) = key.inner_mut() {
+                    let idx_kreg = self.alloc_const_reg(mem.take_str(std::mem::take(id)).into());
+                    match valstatus {
+                        ExprStatus::LitNil
+                        | ExprStatus::LitTrue
+                        | ExprStatus::LitFalse
+                        | ExprStatus::LitInt(_)
+                        | ExprStatus::LitFlt(_)
+                        | ExprStatus::Kst(_) => {
+                            let valkreg = self.try_load_expr_to_const(valstatus);
+                            self.emit(Isc::iabck(SETFIELD, dest, idx_kreg, valkreg), fdefloc);
+                        }
+                        _ => {
                             let valreg = self.try_load_expr_to_local(valstatus, fdefloc);
-                            self.emit(Isc::iabck(SETFIELD, dest, kidx, valreg), fdefloc)
+                            self.emit(Isc::iabck(SETFIELD, dest, idx_kreg, valreg), fdefloc)
                         }
                     }
-
-                    ExprStatus::Reg(reg) => {
-                        if let ExprStatus::Kst(valreg) = valstatus {
-                            self.emit(Isc::iabck(SETTABLE, dest, reg, valreg), fdefloc)
-                        } else {
-                            let valreg = self.try_load_expr_to_local(valstatus, fdefloc);
-                            self.emit(Isc::iabc(SETTABLE, dest, reg, valreg), fdefloc)
+                } else {
+                    match self.walk_common_expr(key, Ctx::Keep, mem)? {
+                        ExprStatus::Reg(reg) => {
+                            if let ExprStatus::Kst(valreg) = valstatus {
+                                self.emit(Isc::iabck(SETTABLE, dest, reg, valreg), fdefloc)
+                            } else {
+                                let valreg = self.try_load_expr_to_local(valstatus, fdefloc);
+                                self.emit(Isc::iabc(SETTABLE, dest, reg, valreg), fdefloc)
+                            }
                         }
-                    }
 
-                    ExprStatus::LitInt(i) => {
-                        if let ExprStatus::Kst(valreg) = valstatus {
-                            self.emit(Isc::iabck(SETI, dest, i as i32, valreg), fdefloc);
-                        } else {
-                            let valreg = self.try_load_expr_to_local(valstatus, fdefloc);
-                            self.emit(Isc::iabc(SETI, dest, i as i32, valreg), fdefloc);
+                        ExprStatus::LitInt(i) => {
+                            if let ExprStatus::Kst(valreg) = valstatus {
+                                self.emit(Isc::iabck(SETI, dest, i as i32, valreg), fdefloc);
+                            } else {
+                                let valreg = self.try_load_expr_to_local(valstatus, fdefloc);
+                                self.emit(Isc::iabc(SETI, dest, i as i32, valreg), fdefloc);
+                            }
                         }
-                    }
 
-                    _ => todo!(),
+                        _ => todo!(),
+                    }
                 }
                 continue;
             }
 
             // array field
-            if let ExprStatus::Kst(valreg) = valstatus {
-                self.emit(Isc::iabck(SETI, dest, aryidx, valreg), fdefloc);
-            } else {
-                let valreg = self.try_load_expr_to_local(valstatus, fdefloc);
-                self.emit(Isc::iabc(SETI, dest, aryidx, valreg), fdefloc);
+            match valstatus {
+                ExprStatus::LitNil
+                | ExprStatus::LitTrue
+                | ExprStatus::LitFalse
+                | ExprStatus::LitInt(_)
+                | ExprStatus::LitFlt(_)
+                | ExprStatus::Kst(_) => {
+                    let valkreg = self.try_load_expr_to_const(valstatus);
+                    self.emit(Isc::iabck(SETI, dest, aryidx, valkreg), fdefloc);
+                }
+                _ => {
+                    let valreg = self.try_load_expr_to_local(valstatus, fdefloc);
+                    self.emit(Isc::iabck(SETI, dest, aryidx, valreg), fdefloc)
+                }
             }
             aryidx += 1;
         }
