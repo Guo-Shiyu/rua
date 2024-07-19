@@ -8,7 +8,7 @@ pub mod passes;
 pub mod state;
 pub mod value;
 
-use std::fmt::{write, Debug, Display};
+use std::fmt::{Debug, Display};
 
 use codegen::{BinLoadErr, CodeGenError};
 use lexer::Token;

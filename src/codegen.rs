@@ -1029,22 +1029,6 @@ impl GenState {
         ExprStatus::Reg(dest)
     }
 
-    fn try_emit_inmidiate_index(&mut self, kreg: RegIndex) -> Option<i32> {
-        debug_assert!((kreg as usize) < self.ksts.len());
-        // SAFETY: constant must exist
-        let val = unsafe { self.ksts.get_unchecked(kreg as usize) };
-        debug_assert!(!val.is_gcobj());
-        if let Value::Int(i) = val {
-            if *i < Isc::MAX_B as i64 {
-                Some(*i as i32)
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    }
-
     fn try_load_expr_to_const(&mut self, es: ExprStatus) -> RegIndex {
         match es {
             ExprStatus::LitNil => self.alloc_const_reg(Value::Nil),
@@ -1135,7 +1119,7 @@ enum ExprGenCtx {
     PotentialTailCall,
 
     // intermidiate table can be cached
-    MultiLevelTableIndex { _depth: u8, dest: RegIndex },
+    MultiLevelTableIndex { _depth: u8, _dest: RegIndex },
 }
 
 impl ExprGenCtx {
@@ -1988,7 +1972,7 @@ impl CodeGen {
                 }
             },
 
-            Ctx::MultiLevelTableIndex { _depth: _, dest: _ } => {
+            Ctx::MultiLevelTableIndex { _depth: _, _dest: _ } => {
                 // TODO:
                 // expr codegen: multi level Table Index optimize
                 return self.walk_common_expr(node, Ctx::Keep, mem);
@@ -2109,7 +2093,7 @@ impl CodeGen {
                     prefix,
                     Ctx::MultiLevelTableIndex {
                         _depth: 1,
-                        dest: dest,
+                        _dest: dest,
                     },
                     mem,
                 )? {

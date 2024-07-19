@@ -21,6 +21,7 @@ fn main() -> Result<(), InterpretError> {
 #[cfg(test)]
 mod test {
     use super::*;
+    use rua::state::PanicFn;
 
     #[test]
     fn hello_world() -> Result<(), InterpretError> {
@@ -32,7 +33,6 @@ mod test {
         "#;
 
         let res = vm.unsafe_script(src, None);
-        dbg!(&res);
         assert!(res.is_ok());
         vm.full_gc();
         // println!("# after gc");
@@ -66,10 +66,7 @@ mod test {
             .for_each(|filepath| {
                 let mut vm = VM::new();
                 assert_ne!(vm.open(Stdlib::Base).unwrap(), 0);
-                let res = vm.script_file(filepath);
-                if res.is_err() {
-                    dbg!(res.as_ref().err().unwrap());
-                }
+                let res = vm.safe_script_file(filepath, None, Some(PanicFn::PANIC));
                 assert!(res.is_ok());
             });
     }

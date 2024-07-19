@@ -103,6 +103,7 @@ impl Frame {
         Ok(if k { self.kget(reg) } else { self.rget(reg)? })
     }
 
+    #[allow(dead_code)]
     fn slot_iter(&self) -> StackIter {
         StackIter {
             begin: self.func,
@@ -189,21 +190,42 @@ pub struct WarnFn {
     handler: fn(&mut VM),
 }
 
+impl WarnFn {
+    fn display_warn(vm: &mut VM) {
+        debug_assert_ne!(vm.top(), 0);
+        let msg = vm.pop().unwrap_or_default();
+        if !msg.is_nil() {
+            eprintln!("Rua VM Warning: {msg}");
+        }
+    }
+
+    const EPRINT: WarnFn = WarnFn {
+        handler: Self::display_warn,
+    };
+}
+
 impl Default for WarnFn {
     fn default() -> Self {
-        WarnFn {
-            handler: |_vm: &mut VM| todo!(),
-        }
+        Self::EPRINT
     }
 }
 
+/// Handler in this struct will be called if an `InterpretError` was catched in `VM`.
 #[derive(Debug, Clone, Copy)]
 pub struct PanicFn {
     handler: fn(&mut VM, InterpretError),
 }
 
 impl PanicFn {
-    fn pass_on_error(vm: &mut VM, e: InterpretError) {
+    pub const PANIC: PanicFn = PanicFn {
+        handler: Self::panic,
+    };
+
+    pub const PASS: PanicFn = PanicFn {
+        handler: Self::pass,
+    };
+
+    fn diaplay_error(vm: &mut VM, e: &InterpretError) {
         // print backtrace and show local variables
         let mut last_srcinfo = Value::Nil;
         let mut line = 0;
@@ -245,13 +267,20 @@ impl PanicFn {
             }
         }
     }
+
+    fn pass(vm: &mut VM, e: InterpretError) {
+        Self::diaplay_error(vm, &e);
+    }
+
+    fn panic(vm: &mut VM, e: InterpretError) {
+        Self::diaplay_error(vm, &e);
+        panic!("{}", e);
+    }
 }
 
 impl Default for PanicFn {
     fn default() -> Self {
-        PanicFn {
-            handler: Self::pass_on_error,
-        }
+        Self::PASS
     }
 }
 
@@ -414,6 +443,19 @@ impl VM {
         Ok(())
     }
 
+    /// Push value on stack without stack slot check. This will *not* try extend stack or check weather is
+    /// there still available slot on stack.    
+    /// In default, only error handling functions use this method, such as `warn()` .
+    pub unsafe fn push_unchecked<V>(&mut self, val: V)
+    where
+        Value: From<V>,
+    {
+        unsafe {
+            *self.top = Value::from(val);
+            self.top = self.top.add(1)
+        };
+    }
+
     pub fn pop(&mut self) -> Option<Value> {
         debug_assert!(self.top >= self.slotend);
         self.try_shrink_stack();
@@ -516,9 +558,15 @@ impl VM {
     pub fn safe_script_file<P: AsRef<Path>>(
         &mut self,
         path: P,
-        chunkname: Option<String>,
+        mut chunkname: Option<String>,
         on_err: Option<PanicFn>,
     ) -> Result<(), std::io::Error> {
+        if chunkname.is_none() {
+            chunkname = match path.as_ref().as_os_str().to_os_string().into_string() {
+                Ok(str) => Some(str),
+                Err(osstr) => panic!("Bad OsString: {:?}", osstr),
+            }
+        }
         self.safe_script(&std::fs::read_to_string(path)?, chunkname, on_err);
         Ok(())
     }
@@ -790,6 +838,15 @@ impl VM {
             Gc::drop(tofinal);
         }
         // dbg!(self.heap.total_alloc_bytes());
+    }
+
+    /// Put message on stack and call WarnFn. In default the message will be showed in stderr
+    /// and message will be poped from stack.
+    #[allow(dead_code)]
+    fn warn(&mut self, message: String) {
+        let msgval = self.take_str(message);
+        unsafe { self.push_unchecked(msgval) };
+        (self.warn.handler)(self);
     }
 }
 
@@ -1332,5 +1389,20 @@ mod test {
         assert_eq!(vm.unsafe_script(call, None).unwrap(), ());
         check_init_state(&mut vm);
         Ok(())
+    }
+
+    #[test]
+    fn warn_test() {
+        let mut vm = VM::new();
+        vm.warn(format!("🌕 This is a test warn message. "));
+
+        // push until stack full
+        while vm.stack_remain() != 0 {
+            assert!(vm.push(Value::default()).is_ok());
+        }
+        vm.warn(format!(
+            "🌕 There is {} slot on vm's stack, but `vm.warn()` works well.",
+            vm.stack_remain()
+        ))
     }
 }
