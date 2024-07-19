@@ -878,7 +878,7 @@ impl Parser<'_> {
                 let key = self.expr()?;
                 self.check_and_next(Token::RS)?;
                 self.check_and_next(Token::Assign)?;
-                return Ok(Field::new(Some(key), self.expr()?));
+                return Ok(Field::eval(key, self.expr()?));
             }
 
             Token::Ident(key) => {
@@ -886,7 +886,7 @@ impl Parser<'_> {
             }
 
             // expr
-            _ => return Ok(Field::new(None, self.expr()?)),
+            _ => return Ok(Field::elem(self.expr()?)),
         };
 
         self.look_ahead()?;
@@ -894,12 +894,10 @@ impl Parser<'_> {
             // Name `=` expr
             self.next()?; // skip name
             self.next()?; // skip '='
-            let line = self.lex.line();
-            let expr = Box::new(SrcLoc::new(Expr::Ident(holder), (line, line)));
-            Ok(Field::new(Some(expr), self.expr()?))
+            Ok(Field::lit(holder, self.expr()?))
         } else {
             // expr
-            Ok(Field::new(None, self.expr()?))
+            Ok(Field::elem(self.expr()?))
         }
     }
 

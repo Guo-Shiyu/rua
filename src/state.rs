@@ -933,6 +933,15 @@ impl VM {
                             self.rset(a, table.index(self.kget(c)))?;
                         }
 
+                        GETTABLE => {
+                            let mut table = unsafe {
+                                let optab = self.rget(b)?;
+                                debug_assert!(optab.is_table());
+                                optab.as_table_unchecked()
+                            };
+                            self.rset(a, table.index(self.rget(c)?))?;
+                        }
+
                         GETI => {
                             let mut table = unsafe {
                                 let optab = self.rget(b)?;

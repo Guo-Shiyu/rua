@@ -8,8 +8,8 @@ use std::{
 
 use crate::{
     ast::{
-        Attribute, BasicBlock, BinOp, Block, Expr, ExprNode, Field, FuncBody, FuncCall, GenericFor,
-        NumericFor, ParameterList, SrcLoc, Stmt, StmtNode, UnOp,
+        Attribute, BasicBlock, BinOp, Block, Expr, ExprNode, Field, FieldKey, FuncBody, FuncCall,
+        GenericFor, NumericFor, ParameterList, SrcLoc, Stmt, StmtNode, UnOp,
     },
     heap::{Gc, GcOp, Heap, MemStat, Tag, TypeTag},
     state::RegIndex,
@@ -1021,7 +1021,7 @@ impl GenState {
             }
 
             ExprStatus::Reg(reg) => {
-                self.emit(Isc::iabc(GETFIELD, dest, pre_reg, reg), ln);
+                self.emit(Isc::iabc(GETTABLE, dest, pre_reg, reg), ln);
             }
 
             _ => unreachable!(),
@@ -2296,47 +2296,8 @@ impl CodeGen {
             let fdefloc = field.val.def_begin();
             let valstatus = self.walk_common_expr(field.val, Ctx::Keep, mem)?;
 
-            if let Some(mut key) = field.key {
-                if let Expr::Ident(id) = key.inner_mut() {
-                    let idx_kreg = self.alloc_const_reg(mem.take_str(std::mem::take(id)).into());
-                    match valstatus {
-                        ExprStatus::LitNil
-                        | ExprStatus::LitTrue
-                        | ExprStatus::LitFalse
-                        | ExprStatus::LitInt(_)
-                        | ExprStatus::LitFlt(_)
-                        | ExprStatus::Kst(_) => {
-                            let valkreg = self.try_load_expr_to_const(valstatus);
-                            self.emit(Isc::iabck(SETFIELD, dest, idx_kreg, valkreg), fdefloc);
-                        }
-                        _ => {
-                            let valreg = self.try_load_expr_to_local(valstatus, fdefloc);
-                            self.emit(Isc::iabck(SETFIELD, dest, idx_kreg, valreg), fdefloc)
-                        }
-                    }
-                } else {
-                    match self.walk_common_expr(key, Ctx::Keep, mem)? {
-                        ExprStatus::Reg(reg) => {
-                            if let ExprStatus::Kst(valreg) = valstatus {
-                                self.emit(Isc::iabck(SETTABLE, dest, reg, valreg), fdefloc)
-                            } else {
-                                let valreg = self.try_load_expr_to_local(valstatus, fdefloc);
-                                self.emit(Isc::iabc(SETTABLE, dest, reg, valreg), fdefloc)
-                            }
-                        }
-
-                        ExprStatus::LitInt(i) => {
-                            if let ExprStatus::Kst(valreg) = valstatus {
-                                self.emit(Isc::iabck(SETI, dest, i as i32, valreg), fdefloc);
-                            } else {
-                                let valreg = self.try_load_expr_to_local(valstatus, fdefloc);
-                                self.emit(Isc::iabc(SETI, dest, i as i32, valreg), fdefloc);
-                            }
-                        }
-
-                        _ => todo!(),
-                    }
-                }
+            if let Some(key) = field.key {
+                self.emit_table_kv_field(key, mem, valstatus, dest, fdefloc)?;
                 continue;
             }
 
@@ -2359,6 +2320,60 @@ impl CodeGen {
             aryidx += 1;
         }
         Ok(ExprStatus::Reg(dest))
+    }
+
+    fn emit_table_kv_field(
+        &mut self,
+        key: FieldKey,
+        mem: &mut Heap,
+        value: ExprStatus,
+        dest: i32,
+        ln: u32,
+    ) -> Result<(), CodeGenError> {
+        match key {
+            FieldKey::Expr(expr) => match self.walk_common_expr(expr, Ctx::Keep, mem)? {
+                ExprStatus::Reg(reg) => {
+                    if let ExprStatus::Kst(valreg) = value {
+                        self.emit(Isc::iabck(SETTABLE, dest, reg, valreg), ln)
+                    } else {
+                        let valreg = self.try_load_expr_to_local(value, ln);
+                        self.emit(Isc::iabc(SETTABLE, dest, reg, valreg), ln)
+                    }
+                }
+
+                ExprStatus::LitInt(i) => {
+                    if let ExprStatus::Kst(valreg) = value {
+                        self.emit(Isc::iabck(SETI, dest, i as i32, valreg), ln);
+                    } else {
+                        let valreg = self.try_load_expr_to_local(value, ln);
+                        self.emit(Isc::iabc(SETI, dest, i as i32, valreg), ln);
+                    }
+                }
+
+                _ => todo!(),
+            },
+
+            FieldKey::Key(id) => {
+                let idx_kreg = self.alloc_const_reg(mem.take_str(id).into());
+                match value {
+                    ExprStatus::LitNil
+                    | ExprStatus::LitTrue
+                    | ExprStatus::LitFalse
+                    | ExprStatus::LitInt(_)
+                    | ExprStatus::LitFlt(_)
+                    | ExprStatus::Kst(_) => {
+                        let valkreg = self.try_load_expr_to_const(value);
+                        self.emit(Isc::iabck(SETFIELD, dest, idx_kreg, valkreg), ln);
+                    }
+                    _ => {
+                        let valreg = self.try_load_expr_to_local(value, ln);
+                        self.emit(Isc::iabck(SETFIELD, dest, idx_kreg, valreg), ln)
+                    }
+                }
+            }
+        };
+
+        Ok(())
     }
 
     /// Lookup a identifier and return LookupState. If ident was found as a upval in outter function,

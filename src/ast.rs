@@ -372,14 +372,42 @@ pub type ArgumentList = FnHeader<ExprNode>;
 /// ``` text
 /// field ::= `[` exp `]` `=` exp | Name `=` exp | exp
 /// ```
+/// FieldKey represents two cases that:     
+/// + FieldKey::Expr => `{ [key] = value }`    
+/// + FieldKey::Key => `{ key = value }`  
+///
+/// The difference is that `Expr` will be evaluated and the value of `Expr` will be treated as table's key,
+/// while `Key` will treated as table's key directly.
+pub enum FieldKey {
+    Expr(ExprNode),
+    Key(String),
+}
+
 pub struct Field {
-    pub key: Option<ExprNode>,
+    pub key: Option<FieldKey>,
     pub val: ExprNode,
 }
 
 impl Field {
-    pub fn new(key: Option<ExprNode>, val: ExprNode) -> Self {
-        Field { key, val }
+    pub fn lit(key: String, val: ExprNode) -> Self {
+        Field {
+            key: Some(FieldKey::Key(key)),
+            val,
+        }
+    }
+
+    pub fn eval(key: ExprNode, val: ExprNode) -> Self {
+        Field {
+            key: Some(FieldKey::Expr(key)),
+            val,
+        }
+    }
+
+    pub fn elem(val: ExprNode) -> Self {
+        Field {
+            key: None,
+            val: val,
+        }
     }
 }
 
