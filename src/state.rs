@@ -436,10 +436,7 @@ impl VM {
         Value: From<V>,
     {
         self.try_extend_stack()?;
-        unsafe {
-            *self.top = Value::from(val);
-            self.top = self.top.add(1)
-        };
+        unsafe { self.push_unchecked(val) };
         Ok(())
     }
 
@@ -459,10 +456,7 @@ impl VM {
     pub fn pop(&mut self) -> Option<Value> {
         debug_assert!(self.top >= self.slotend);
         self.try_shrink_stack();
-        (self.top > self.slotend).then(|| unsafe {
-            self.top = self.top.sub(1);
-            *self.top
-        })
+        (self.top > self.slotend).then(|| unsafe { self.pop_unchecked() })
     }
 
     pub unsafe fn pop_unchecked(&mut self) -> Value {

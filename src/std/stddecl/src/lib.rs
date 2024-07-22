@@ -41,7 +41,7 @@ pub fn ruastd(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let hookdef = if fns
         .iter()
-        .any(|sig| sig.span().source_text().unwrap() == "rua_on_lib_open")
+        .any(|sig| sig.span().source_text().unwrap_or_default() == "rua_on_lib_open")
     {
         quote! {}
     } else {

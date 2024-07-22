@@ -144,6 +144,10 @@ pub enum InterpretError {
     IncompatiablePlatform,
 
     /* dynamic error (runtime error) */
+    RawError {
+        msg: Box<String>,
+    },
+
     RsCallDepthLimit {
         max: u32,
     },
@@ -173,7 +177,9 @@ pub enum InterpretError {
 
     BadForeignModule(Box<BadModule>),
 
-    AssertionFail,
+    AssertionFail {
+        msg: Box<String>,
+    },
 }
 
 impl Display for InterpretError {
@@ -183,6 +189,8 @@ impl Display for InterpretError {
             IOErr(e) => writeln!(f, "IO error: {}", e),
             SyntaxErr(se) => writeln!(f, "Syntax error: {}", se),
             CodeGenErr(_) => todo!(),
+
+            RawError { msg } => f.write_str(msg),
 
             RsCallDepthLimit { max } => {
                 writeln!(f, "Too deep function call. (MAX_CALL_DEPTH: {})", max)
@@ -218,9 +226,7 @@ impl Display for InterpretError {
                 )
             }
 
-            AssertionFail => {
-                writeln!(f, "Assertion failed!")
-            }
+            AssertionFail { msg } => f.write_str(msg),
 
             ForeignModuleNotFound(info) => {
                 writeln!(

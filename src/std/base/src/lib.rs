@@ -2,7 +2,7 @@ use stddecl::ruastd;
 
 #[ruastd]
 mod base {
-    use rua::{state::VM, InterpretError};
+    use rua::{state::VM, value::Value, InterpretError};
 
     pub fn print(vm: &mut VM) -> Result<usize, InterpretError> {
         let n = vm.top();
@@ -20,27 +20,38 @@ mod base {
     }
 
     pub fn assert(vm: &mut VM) -> Result<usize, InterpretError> {
-        if vm.top() >= 1 {
-            // clear extra argument
-            while vm.top() != 1 {
-                vm.pop();
-            }
+        if vm.top() < 1 {
+            return Err(InterpretError::ArgumentMismatch { expect: 1, got: 0 });
+        }
 
-            // take first variable to check
-            let var = unsafe { vm.pop_unchecked() };
-            if !var.is_falsey() {
-                vm.push(true)?; // set true as return value
-                Ok(1)
+        // clear extra argument
+        while vm.top() > 2 {
+            vm.pop();
+        }
+
+        // take first variable to check
+        let first = unsafe { vm.peek_unchecked(1) };
+        if first.is_falsey() {
+            let errmsg = if vm.top() == 2 {
+                let errobj = unsafe { vm.pop().unwrap_unchecked() };
+                match errobj {
+                    Value::Str(s) => s.to_string(),
+                    num if num.is_number() => num.to_string(),
+                    other => format!("error object is a {} value", other.typestr()),
+                }
             } else {
-                Err(InterpretError::AssertionFail) // raise an error
-            }
+                "assertion failed!".to_string()
+            };
+            Err(InterpretError::AssertionFail {
+                msg: Box::new(errmsg),
+            })
         } else {
-            Err(InterpretError::ArgumentMismatch { expect: 1, got: 0 })
+            Ok(vm.top() as usize)
         }
     }
 
     pub fn error(_lua: &mut VM) -> Result<usize, InterpretError> {
-        todo!();
+        todo!()
     }
 
     pub fn pcall(_lua: &mut VM) -> Result<usize, InterpretError> {
