@@ -1972,7 +1972,10 @@ impl CodeGen {
                 }
             },
 
-            Ctx::MultiLevelTableIndex { _depth: _, _dest: _ } => {
+            Ctx::MultiLevelTableIndex {
+                _depth: _,
+                _dest: _,
+            } => {
                 // TODO:
                 // expr codegen: multi level Table Index optimize
                 return self.walk_common_expr(node, Ctx::Keep, mem);
@@ -1986,23 +1989,19 @@ impl CodeGen {
         mem: &mut Heap,
     ) -> Result<ExprStatus, CodeGenError> {
         let pre_state = self.nextreg;
-        let status = match node {
+        match node {
             Expr::Subscript { prefix, key } => {
                 let _ = self.walk_common_expr(prefix, Ctx::Ignore, mem);
                 let _ = self.walk_common_expr(key, Ctx::Ignore, mem);
-                ExprStatus::Reg(RegIndex::MAX)
             }
             Expr::FuncCall(call) => {
                 let next = self.alloc_free_reg();
                 let _ = self.walk_fn_call(call, next, 0, false, mem);
-                self.free_reg();
-                ExprStatus::Reg(RegIndex::MAX)
             }
             Expr::TableCtor(ctor) => {
                 for field in ctor {
                     let _ = self.walk_common_expr(field.val, Ctx::Ignore, mem);
                 }
-                ExprStatus::Reg(RegIndex::MAX)
             }
             Expr::BinaryOp {
                 lhs: l,
@@ -2011,13 +2010,13 @@ impl CodeGen {
             } => {
                 let _ = self.walk_common_expr(l, Ctx::Ignore, mem);
                 let _ = self.walk_common_expr(r, Ctx::Ignore, mem);
-                ExprStatus::Reg(RegIndex::MAX)
             }
             Expr::UnaryOp { op: _, expr } => {
                 let _ = self.walk_common_expr(expr, Ctx::Ignore, mem);
-                ExprStatus::Reg(RegIndex::MAX)
             }
-            _ => ExprStatus::Reg(RegIndex::MAX),
+
+            // no side-effect, skip codegen for other expression in ignore case.
+            _ => {}
         };
         // recover register state
         let mut try_recover = self.nextreg;
@@ -2025,7 +2024,7 @@ impl CodeGen {
         while try_recover != pre_state {
             try_recover = self.free_reg();
         }
-        Ok(status)
+        Ok(ExprStatus::Reg(RegIndex::MAX))
     }
 
     fn emit_expr(
