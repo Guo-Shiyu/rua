@@ -22,6 +22,7 @@ fn main() -> Result<(), InterpretError> {
 mod test {
     use super::*;
     use rua::state::PanicFn;
+    use std::path::PathBuf;
 
     #[test]
     fn hello_world() -> Result<(), InterpretError> {
@@ -41,16 +42,12 @@ mod test {
 
     #[test]
     fn test_rua_scripts() {
-        let srcdir = "./test/rua/";
-        let emsg = format!(
-            "unable to find directory: {} with base dir:{}",
-            srcdir,
-            std::env::current_dir().unwrap().display()
-        );
+        let mut srcdir = std::env::current_dir().unwrap();
+        srcdir.push([".", "test", "rua"].iter().collect::<PathBuf>());
+        let message = format!("Can not find test directory: {:?}. ", srcdir.clone());
 
-        let dir = std::fs::read_dir(srcdir).expect(&emsg);
-
-        let mut src_paths = dir
+        let mut src_paths = std::fs::read_dir(srcdir)
+            .expect(&message)
             .map(|e| e.map(|e| e.path()))
             .collect::<Result<Vec<_>, _>>()
             .unwrap();

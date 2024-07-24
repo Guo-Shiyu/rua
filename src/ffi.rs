@@ -42,37 +42,10 @@ pub const fn get_std_libs(lib: Stdlib) -> &'static [&'static str] {
 }
 
 pub fn open_lib(vm: &mut VM, modname: &str) -> Result<u32, InterpretError> {
-    open_lib_posix_impl(vm, modname)
-}
+    let (dlopen, dlsym, dlfmt) = select_dll_operation_platform();
 
-extern "C" {
-    fn dlopen(filename: *const c_char, flags: i32) -> *mut c_void;
-    fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
-    // fn dlclose(handle: *mut std::ffi::c_void) -> std::os::raw::c_int;
-}
-
-fn find_dylib_recursive(dir: &Path, target: &str) -> Option<PathBuf> {
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                let rec = find_dylib_recursive(&path, target);
-                if rec.is_some() {
-                    return rec;
-                }
-            } else if let Some(name) = path.file_name() {
-                if name == target {
-                    return Some(path);
-                }
-            }
-        }
-    }
-    None
-}
-
-fn open_lib_posix_impl(vm: &mut VM, modname: &str) -> Result<u32, InterpretError> {
     // search dynamic library in current dir recursively.
-    let target = format!("lib{}.so", modname);
+    let target = dlfmt(modname);
     let curdir = std::env::current_dir()?;
 
     // TODO: detect environment variable LUA_PATH
@@ -97,7 +70,7 @@ fn open_lib_posix_impl(vm: &mut VM, modname: &str) -> Result<u32, InterpretError
             // execute `dlopen` and get handle of dylib
             let handle = {
                 let cname = CString::new(dll.clone()).expect("CString::new failed");
-                let handle = unsafe { dlopen(cname.as_ptr(), 1) }; // 2: RTLD_NOW,  1: RTLD_LAZY
+                let handle = unsafe { dlopen(cname.as_ptr()) };
                 if handle.is_null() {
                     let badmod = BadModule {
                         path: dll,
@@ -124,9 +97,67 @@ fn open_lib_posix_impl(vm: &mut VM, modname: &str) -> Result<u32, InterpretError
             };
 
             // execute entry symbol of dylib
-            type CdylibEntry = extern "C" fn(&mut VM) -> u32;
             let dllentry: CdylibEntry = unsafe { std::mem::transmute(entry_point) };
             Ok(dllentry(vm))
         }
     }
+}
+
+fn find_dylib_recursive(dir: &Path, target: &str) -> Option<PathBuf> {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let rec = find_dylib_recursive(&path, target);
+                if rec.is_some() {
+                    return rec;
+                }
+            } else if let Some(name) = path.file_name() {
+                if name == target {
+                    return Some(path);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// equal to `dlopen` on unix
+type DllOpen = unsafe extern "C" fn(dllpath: *const c_char) -> *mut c_void;
+
+/// equal to `dlsym` on unix
+type DllGetSym = unsafe extern "C" fn(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+
+/// (dll-open, dll-find-symbol, dll-name-format)
+type DllOperationGroup = (DllOpen, DllGetSym, fn(&str) -> String);
+
+/// signature of rua library's entry
+type CdylibEntry = extern "C" fn(vm: &mut VM) -> u32;
+
+#[cfg(target_family = "windows")]
+fn select_dll_operation_platform() -> DllOperationGroup {
+    extern "C" {
+        fn LoadLibraryA(filename: *const c_char) -> *mut c_void;
+        fn GetProcAddress(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+        // fn FreeLibrary(handle: *mut std::ffi::c_void) -> std::os::raw::c_int;
+    }
+    return (LoadLibraryA, GetProcAddress, |name| format!("{}.dll", name));
+}
+
+#[cfg(target_family = "unix")]
+fn select_dll_operation_platform() -> DllOperationGroup {
+    extern "C" {
+        fn dlopen(filename: *const c_char, flags: i32) -> *mut c_void;
+        fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+        // fn dlclose(handle: *mut std::ffi::c_void) -> std::os::raw::c_int;
+    }
+    extern "C" fn dlopen_wrapper(filename: *const c_char) -> *mut c_void {
+        unsafe { dlopen(filename, 1) } // 2: RTLD_NOW,  1: RTLD_LAZY
+    }
+    return (dlopen_wrapper, dlsym, |name| format!("lib{}.so", name));
+}
+
+#[cfg(not(any(target_family = "windows", target_family = "unix")))]
+fn select_dll_operation_platform() -> DllOperationGroup {
+    compile_error!("Unsupported platform to select dynamic library operation functions.")
 }
