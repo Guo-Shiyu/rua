@@ -878,15 +878,15 @@ impl Parser<'_> {
                 let key = self.expr()?;
                 self.check_and_next(Token::RS)?;
                 self.check_and_next(Token::Assign)?;
-                return Ok(Field::eval(key, self.expr()?));
+                return Ok(Field::expr_key(key, self.expr()?));
             }
 
             Token::Ident(key) => {
                 std::mem::swap(&mut holder, key);
             }
 
-            // expr
-            _ => return Ok(Field::elem(self.expr()?)),
+            // expr as array elem
+            _ => return Ok(Field::array_elem(self.expr()?)),
         };
 
         self.look_ahead()?;
@@ -894,10 +894,10 @@ impl Parser<'_> {
             // Name `=` expr
             self.next()?; // skip name
             self.next()?; // skip '='
-            Ok(Field::lit(holder, self.expr()?))
+            Ok(Field::lit_key(holder, self.expr()?))
         } else {
             // expr
-            Ok(Field::elem(self.expr()?))
+            Ok(Field::array_elem(self.expr()?))
         }
     }
 

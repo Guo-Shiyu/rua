@@ -389,25 +389,22 @@ pub struct Field {
 }
 
 impl Field {
-    pub fn lit(key: String, val: ExprNode) -> Self {
+    pub fn lit_key(key: String, val: ExprNode) -> Self {
         Field {
             key: Some(FieldKey::Key(key)),
             val,
         }
     }
 
-    pub fn eval(key: ExprNode, val: ExprNode) -> Self {
+    pub fn expr_key(key: ExprNode, val: ExprNode) -> Self {
         Field {
             key: Some(FieldKey::Expr(key)),
             val,
         }
     }
 
-    pub fn elem(val: ExprNode) -> Self {
-        Field {
-            key: None,
-            val: val,
-        }
+    pub fn array_elem(val: ExprNode) -> Self {
+        Field { key: None, val }
     }
 }
 
