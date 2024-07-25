@@ -372,17 +372,23 @@ fn try_fold(exp: &mut Expr) -> AfterFoldStatus {
                                     std::cmp::Ordering::Equal => f64::NAN,
                                     std::cmp::Ordering::Greater => f64::INFINITY,
                                 });
-                            } else if *op == BinOp::Mod {
-                                // do nothing. perform mod 0 is a runtime error in lua.
+                                StillConst
+                            // } else if *op == BinOp::Mod {
+                            // do nothing. perform mod 0 is a runtime error in lua.
+                            //     NonConst
+                            } else {
+                                NonConst
                             }
                         } else {
                             *exp = apply_arithmetic_op_int(i1, i2, iop);
+                            StillConst
                         }
-                        StillConst
                     } else {
                         match (op, lhs.inner_ref(), rhs.inner_ref()) {
                             (BinOp::Concat, Expr::Literal(l1), Expr::Literal(l2)) => {
-                                *exp = Expr::Int((l1.len() + l2.len()) as i64);
+                                let mut cat = l1.clone();
+                                cat.push_str(&l2);
+                                *exp = Expr::Literal(cat);
                                 StillConst
                             }
                             _ => NonConst,
