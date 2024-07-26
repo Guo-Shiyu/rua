@@ -432,6 +432,43 @@ pub enum BinOp {
     And, Or,
 }
 
+impl BinOp {
+    pub fn is_arith_op(&self) -> bool {
+        matches!(
+            &self,
+            BinOp::Add
+                | BinOp::Minus
+                | BinOp::Mul
+                | BinOp::Mod
+                | BinOp::Pow
+                | BinOp::Div
+                | BinOp::IDiv
+        )
+    }
+
+    pub fn is_bit_op(&self) -> bool {
+        matches!(
+            &self,
+            BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr
+        )
+    }
+
+    pub fn is_concat_op(&self) -> bool {
+        matches!(&self, BinOp::Concat)
+    }
+
+    pub fn is_logic_op(&self) -> bool {
+        matches!(&self, BinOp::And | BinOp::Or)
+    }
+
+    pub fn is_cmp_op(&self) -> bool {
+        matches!(
+            &self,
+            BinOp::Eq | BinOp::Less | BinOp::LE | BinOp::Neq | BinOp::Great | BinOp::GE
+        )
+    }
+}
+
 /// ``` text
 /// unop ::= `-` | not | `#` | `~`
 /// ```

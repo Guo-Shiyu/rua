@@ -420,6 +420,18 @@ impl Instruction {
     pub fn placeholder() -> Self {
         Isc::isj(JMP, 9999)
     }
+
+    /// Check float number could be stored in sBx field of instruction.
+    pub fn fit_sbx(num: f64) -> bool {
+        let floor = num.floor();
+        if floor != num || num > i32::MAX as f64 || num < i32::MIN as f64 {
+            return false;
+        }
+
+        // in lua 5.4 `-OFFSET_sBx <= i && i <= MAXARG_Bx - OFFSET_sBx`
+        let int = floor as i32;
+        -(1 << 17) <= int && int <= (1 << 18) - 1 - (1 << 17)
+    }
 }
 
 impl OpCode {
@@ -741,6 +753,18 @@ impl Proto {
                         }
                     }
                     NEWTABLE => write!(f, "r({}) = {{}}", a)?,
+                    TESTSET => {
+                        // next move is code[idx + 2]
+                        let another_oprand = self.code[idx + 2].get_b();
+                        write!(
+                            f,
+                            "r({}) = r({}) {} r({})",
+                            a,
+                            b,
+                            if k { "or" } else { "and" },
+                            another_oprand
+                        )?
+                    }
                     CALL => write!(f, "Call r({}) with {} in, {} out  <--", a, b - 1, c - 1)?,
                     RETURN => write!(
                         f,
@@ -773,12 +797,12 @@ impl Proto {
                 let (op, a, sbx) = code.repr_asbx();
                 match op {
                     LOADI => write!(f, "r({}) = {}", a, sbx)?,
-                    LOADF => todo!(),
+                    LOADF => write!(f, "r({}) = {}", a, sbx as f64)?,
                     _ => {}
                 }
             }
             OpMode::IAx => {
-                let (op, _) = code.repr_ax();
+                let (op, _ax) = code.repr_ax();
                 match op {
                     EXTRAARG => {}
                     _ => unreachable!(),
@@ -787,7 +811,7 @@ impl Proto {
             OpMode::IsJ => {
                 let (isc, jmp) = code.repr_sj();
                 match isc {
-                    JMP => write!(f, "to {}", idx as i32 + 1 + jmp)?,
+                    JMP => write!(f, "  --> {}", idx as i32 + 1 + jmp)?,
                     _ => unreachable!(),
                 }
             }
@@ -978,7 +1002,7 @@ impl GenState {
     fn emit_local_decl(&mut self, name: String, status: ExprStatus, ln: u32) {
         let locdecl = LocVarDecl {
             name,
-            reg: self.try_load_expr_to_local(status, ln),
+            reg: self.load_expr_to_local(status, ln),
             start_pc: self.cur_pc(),
             end_pc: self.cur_pc(),
         };
@@ -1029,7 +1053,7 @@ impl GenState {
         ExprStatus::Reg(dest)
     }
 
-    fn try_load_expr_to_const(&mut self, es: ExprStatus) -> RegIndex {
+    fn load_expr_to_const(&mut self, es: ExprStatus) -> RegIndex {
         match es {
             ExprStatus::LitNil => self.alloc_const_reg(Value::Nil),
             ExprStatus::LitTrue => self.alloc_const_reg(Value::Bool(true)),
@@ -1042,7 +1066,7 @@ impl GenState {
     }
 
     /// Load an Expr to local if it is not in local reg.
-    fn try_load_expr_to_local(&mut self, es: ExprStatus, ln: u32) -> RegIndex {
+    fn load_expr_to_local(&mut self, es: ExprStatus, ln: u32) -> RegIndex {
         match es {
             ExprStatus::LitNil => {
                 let free = self.alloc_free_reg();
@@ -1065,11 +1089,13 @@ impl GenState {
                 free
             }
             ExprStatus::LitFlt(f) => {
-                // TODO:
-                // use LOADF for small float.
                 let free = self.alloc_free_reg();
-                let kreg = self.alloc_const_reg(Value::Float(f));
-                self.emit(Isc::iabx(LOADK, free, kreg), ln);
+                if Isc::fit_sbx(f) {
+                    self.emit(Isc::iasbx(LOADF, free, f as i32), ln);
+                } else {
+                    let kreg = self.alloc_const_reg(Value::Float(f));
+                    self.emit(Isc::iabx(LOADK, free, kreg), ln);
+                }
                 free
             }
             ExprStatus::Kst(k) => self.load_const(k, ln),
@@ -1080,23 +1106,6 @@ impl GenState {
             }
             ExprStatus::Call(c) => c,
             ExprStatus::Reg(r) => r,
-        }
-    }
-
-    fn peek_const_expr(exp: &Expr) -> Option<ExprStatus> {
-        match exp {
-            Expr::Nil => Some(ExprStatus::LitNil),
-            Expr::True => Some(ExprStatus::LitTrue),
-            Expr::False => Some(ExprStatus::LitFalse),
-            Expr::Int(i) => {
-                if *i as i32 > Isc::MAX_SBX {
-                    None
-                } else {
-                    Some(ExprStatus::LitInt(*i))
-                }
-            }
-            Expr::Float(_f) => None, // TODO
-            _ => None,
         }
     }
 }
@@ -1417,7 +1426,7 @@ impl CodeGen {
         self.walk_basic_block(block, mem)?;
         let cond_reg = {
             let cond = self.walk_common_expr(cond, Ctx::Keep, mem)?;
-            self.try_load_expr_to_local(cond, def)
+            self.load_expr_to_local(cond, def)
         };
         self.emit(Isc::iabck(TEST, cond_reg, 0, 0), def);
         let fwdstep = entry as i32 - self.cur_pc() as i32 - 1; // -1: pc is the next isc
@@ -1444,7 +1453,7 @@ impl CodeGen {
             //         // while false, skip loop body.
             //     }
             // }
-            self.try_load_expr_to_local(sts, condbeg)
+            self.load_expr_to_local(sts, condbeg)
         };
         self.emit(Isc::iabck(TEST, cond, 0, 0), condbeg);
         let (bpidx, oldpc) = self.set_recover_point(condbeg);
@@ -1466,17 +1475,17 @@ impl CodeGen {
         let mut init_reg = {
             let line = n.init.def_begin();
             let s = self.walk_common_expr(n.init, Ctx::Allocate, mem)?;
-            self.try_load_expr_to_local(s, line)
+            self.load_expr_to_local(s, line)
         };
         let mut limit_reg = {
             let line = n.limit.def_begin();
             let s = self.walk_common_expr(n.limit, Ctx::Allocate, mem)?;
-            self.try_load_expr_to_local(s, line)
+            self.load_expr_to_local(s, line)
         };
         let mut step_reg = {
             let line = n.step.def_begin();
             let s = self.walk_common_expr(n.step, Ctx::Allocate, mem)?;
-            self.try_load_expr_to_local(s, line)
+            self.load_expr_to_local(s, line)
         };
 
         let loopdef = n.body.def_info();
@@ -1570,7 +1579,7 @@ impl CodeGen {
             };
         };
 
-        let reg = self.try_load_expr_to_local(cond, cond_def);
+        let reg = self.load_expr_to_local(cond, cond_def);
         self.emit(Isc::iabck(TEST, reg, 0, 0), cond_def);
         let mut branch = BranchBackPatchPoint {
             cond_jmp_idx: self.cur_pc(),
@@ -1688,7 +1697,7 @@ impl CodeGen {
                             // self.emit(Isc::iabc(RETURN, ret, 0, 0), ln)
                         }
                         otherwise => {
-                            let reg = self.try_load_expr_to_local(otherwise, ln);
+                            let reg = self.load_expr_to_local(otherwise, ln);
                             self.emit(Isc::iabc(RETURN1, reg, 0, 0), ln);
                         }
                     }
@@ -1836,7 +1845,7 @@ impl CodeGen {
                         }
 
                         upstatus @ ExprStatus::Up(_) => {
-                            let valreg = self.try_load_expr_to_local(upstatus, valdef);
+                            let valreg = self.load_expr_to_local(upstatus, valdef);
                             self.emit(Isc::iabc(SETTABUP, 0, decl_kreg, valreg), valdef);
                         }
 
@@ -1845,13 +1854,13 @@ impl CodeGen {
                         }
 
                         literals => {
-                            let val_kreg = self.try_load_expr_to_const(literals);
+                            let val_kreg = self.load_expr_to_const(literals);
                             self.emit(Isc::iabck(SETTABUP, 0, decl_kreg, val_kreg), valdef);
                         }
                     },
 
                     _ => {
-                        let valreg = self.try_load_expr_to_local(valsts, valdef);
+                        let valreg = self.load_expr_to_local(valsts, valdef);
                         self.emit(Isc::iabc(SETUPVAL, valreg, upidx, 0), vardef);
                     }
                 };
@@ -1899,12 +1908,6 @@ impl CodeGen {
             Ctx::Allocate => {
                 let free = self.alloc_free_reg();
                 let status = self.emit_expr(node.inner(), free, def, mem)?;
-                // if let ExprStatus::Reg(ref r) = status {
-                //     if *r < free {
-                //         self.free_reg();
-                //         debug_assert_eq!(self.nextreg, free);
-                //     }
-                // }
                 Ok(status)
             }
 
@@ -1953,11 +1956,11 @@ impl CodeGen {
                     //  left
                     let ln = lhs.def_begin();
                     let left = self.walk_common_expr(lhs, Ctx::PotentialTailCall, mem)?;
-                    let reg = self.try_load_expr_to_local(left, ln);
+                    let reg = self.load_expr_to_local(left, ln);
 
                     // right
                     let right = self.walk_common_expr(rhs, Ctx::PotentialTailCall, mem)?;
-                    self.emit_binop_optimized(ExprStatus::Reg(reg), right, reg, def, op)
+                    self.emit_optimized_binop(ExprStatus::Reg(reg), right, reg, def, op)
                 }
 
                 expr => {
@@ -2058,12 +2061,12 @@ impl CodeGen {
             }
 
             Expr::Float(f) => {
-                let kreg = self.alloc_const_reg(f.into());
-                self.emit(Isc::iabx(LOADK, dest, kreg), def.0);
-                // todo!("load small float to register")
-                // if f as i32 > Isc::MAX_SBX {
-                // } else {
-                // }
+                if Isc::fit_sbx(f) {
+                    self.emit(Isc::iasbx(LOADF, dest, f as i32), def.0);
+                } else {
+                    let kreg = self.alloc_const_reg(f.into());
+                    self.emit(Isc::iabx(LOADK, dest, kreg), def.0);
+                }
                 ExprStatus::Reg(dest)
             }
 
@@ -2115,115 +2118,142 @@ impl CodeGen {
         lhs: ExprNode,
         rhs: ExprNode,
         def: (u32, u32),
-        op: BinOp,
-        destreg: RegIndex,
+        mut op: BinOp,
+        dest: RegIndex,
         mem: &mut Heap,
     ) -> Result<ExprStatus, CodeGenError> {
-        let (lst, rst) = {
-            let l = if let Some(ls) = GenState::peek_const_expr(&lhs) {
-                ls
-            } else {
-                self.walk_common_expr(lhs, Ctx::must_use(destreg), mem)?
-            };
+        // Shrink ExprStatus to one of `Reg, Kst, Int`
+        fn shrink_oprand(code: &mut CodeGen, status: ExprStatus, line: u32) -> ExprStatus {
+            match status {
+                ExprStatus::Kst(_) | ExprStatus::LitInt(_) => status,
+                _ => ExprStatus::Reg(code.load_expr_to_local(status, line)),
+            }
+        }
 
-            let right_reg = self.alloc_free_reg();
-            let r = if let Some(rs) = GenState::peek_const_expr(&rhs) {
-                rs
-            } else {
-                self.walk_common_expr(rhs, Ctx::must_use(right_reg), mem)?
-            };
-            self.free_reg(); // free right reg
-            (l, r)
+        let (lln, rln) = (lhs.def_begin(), rhs.def_begin());
+
+        // reuse dest register if expression has sub-expr with binary operator.
+        // such as case like `r3 = r0 and r1 or r2`, will not use a temporary reggister r4 to store result of `r0 and r1`.
+        let ctx = if matches!(lhs.inner_ref(), Expr::BinaryOp { .. }) {
+            Ctx::must_use(dest)
+        } else {
+            Ctx::Keep
         };
+        let mut les = self.walk_common_expr(lhs, ctx, mem)?;
+        let mut res = self.walk_common_expr(rhs, Ctx::Keep, mem)?;
+        les = shrink_oprand(self, les, lln);
+        res = shrink_oprand(self, res, rln);
 
-        self.emit_binop_optimized(lst, rst, destreg, def, op)
+        // prepare oprand for instruction selection. in general, only skip ConstantFold stage could cause these situation.
+        // load left oprand to register if both oprand is const.
+        if [&les, &res]
+            .iter()
+            .all(|status| matches!(status, ExprStatus::Kst(_)))
+        {
+            les = ExprStatus::Reg(self.load_expr_to_local(les, lln));
+        }
+
+        // load const oprand to register if one of oprand is const and the other one is litint
+        match (&les, &res) {
+            (ExprStatus::LitInt(_), kst @ ExprStatus::Kst(_))
+            | (kst @ ExprStatus::Kst(_), ExprStatus::LitInt(_))
+            | (kst @ ExprStatus::LitInt(_), ExprStatus::LitInt(_)) => {
+                les = ExprStatus::Reg(self.load_expr_to_local(kst.clone(), lln));
+            }
+            _ => {}
+        }
+
+        if op.is_cmp_op() {
+            // because that there is not Great / GreatEqual opcode in lua 5.4
+            // so they will be emit as LessEqual / Less, and two oprands needs to be swapped.
+            op = match op {
+                BinOp::GE => BinOp::Less,
+                BinOp::Great => BinOp::LE,
+                _ => op,
+            };
+            self.emit_cmp_expr(res, les, dest, def, op)?; // reverse oprands here
+        } else if op.is_logic_op() {
+            let lreg = self.load_expr_to_local(les, def.0);
+            let rreg = self.load_expr_to_local(res, def.1);
+            self.emit_logic_expr(lreg, rreg, dest, def.1, op)?;
+        } else {
+            self.emit_optimized_binop(les, res, dest, def, op)?;
+        }
+
+        Ok(ExprStatus::Reg(dest))
     }
 
-    fn emit_binop_optimized(
+    fn emit_cmp_expr(
+        &self,
+        les: ExprStatus,
+        res: ExprStatus,
+        dest: i32,
+        def: (u32, u32),
+        op: BinOp,
+    ) -> Result<(), CodeGenError> {
+        todo!()
+    }
+
+    fn emit_logic_expr(
+        &mut self,
+        lhs: RegIndex,
+        rhs: RegIndex,
+        dest: i32,
+        line: u32,
+        op: BinOp,
+    ) -> Result<(), CodeGenError> {
+        let testset = match op {
+            BinOp::And => Isc::iabc(TESTSET, dest, lhs, 0),
+            BinOp::Or => Isc::iabck(TESTSET, dest, lhs, 0),
+            _ => unreachable!(),
+        };
+        self.emit(testset, line);
+        self.emit(Isc::isj(JMP, 1), line);
+        self.emit(Isc::iabc(MOVE, dest, rhs, 0), line);
+        Ok(())
+    }
+
+    /// Emit instructions that could be optimized with immediate or const oprand.          
+    /// `Bitwise` and `Arithmetic` operator are included. `Concat` will always generate `OpCode::CONCAT`.
+    fn emit_optimized_binop(
         &mut self,
         lst: ExprStatus,
         rst: ExprStatus,
-        destreg: i32,
+        dest: i32,
         def: (u32, u32),
         op: BinOp,
     ) -> Result<ExprStatus, CodeGenError> {
-        let select_arithmetic_kop = |bop: BinOp| -> OpCode {
-            match bop {
-                BinOp::Add => ADDK,
-                BinOp::Minus => SUBK,
-                BinOp::Mul => MULK,
-                BinOp::Mod => MODK,
-                BinOp::Pow => POWK,
-                BinOp::Div => DIVK,
-                BinOp::IDiv => IDIVK,
-                BinOp::BitAnd => BANDK,
-                BinOp::BitOr => BORK,
-                BinOp::BitXor => BXORK,
-                _ => unreachable!(),
-            }
-        };
-        let select_arithemic_op = |bop: BinOp| -> OpCode {
-            match bop {
-                BinOp::Add => ADD,
-                BinOp::Minus => SUB,
-                BinOp::Mul => MUL,
-                BinOp::Mod => MOD,
-                BinOp::Pow => POW,
-                BinOp::Div => DIV,
-                BinOp::IDiv => IDIV,
-                BinOp::BitAnd => BAND,
-                BinOp::BitOr => BOR,
-                BinOp::BitXor => BXOR,
-                _ => unreachable!(),
-            }
-        };
-
-        let select_immediate_op = |bop: BinOp| -> OpCode {
-            match bop {
-                BinOp::Add => ADDI,
-                BinOp::Shl => SHLI,
-                BinOp::Shr => SHRI,
-                _ => unreachable!(),
-            }
-        };
-
-        const IMMEDIATE_OP: [BinOp; 3] = [BinOp::Add, BinOp::Shl, BinOp::Shr];
-
         match (lst, rst) {
-            // both of [l, r] is kst, fallthrough
-            (ExprStatus::Kst(lk), ExprStatus::Kst(rk)) => {
-                // load left to dest reg and cover dest reg
-                self.emit(Isc::iabx(LOADK, destreg, lk), def.0);
-                self.emit(
-                    Isc::iabc(select_arithmetic_kop(op), destreg, destreg, rk),
-                    def.0,
-                );
-            }
-
             // one of [l, r] is kst
-            (ExprStatus::Kst(lk), ExprStatus::Reg(rk))
-            | (ExprStatus::Reg(lk), ExprStatus::Kst(rk)) => {
-                self.emit(Isc::iabc(select_arithmetic_kop(op), destreg, lk, rk), def.0);
+            (kst @ ExprStatus::Kst(rk), ExprStatus::Reg(r))
+            | (ExprStatus::Reg(r), kst @ ExprStatus::Kst(rk)) => {
+                if let Some(kisc) = Self::try_select_const_isc(op) {
+                    self.emit(Isc::iabc(kisc, dest, r, rk), def.0)
+                } else {
+                    let reg = self.load_expr_to_local(kst, def.1);
+                    self.emit(Isc::iabc(Self::default_isc(op), dest, r, reg), def.1)
+                }
             }
 
             // one of [l, r] is imidiate oprand
-            (ExprStatus::LitInt(i), other) | (other, ExprStatus::LitInt(i))
-                if IMMEDIATE_OP.contains(&op) =>
-            {
-                let reg = self.try_load_expr_to_local(other, def.0);
-                self.emit(
-                    Isc::iabc(select_immediate_op(op), destreg, reg, i as i32),
-                    def.0,
-                );
+            (lit @ ExprStatus::LitInt(imm), ExprStatus::Reg(r))
+            | (ExprStatus::Reg(r), lit @ ExprStatus::LitInt(imm)) => {
+                if let Some(iisc) = Self::try_select_imm_isc(op) {
+                    self.emit(Isc::iabc(iisc, r, imm as i32, 0), def.0)
+                } else {
+                    let reg = self.load_expr_to_local(lit, def.1);
+                    self.emit(Isc::iabc(Self::default_isc(op), dest, r, reg), def.1)
+                }
             }
 
             // both of [l, r] is active variable
-            (ExprStatus::Reg(lk), ExprStatus::Reg(rk)) => {
-                self.emit(Isc::iabc(select_arithemic_op(op), destreg, lk, rk), def.0);
+            (ExprStatus::Reg(lreg), ExprStatus::Reg(rreg)) => {
+                self.emit(Isc::iabc(Self::default_isc(op), dest, lreg, rreg), def.0);
             }
+
             _ => unreachable!(),
         };
-        Ok(ExprStatus::Reg(destreg))
+        Ok(ExprStatus::Reg(dest))
     }
 
     fn emit_unary_expr(
@@ -2292,11 +2322,11 @@ impl CodeGen {
                 | ExprStatus::LitInt(_)
                 | ExprStatus::LitFlt(_)
                 | ExprStatus::Kst(_) => {
-                    let valkreg = self.try_load_expr_to_const(valstatus);
+                    let valkreg = self.load_expr_to_const(valstatus);
                     self.emit(Isc::iabck(SETI, dest, aryidx, valkreg), fdefloc);
                 }
                 _ => {
-                    let valreg = self.try_load_expr_to_local(valstatus, fdefloc);
+                    let valreg = self.load_expr_to_local(valstatus, fdefloc);
                     self.emit(Isc::iabck(SETI, dest, aryidx, valreg), fdefloc)
                 }
             }
@@ -2319,7 +2349,7 @@ impl CodeGen {
                     if let ExprStatus::Kst(valreg) = value {
                         self.emit(Isc::iabck(SETTABLE, dest, reg, valreg), ln)
                     } else {
-                        let valreg = self.try_load_expr_to_local(value, ln);
+                        let valreg = self.load_expr_to_local(value, ln);
                         self.emit(Isc::iabc(SETTABLE, dest, reg, valreg), ln)
                     }
                 }
@@ -2328,7 +2358,7 @@ impl CodeGen {
                     if let ExprStatus::Kst(valreg) = value {
                         self.emit(Isc::iabck(SETI, dest, i as i32, valreg), ln);
                     } else {
-                        let valreg = self.try_load_expr_to_local(value, ln);
+                        let valreg = self.load_expr_to_local(value, ln);
                         self.emit(Isc::iabc(SETI, dest, i as i32, valreg), ln);
                     }
                 }
@@ -2345,11 +2375,11 @@ impl CodeGen {
                     | ExprStatus::LitInt(_)
                     | ExprStatus::LitFlt(_)
                     | ExprStatus::Kst(_) => {
-                        let valkreg = self.try_load_expr_to_const(value);
+                        let valkreg = self.load_expr_to_const(value);
                         self.emit(Isc::iabck(SETFIELD, dest, idx_kreg, valkreg), ln);
                     }
                     _ => {
-                        let valreg = self.try_load_expr_to_local(value, ln);
+                        let valreg = self.load_expr_to_local(value, ln);
                         self.emit(Isc::iabck(SETFIELD, dest, idx_kreg, valreg), ln)
                     }
                 }
@@ -2423,6 +2453,7 @@ impl CodeGen {
             LookupState::UpList { idx: 0 }
         }
     }
+
     fn lookup_and_load(
         &mut self,
         id: String,
@@ -2444,6 +2475,65 @@ impl CodeGen {
                     reg
                 }
             }
+        }
+    }
+
+    // isc for single const operand
+    fn try_select_const_isc(bop: BinOp) -> Option<OpCode> {
+        use BinOp::*;
+
+        match bop {
+            Add => Some(ADDK),
+            Minus => Some(SUBK),
+            Mul => Some(MULK),
+            Mod => Some(MODK),
+            Pow => Some(POWK),
+            Div => Some(DIVK),
+            IDiv => Some(IDIVK),
+            BitAnd => Some(BANDK),
+            BitOr => Some(BORK),
+            BitXor => Some(BXORK),
+            Eq => Some(EQK),
+            _ => None,
+        }
+    }
+
+    /// select instruction for single immediate operand
+    fn try_select_imm_isc(bop: BinOp) -> Option<OpCode> {
+        use BinOp::*;
+
+        match bop {
+            Add => Some(ADDI),
+            Shl => Some(SHLI),
+            Shr => Some(SHRI),
+            Eq => Some(EQI),
+            Less => Some(LTI),
+            LE => Some(LEI),
+            GE => Some(GEI),
+            Great => Some(GTI),
+            _ => None,
+        }
+    }
+
+    fn default_isc(bop: BinOp) -> OpCode {
+        use BinOp::*;
+
+        match bop {
+            Add => ADD,
+            Minus => SUB,
+            Mul => MUL,
+            Mod => MOD,
+            Pow => POW,
+            Div => DIV,
+            IDiv => IDIV,
+            BitAnd => BAND,
+            BitOr => BOR,
+            BitXor => BXOR,
+            Concat => CONCAT,
+            Eq => EQ,
+            Less => LT,
+            LE => OpCode::LE,
+            _ => unreachable!(),
         }
     }
 }

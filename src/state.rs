@@ -790,7 +790,6 @@ impl VM {
         // write return value to  [caller, caller + 1, ... caller + nexpect - 1]
         for idx in 0..nexpect {
             let reti = self.peek(idx + 1).unwrap_or_default();
-            dbg!(reti);
             unsafe { self.func.offset(idx as isize).write(reti) };
         }
         self.callchain.pop();
@@ -1180,6 +1179,15 @@ impl VM {
                             }
                         }
 
+                        TESTSET => {
+                            let rb = self.rget(b)?;
+                            if rb.is_falsey() != k {
+                                self.rset(a, rb)?;
+                            } else {
+                                self.pc += 1;
+                            }
+                        }
+
                         CALL => {
                             self.do_call(a, b - 1, c - 1)?;
                         }
@@ -1238,7 +1246,9 @@ impl VM {
                             self.rset(a, sbx)?;
                         }
 
-                        LOADF => todo!(),
+                        LOADF => {
+                            self.rset(a, sbx as f64)?;
+                        }
 
                         LOADK => {
                             self.rset(a, self.kget(sbx))?;
