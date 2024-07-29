@@ -54,7 +54,7 @@ impl Display for OpMode {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Instruction {
     code: u32,
 }
@@ -446,7 +446,7 @@ impl OpCode {
     }
 }
 
-impl Display for Instruction {
+impl Debug for Instruction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mode = self.mode();
         write!(f, "{} ", mode)?;
@@ -479,6 +479,12 @@ impl Display for Instruction {
                 write!(f, "{code:<16}\t{sj:<3}         ")
             }
         }
+    }
+}
+
+impl Display for Instruction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        <Self as std::fmt::Debug>::fmt(self, f)
     }
 }
 
@@ -719,40 +725,114 @@ impl Proto {
             OpMode::IABC => {
                 let (isc, a, b, c, k) = code.repr_abck();
                 match isc {
-                    MOVE => write!(f, "r({}) = r({})", a, b)?,
-                    LOADFALSE => write!(f, "r({}) = false", a)?,
-                    LOADTRUE => write!(f, "r({}) = true", a)?,
-                    LOADNIL => write!(f, "r({}) ... r({}) = nil", a, a + b)?,
+                    MOVE => write!(f, "r({}) = r({})", a, b),
+                    LOADFALSE => write!(f, "r({}) = false", a),
+                    LFALSESKIP => write!(f, "r({}) = false; --> {}", a, idx + 2),
+                    LOADTRUE => write!(f, "r({}) = true", a),
+                    LOADNIL => write!(f, "r({}) ... r({}) = nil", a, a + b),
                     GETTABUP => write!(
                         f,
                         "r({}) = {}[{:?}]",
                         a,
                         self.updecl[b as usize].name(),
                         self.kst[c as usize]
-                    )?,
-                    GETI => write!(f, "r({}) = r({})[{}]", a, b, c)?,
-                    GETFIELD => write!(f, "r({}) = r({})[{}]", a, b, self.kst[c as usize])?,
+                    ),
+                    GETI => write!(f, "r({}) = r({})[{}]", a, b, c),
+                    GETFIELD => write!(f, "r({}) = r({})[{}]", a, b, self.kst[c as usize]),
                     SETTABUP => write!(
                         f,
                         "{}[{}] = {}",
                         self.updecl[a as usize].name(),
                         self.kst[b as usize],
                         self.kst[c as usize]
-                    )?,
-                    SETTABLE => write!(f, "r({})[r({})] = rk({})", a, b, c)?,
-                    SETI => write!(f, "r({})[{}] = k({})", a, b, c)?,
+                    ),
+                    SETTABLE => write!(f, "r({})[r({})] = rk({})", a, b, c),
+                    SETI => write!(f, "r({})[{}] = k({})", a, b, c),
                     SETFIELD => {
                         if k {
                             write!(
                                 f,
                                 "r({})[{}] = {}",
                                 a, self.kst[b as usize], self.kst[c as usize]
-                            )?
+                            )
                         } else {
-                            write!(f, "r({})[{}] = r({})", a, self.kst[b as usize], c)?
+                            write!(f, "r({})[{}] = r({})", a, self.kst[b as usize], c)
                         }
                     }
-                    NEWTABLE => write!(f, "r({}) = {{}}", a)?,
+                    NEWTABLE => write!(f, "r({}) = {{}}", a),
+                    EQ => write!(
+                        f,
+                        "If r({}) {}= r({}), --> {}",
+                        a,
+                        if !k { '!' } else { '=' },
+                        b,
+                        idx + 2
+                    ),
+                    LT => write!(
+                        f,
+                        "If r({}) {} r({}), --> {}",
+                        a,
+                        if k { '<' } else { '>' },
+                        b,
+                        idx + 2
+                    ),
+                    LE => write!(
+                        f,
+                        "If r({}) {}= r({}), --> {}",
+                        a,
+                        if k { '<' } else { '>' },
+                        b,
+                        idx + 2
+                    ),
+                    EQK => write!(
+                        f,
+                        "If r({}) {}= {}, --> {}",
+                        a,
+                        if !k { '!' } else { '=' },
+                        self.kst[b as usize],
+                        idx + 2
+                    ),
+                    EQI => write!(
+                        f,
+                        "If r({}) {}= {}, --> {}",
+                        a,
+                        if !k { '!' } else { '=' },
+                        b,
+                        idx + 2
+                    ),
+                    LTI => write!(
+                        f,
+                        "If r({}) {} {}, --> {}",
+                        a,
+                        if !k { '<' } else { '>' },
+                        b,
+                        idx + 2
+                    ),
+                    LEI => write!(
+                        f,
+                        "If r({}) {}= {}, --> {}",
+                        a,
+                        if !k { '<' } else { '>' },
+                        b,
+                        idx + 2
+                    ),
+                    GTI => write!(
+                        f,
+                        "If r({}) {} {}, --> {}",
+                        a,
+                        if k { '<' } else { '>' },
+                        b,
+                        idx + 2
+                    ),
+                    GEI => write!(
+                        f,
+                        "If r({}) {}= {}, --> {}",
+                        a,
+                        if k { '<' } else { '>' },
+                        b,
+                        idx + 2
+                    ),
+
                     TESTSET => {
                         // next move is code[idx + 2]
                         let another_oprand = self.code[idx + 2].get_b();
@@ -763,60 +843,59 @@ impl Proto {
                             b,
                             if k { "or" } else { "and" },
                             another_oprand
-                        )?
+                        )
                     }
-                    CALL => write!(f, "Call r({}) with {} in, {} out  <--", a, b - 1, c - 1)?,
+                    CALL => write!(f, "Call r({}) with {} in, {} out  <==", a, b - 1, c - 1),
                     RETURN => write!(
                         f,
-                        "Return {} values of r({}) ... r({})  ==>",
+                        "Return {} values of r({}) ... r({})  =>",
                         b - 1,
                         a,
                         b - 2
-                    )?,
-                    RETURN0 => write!(f, "Return 0 value  -->")?,
-                    RETURN1 => write!(f, "Return r({}) -=>", a)?,
-                    _ => {}
-                };
+                    ),
+                    RETURN0 => write!(f, "Return 0 value  =>"),
+                    RETURN1 => write!(f, "Return r({:>5}) =>", a),
+                    _ => Ok(()),
+                }
             }
             OpMode::IABx => {
                 let (op, a, bx) = code.repr_abx();
                 match op {
-                    LOADK => write!(f, "r({}) = {:?}", a, self.kst[bx as usize])?,
+                    LOADK => write!(f, "r({}) = {:?}", a, self.kst[bx as usize]),
                     CLOSURE => write!(
                         f,
                         "r({}) = Closure[{}] at 0x{:X}",
                         a,
                         bx,
                         self.subfn[bx as usize].address()
-                    )?,
-                    NEWTABLE => write!(f, "r({}) = {{}}", a)?,
-                    _ => {}
+                    ),
+                    NEWTABLE => write!(f, "r({}) = {{}}", a),
+                    _ => Ok(()),
                 }
             }
             OpMode::IAsBx => {
                 let (op, a, sbx) = code.repr_asbx();
                 match op {
-                    LOADI => write!(f, "r({}) = {}", a, sbx)?,
-                    LOADF => write!(f, "r({}) = {}", a, sbx as f64)?,
-                    _ => {}
+                    LOADI => write!(f, "r({}) = {}", a, sbx),
+                    LOADF => write!(f, "r({}) = {}", a, sbx as f64),
+                    _ => Ok(()),
                 }
             }
             OpMode::IAx => {
                 let (op, _ax) = code.repr_ax();
                 match op {
-                    EXTRAARG => {}
+                    EXTRAARG => Ok(()),
                     _ => unreachable!(),
-                };
+                }
             }
             OpMode::IsJ => {
                 let (isc, jmp) = code.repr_sj();
                 match isc {
-                    JMP => write!(f, "  --> {}", idx as i32 + 1 + jmp)?,
+                    JMP => write!(f, "  --> {}", idx as i32 + 1 + jmp),
                     _ => unreachable!(),
                 }
             }
-        };
-        Ok(())
+        }
     }
 }
 
@@ -2118,14 +2197,21 @@ impl CodeGen {
         lhs: ExprNode,
         rhs: ExprNode,
         def: (u32, u32),
-        mut op: BinOp,
+        op: BinOp,
         dest: RegIndex,
         mem: &mut Heap,
     ) -> Result<ExprStatus, CodeGenError> {
         // Shrink ExprStatus to one of `Reg, Kst, Int`
         fn shrink_oprand(code: &mut CodeGen, status: ExprStatus, line: u32) -> ExprStatus {
             match status {
-                ExprStatus::Kst(_) | ExprStatus::LitInt(_) => status,
+                ExprStatus::Kst(_) => status,
+                lit @ ExprStatus::LitInt(imm) => {
+                    if imm >= Isc::MAX_SBX as i64 {
+                        ExprStatus::Kst(code.load_expr_to_const(lit))
+                    } else {
+                        lit
+                    }
+                }
                 _ => ExprStatus::Reg(code.load_expr_to_local(status, line)),
             }
         }
@@ -2164,14 +2250,7 @@ impl CodeGen {
         }
 
         if op.is_cmp_op() {
-            // because that there is not Great / GreatEqual opcode in lua 5.4
-            // so they will be emit as LessEqual / Less, and two oprands needs to be swapped.
-            op = match op {
-                BinOp::GE => BinOp::Less,
-                BinOp::Great => BinOp::LE,
-                _ => op,
-            };
-            self.emit_cmp_expr(res, les, dest, def, op)?; // reverse oprands here
+            self.emit_conditional_expr(les, res, dest, def, op)?;
         } else if op.is_logic_op() {
             let lreg = self.load_expr_to_local(les, def.0);
             let rreg = self.load_expr_to_local(res, def.1);
@@ -2183,15 +2262,100 @@ impl CodeGen {
         Ok(ExprStatus::Reg(dest))
     }
 
-    fn emit_cmp_expr(
-        &self,
+    ///
+    fn emit_conditional_expr(
+        &mut self,
         les: ExprStatus,
         res: ExprStatus,
         dest: i32,
         def: (u32, u32),
         op: BinOp,
     ) -> Result<(), CodeGenError> {
-        todo!()
+        // `c = not (les op res) ? false : true`
+        let compose = |code, a, b, c| -> Instruction {
+            if matches!(op, BinOp::Neq) {
+                Isc::iabc(code, a, b, c)
+            } else {
+                Isc::iabck(code, a, b, c)
+            }
+        };
+
+        let emit_default_cmp_expr = |cgen: &mut CodeGen, op, left, right| {
+            // because there is not GE / GT opcode in lua 5.4, so they willl be emitted as LE / LT.
+            // and two oprands need to be reversed.
+
+            // fixed: (operator, lhs, rhs)
+            let fixed = match op {
+                BinOp::GE => (BinOp::LE, right, left),
+                BinOp::Great => (BinOp::Less, right, left),
+                _ => (op, left, right),
+            };
+            cgen.emit(
+                compose(Self::default_isc(fixed.0), fixed.1, fixed.2, 0),
+                def.1,
+            );
+        };
+
+        let emit_const_cmp_expr = |cgen: &mut CodeGen, op, r, rk, kst| {
+            if let Some(kisc) = CodeGen::try_select_const_isc(op) {
+                cgen.emit(compose(kisc, r, rk, 0), def.1)
+            } else {
+                let reg = cgen.load_expr_to_local(kst, def.1);
+                emit_default_cmp_expr(cgen, op, r, reg)
+            }
+        };
+
+        let emit_imm_cmp_expr =
+            |cgen: &mut CodeGen, op, r, imm, lit| match CodeGen::try_select_imm_isc(op) {
+                Some(iisc) if imm <= Isc::MAX_C as i64 => {
+                    cgen.emit(compose(iisc, r, imm as i32, 0), def.0)
+                }
+                _ => {
+                    let reg = cgen.load_expr_to_local(lit, def.0);
+                    emit_default_cmp_expr(cgen, op, r, reg)
+                }
+            };
+
+        // use inverse operator to keep immediate number as second  oprand
+        let inversed = match op {
+            BinOp::Less => BinOp::Great,
+            BinOp::LE => BinOp::GE,
+            BinOp::Great => BinOp::Less,
+            BinOp::GE => BinOp::LE,
+            _ => op,
+        };
+        match (les, res) {
+            // one of [l, r] is kst
+            (ExprStatus::Reg(r), kst @ ExprStatus::Kst(rk)) => {
+                emit_const_cmp_expr(self, op, r, rk, kst)
+            }
+
+            // one of [l, r] is kst, use inversed operator to keep constant as second oprands
+            (kst @ ExprStatus::Kst(rk), ExprStatus::Reg(r)) => {
+                emit_const_cmp_expr(self, inversed, r, rk, kst)
+            }
+
+            // one of [l, r] is imidiate oprand
+            (ExprStatus::Reg(r), lit @ ExprStatus::LitInt(imm)) => {
+                emit_imm_cmp_expr(self, op, r, imm, lit)
+            }
+
+            // one of [l, r] is imidiate oprand, use inversed operator to keep constant as second oprands
+            (lit @ ExprStatus::LitInt(imm), ExprStatus::Reg(r)) => {
+                emit_imm_cmp_expr(self, inversed, r, imm, lit)
+            }
+
+            // both of [l, r] is in register
+            (ExprStatus::Reg(left), ExprStatus::Reg(right)) => {
+                emit_default_cmp_expr(self, op, left, right)
+            }
+
+            _ => unreachable!(),
+        };
+        self.emit(Isc::isj(JMP, 1), def.0);
+        self.emit(Isc::iabc(LFALSESKIP, dest, 0, 0), def.1);
+        self.emit(Isc::iabc(LOADTRUE, dest, 0, 0), def.1);
+        Ok(())
     }
 
     fn emit_logic_expr(
@@ -2493,7 +2657,7 @@ impl CodeGen {
             BitAnd => Some(BANDK),
             BitOr => Some(BORK),
             BitXor => Some(BXORK),
-            Eq => Some(EQK),
+            Eq | Neq => Some(EQK), // Neq repr as EQ in bytecode
             _ => None,
         }
     }
@@ -2506,7 +2670,7 @@ impl CodeGen {
             Add => Some(ADDI),
             Shl => Some(SHLI),
             Shr => Some(SHRI),
-            Eq => Some(EQI),
+            Eq | Neq => Some(EQI), // Neq repr as EQ in bytecode
             Less => Some(LTI),
             LE => Some(LEI),
             GE => Some(GEI),
@@ -2530,15 +2694,13 @@ impl CodeGen {
             BitOr => BOR,
             BitXor => BXOR,
             Concat => CONCAT,
-            Eq => EQ,
+            Eq | Neq => EQ, // Neq repr as EQ in bytecode
             Less => LT,
             LE => OpCode::LE,
             _ => unreachable!(),
         }
     }
-}
 
-impl CodeGen {
     pub fn codegen(
         ast_root: Box<SrcLoc<Block>>,
         strip: bool,
@@ -2964,7 +3126,6 @@ mod test {
 
     #[test]
     fn instruction_size_check() {
-        use super::Instruction;
         assert_eq!(std::mem::size_of::<Instruction>(), 4);
     }
 

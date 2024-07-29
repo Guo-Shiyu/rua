@@ -44,14 +44,10 @@ impl Frame {
     const INIT_FRAME_PC: i32 = i32::MAX;
     const LUA_MULTI_RET: i32 = i32::MAX;
 
-    unsafe fn cur_isc(&self) -> Instruction {
-        *self.code_ptr.offset(self.pc as isize)
-    }
-
     /// Get next instruction and increase pc counter with 1.
     fn fetch(&mut self) -> Instruction {
         debug_assert!(self.pc < self.codelen);
-        let isc = unsafe { self.cur_isc() };
+        let isc = unsafe { *self.code_ptr.offset(self.pc as isize) };
         self.pc += 1;
         isc
     }
@@ -886,6 +882,12 @@ impl VM {
         }
     }
 
+    fn cmp_impl(&mut self, lhs: Value, rhs: Value, expect: Ordering, k: bool) {
+        if (lhs.cmp(&rhs) == expect) != k {
+            self.pc += 1;
+        }
+    }
+
     fn execute(&mut self) -> Result<(), InterpretError> {
         use OpCode::*;
         use Value::*;
@@ -1171,6 +1173,42 @@ impl VM {
 
                         SHR => {
                             self.bit_op(a, self.rget(b)?, self.rget(c)?, |l, r| l >> r, MMBIN)?
+                        }
+
+                        EQ => {
+                            self.cmp_impl(self.rget(a)?, self.rget(b)?, Ordering::Equal, k);
+                        }
+
+                        LT => {
+                            self.cmp_impl(self.rget(a)?, self.rget(b)?, Ordering::Less, k);
+                        }
+
+                        LE => {
+                            self.cmp_impl(self.rget(a)?, self.rget(b)?, Ordering::Greater, !k);
+                        }
+
+                        EQK => {
+                            self.cmp_impl(self.rget(a)?, self.kget(b), Ordering::Equal, k);
+                        }
+
+                        EQI => {
+                            self.cmp_impl(self.rget(a)?, Value::from(b), Ordering::Equal, k);
+                        }
+
+                        LTI => {
+                            self.cmp_impl(self.rget(a)?, Value::from(b), Ordering::Less, k);
+                        }
+
+                        LEI => {
+                            self.cmp_impl(self.rget(a)?, Value::from(b), Ordering::Greater, !k);
+                        }
+
+                        GTI => {
+                            self.cmp_impl(self.rget(a)?, Value::from(b), Ordering::Greater, k);
+                        }
+
+                        GEI => {
+                            self.cmp_impl(self.rget(a)?, Value::from(b), Ordering::Less, !k);
                         }
 
                         TEST => {
