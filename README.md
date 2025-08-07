@@ -1,8 +1,10 @@
-# Rua   
-An (under development) Lua 5.4 VM implemented in pure Rust.   
+# Rua
 
-# Quick Start 
-``` rust 
+An (under development) Lua 5.4 VM implemented in pure Rust.
+
+# Quick Start
+
+``` rust
     let mut vm = State::new();
     vm.open(StdLib::Base);
 
@@ -14,5 +16,6 @@ An (under development) Lua 5.4 VM implemented in pure Rust.
     assert!(res.is_ok());
 ```
 
-# License    
+# License
+
 MIT License
