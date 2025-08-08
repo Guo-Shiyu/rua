@@ -1,7 +1,7 @@
-# version.workspace = true
-
 [package]
 name = "rua-core"
+edition.workspace = true
+default-run = "rua"
 
 [lib]
 path = "src/lib.rs"

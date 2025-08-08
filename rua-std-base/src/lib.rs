@@ -4,7 +4,7 @@ use rua_std_decl::ruastd;
 
 #[ruastd]
 mod base {
-    use rua_core::{state::VM, value::Value, InterpretError};
+    use rua_core::{InterpretError, state::VM, value::Value};
 
     pub fn print(vm: &mut VM) -> Result<usize, InterpretError> {
         let n = vm.top();

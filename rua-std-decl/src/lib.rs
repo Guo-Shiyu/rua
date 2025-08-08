@@ -4,7 +4,7 @@ extern crate syn;
 
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
-use syn::{parse_macro_input, ItemMod};
+use syn::{ItemMod, parse_macro_input};
 
 // fn entry_format(name: String) -> String {
 //     format!("lua_{}_entry", name)
@@ -32,7 +32,7 @@ pub fn ruastd(_attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 
     for item in &input.content.as_ref().unwrap().1 {
-        if let syn::Item::Fn(ref function) = item {
+        if let syn::Item::Fn(function) = item {
             fns.push(function.sig.ident.clone());
         }
     }
@@ -48,7 +48,7 @@ pub fn ruastd(_attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {}
     } else {
         quote! {
-            #[no_mangle]
+            #[unsafe(no_mangle)]
             fn rua_on_lib_open(vm: &mut VM) -> Result<usize, InterpretError> {
                 Ok(0)
             }
@@ -65,17 +65,17 @@ pub fn ruastd(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
         #hookdef
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         #[used]
         static #rua_entrys: [&'static str; #entrycnt] = [#(stringify!(#fns)),*];
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         #[used]
         static #rua_entrycnt_id: u32 = #entrycnt as u32;
 
         use rua_core::{state::VM, value::{RsFunc, Value}, InterpretError};
         use crate::#module_name::*;
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub extern "C" fn #entry (vm: &mut VM) -> u32 {
             for (name, ptr) in [#(stringify!(#fns)),*].iter().zip([#(#fns),*].iter()) {
                 // println!("Loading {} in {}", name, file!());

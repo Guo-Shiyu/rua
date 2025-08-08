@@ -1,5 +1,7 @@
 [package]
 name = "rua-std-decl"
+edition.workspace = true
+version.workspace = true
 
 [lib]
 proc-macro = true

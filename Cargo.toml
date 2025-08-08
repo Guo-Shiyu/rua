@@ -1,4 +1,5 @@
 [workspace]
+resolver = "2"
 members = [
     "rua-core",
     "rua-std-base",
@@ -14,5 +15,9 @@ license = "MIT"
 authors = ["Shiyu"]
 description = "A short description of my package"
 rust-version = "1.89"
-default-run = "rua"
 documentation = "https://example.com/bar"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
