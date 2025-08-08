@@ -1,0 +1,15 @@
+# version.workspace = true
+
+[package]
+name = "rua-core"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "ruac"
+path = "src/bin/ruac.rs"
+
+[[bin]]
+name = "rua"
+path = "src/bin/rua.rs"

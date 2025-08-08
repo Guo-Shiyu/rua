@@ -189,7 +189,7 @@ impl Lexer<'_> {
     ];
 
     /// Initialize a tokenizer at line 1 and col 1.
-    pub fn new(input: &str) -> Lexer {
+    pub fn new(input: &str) -> Lexer<'_> {
         Lexer {
             scan: Scanner::new(input),
             line: 1,
@@ -260,7 +260,7 @@ impl Lexer<'_> {
                             self.scan.eat();
                             Ok(Token::LS)
                         }
-                    }
+                    };
                 }
 
                 '\'' | '\"' => break self.lex_literal(),
@@ -289,7 +289,7 @@ impl Lexer<'_> {
                         Err(SyntaxError::InvalidCharacter { ch: punc })
                     } else {
                         self.lex_punctuation(punc)
-                    }
+                    };
                 }
 
                 invalid => break Err(SyntaxError::InvalidCharacter { ch: invalid }),
@@ -464,7 +464,7 @@ impl Lexer<'_> {
                 '\x00' | '\n' | '\r' => {
                     return Err(SyntaxError::UnclosedStringLiteral {
                         literal: format!("{quote}{lit}"),
-                    })
+                    });
                 }
 
                 '\\' => {
@@ -800,9 +800,11 @@ mod test {
     fn keywords() {
         use crate::lexer::Lexer;
 
-        assert!(Lexer::KEY_WORDS
-            .iter()
-            .map(|s| Lexer::keyword_or_ident(s))
-            .all(|t| t.is_keyword()));
+        assert!(
+            Lexer::KEY_WORDS
+                .iter()
+                .map(|s| Lexer::keyword_or_ident(s))
+                .all(|t| t.is_keyword())
+        );
     }
 }

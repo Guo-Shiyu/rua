@@ -186,14 +186,14 @@ impl Display for InterpretError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         use InterpretError::*;
         match self {
-            IOErr(e) => writeln!(f, "IO error: {}", e),
+            IOErr(e) => writeln!(f, "IO error: {e}"),
             SyntaxErr(se) => writeln!(f, "Syntax error: {}", se),
             CodeGenErr(_) => todo!(),
 
             RawError { msg } => f.write_str(msg),
 
             RsCallDepthLimit { max } => {
-                writeln!(f, "Too deep function call. (MAX_CALL_DEPTH: {})", max)
+                writeln!(f, "Too deep function call. (MAX_CALL_DEPTH: {max})")
             }
 
             StackOverflow => writeln!(
@@ -205,8 +205,7 @@ impl Display for InterpretError {
             InvalidRegisterAccess { target, max } => {
                 writeln!(
                     f,
-                    "Invalid register access: {} (max available: {})",
-                    target, max
+                    "Invalid register access: {target} (max available: {max})"
                 )
             }
 
@@ -215,15 +214,11 @@ impl Display for InterpretError {
             }
 
             InvalidInvocation { callee } => {
-                writeln!(f, "Try to call a non-callable object: {}", callee)
+                writeln!(f, "Try to call a non-callable object: {callee}")
             }
 
             ArgumentMismatch { expect, got } => {
-                writeln!(
-                    f,
-                    "Wrong number of arguments, expected {}, got {}",
-                    expect, got
-                )
+                writeln!(f, "Wrong number of arguments, expected {expect}, got {got}")
             }
 
             AssertionFail { msg } => f.write_str(msg),

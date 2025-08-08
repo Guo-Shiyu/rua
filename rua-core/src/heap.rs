@@ -358,7 +358,9 @@ pub type StrHashVal = u32;
 /// Indecates that the length of inplace buffer in struct`Short`.
 /// if given compile flag "long_inplace_str", the buffer length is 47 to keep the size of `WithGcHeader<StrImpl>` is 64.  
 /// if not (in default) the buffer length is 23, and the size of `WithGcHeader<StrImpl>` is 40, same with Lua 5.4.4.
-const MAX_INPLACE_STR_LEN: usize = if cfg!(long_inplace_str) { 47 } else { 23 };
+// const MAX_INPLACE_STR_LEN: usize = if cfg!(long_inplace_str) { 47 } else { 23 };
+const MAX_INPLACE_STR_LEN: usize = 40;
+
 #[derive(Debug)]
 pub struct Short {
     hash: Cell<StrHashVal>,
@@ -401,7 +403,7 @@ impl MemStat for StrImpl {
     fn mem_ref(&self) -> usize {
         match self {
             StrImpl::Short(_) => 0, //  no extra heap memory used for short string
-            StrImpl::Long(l) => l.data.len(),
+            StrImpl::Long(l) => l.data.len() * std::mem::size_of::<char>(),
         }
     }
 }
@@ -670,7 +672,7 @@ impl Table {
                 match k {
                     Value::Str(s) => {
                         if s.as_str() == target {
-                            return Some(v.clone());
+                            return Some(*v);
                         }
                     }
                     _ => continue,
@@ -714,12 +716,12 @@ impl UserData {
         self.ptr.cast().as_ptr()
     }
 
-    pub unsafe fn as_mut<T>(&mut self) -> *mut T {
-        self.ptr.cast().as_mut()
+    pub fn as_mut<T>(&mut self) -> *mut T {
+        unsafe { self.ptr.cast().as_mut() }
     }
 
-    pub unsafe fn as_ref<T>(&self) -> &T {
-        self.ptr.cast().as_ref()
+    pub fn as_ref<T>(&self) -> &T {
+        unsafe { self.ptr.cast().as_ref() }
     }
 }
 
@@ -1163,6 +1165,7 @@ impl Heap {
 
 #[cfg(test)]
 mod test {
+
     use super::*;
 
     #[test]

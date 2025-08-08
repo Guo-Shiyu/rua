@@ -747,7 +747,7 @@ impl AstDumper {
     fn write_lable(&mut self, buf: &mut BufWriter<impl Write>, lable: char) -> Result<(), Error> {
         self.color(buf, NORMAL)?;
         self.write_indent(buf)
-            .and_then(|_| write!(buf, "{} ", lable))
+            .and_then(|_| write!(buf, "{lable} "))
     }
 
     fn write_name(
@@ -757,15 +757,15 @@ impl AstDumper {
         addr: usize,
     ) -> Result<(), Error> {
         self.color(buf, GREEN)?;
-        write!(buf, "{}:", name)?;
+        write!(buf, "{name}:")?;
         self.color(buf, YELLOW)?;
-        write!(buf, " 0x{:x} ", addr)?;
+        write!(buf, " 0x{addr:x} ")?;
         self.color(buf, NORMAL)
     }
 
     fn write_lineinfo(&mut self, buf: &mut BufWriter<impl Write>, line: u32) -> Result<(), Error> {
         self.color(buf, GREY)?;
-        writeln!(buf, "  <line: {}>", line)
+        writeln!(buf, "  <line: {line}>")
     }
 
     fn inc_indent(&mut self) {
@@ -778,7 +778,7 @@ impl AstDumper {
 
     fn color(&self, buf: &mut BufWriter<impl Write>, color_ctrl: &str) -> Result<(), Error> {
         if self.colored {
-            write!(buf, "{}", color_ctrl)
+            write!(buf, "{color_ctrl}")
         } else {
             Ok(())
         }
@@ -841,7 +841,7 @@ mod test {
         use super::*;
         use crate::parser::Parser;
         use std::io::BufWriter;
-        let lua_src_path = "test/all.lua";
+        let lua_src_path = "../test/all.lua";
         let src = std::fs::read_to_string(lua_src_path).unwrap();
         let block = Parser::parse(&src, Some(lua_src_path.to_string())).unwrap();
 

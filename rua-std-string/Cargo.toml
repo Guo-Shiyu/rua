@@ -1,0 +1,9 @@
+[package]
+name = "rua-std-string"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+rua-core = { path = "../rua-core" }
+rua-std-decl = { path = "../rua-std-decl" }

@@ -24,7 +24,7 @@ pub enum Stdlib {
 }
 
 pub const fn get_std_libs(lib: Stdlib) -> &'static [&'static str] {
-    use Stdlib::*;
+    use self::Stdlib::*;
     match lib {
         Base => &["base"],
         Package => todo!(),
@@ -46,7 +46,7 @@ pub fn open_lib(vm: &mut VM, modname: &str) -> Result<u32, InterpretError> {
 
     // search dynamic library in current dir recursively.
     let target = dlfmt(modname);
-    let curdir = std::env::current_dir()?;
+    let curdir = std::env::current_dir()?.parent().unwrap().to_path_buf();
 
     // TODO: detect environment variable LUA_PATH
     match find_dylib_recursive(&curdir, &target) {
@@ -146,14 +146,16 @@ fn select_dll_operation_platform() -> DllOperationGroup {
 
 #[cfg(target_family = "unix")]
 fn select_dll_operation_platform() -> DllOperationGroup {
-    extern "C" {
+    unsafe extern "C" {
         fn dlopen(filename: *const c_char, flags: i32) -> *mut c_void;
         fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
         // fn dlclose(handle: *mut std::ffi::c_void) -> std::os::raw::c_int;
     }
-    extern "C" fn dlopen_wrapper(filename: *const c_char) -> *mut c_void {
+
+    unsafe extern "C" fn dlopen_wrapper(filename: *const c_char) -> *mut c_void {
         unsafe { dlopen(filename, 1) } // 2: RTLD_NOW,  1: RTLD_LAZY
     }
+
     return (dlopen_wrapper, dlsym, |name| format!("lib{}.so", name));
 }
 

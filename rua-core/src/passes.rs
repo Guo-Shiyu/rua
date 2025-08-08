@@ -150,8 +150,8 @@ pub fn walk_stmt<T: MutVisitor>(vis: &mut T, stmt: &mut StmtNode) {
                 &mut num.body,
             );
         }
-        Stmt::GenericFor(gen) => {
-            vis.visit_generic_for(&mut gen.iters, &mut gen.exprs, &mut gen.body);
+        Stmt::GenericFor(genfor) => {
+            vis.visit_generic_for(&mut genfor.iters, &mut genfor.exprs, &mut genfor.body);
         }
         Stmt::LocalVarDecl { names, exprs } => {
             vis.visit_local_decl(names, exprs);
@@ -165,12 +165,7 @@ pub fn walk_stmt<T: MutVisitor>(vis: &mut T, stmt: &mut StmtNode) {
 
 pub fn walk_expr<T: MutVisitor>(vis: &mut T, expr: &mut ExprNode) {
     match expr.inner_mut() {
-        Expr::Nil => {}
-        Expr::False => {}
-        Expr::True => {}
-        Expr::Int(_) => {}
-        Expr::Float(_) => {}
-        Expr::Dots => {}
+        Expr::Nil | Expr::False | Expr::True | Expr::Int(_) | Expr::Float(_) | Expr::Dots => {}
         Expr::Ident(id) => walk_ident(vis, id),
         Expr::Literal(l) => walk_literal(vis, l),
         Expr::Lambda(la) => walk_lambda(vis, la),
@@ -334,7 +329,7 @@ enum AfterFoldStatus {
 struct ConstantFolder();
 
 fn try_fold(exp: &mut Expr) -> AfterFoldStatus {
-    use AfterFoldStatus::*;
+    use self::AfterFoldStatus::*;
     match exp {
         Expr::Nil | Expr::False | Expr::True | Expr::Int(_) | Expr::Float(_) | Expr::Literal(_) => {
             StillConst
@@ -507,7 +502,7 @@ impl MutVisitor for ConstantFolder {
                 } else {
                     // `if false then ...` drop then block
                     let _ = std::mem::take(then_blk);
-                    if let None = else_blk {
+                    if else_blk.is_none() {
                         *else_blk = Some(BasicBlock::default());
                     }
                 }
@@ -560,7 +555,7 @@ mod test {
             std::env::current_dir().unwrap().display()
         );
 
-        let dir = std::fs::read_dir("./test/").expect(&emsg);
+        let dir = std::fs::read_dir("../test/").expect(&emsg);
 
         let mut src_paths = dir
             .map(|e| e.map(|e| e.path()))

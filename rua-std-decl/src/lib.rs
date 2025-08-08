@@ -1,4 +1,6 @@
 extern crate proc_macro;
+extern crate quote;
+extern crate syn;
 
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
@@ -71,7 +73,7 @@ pub fn ruastd(_attr: TokenStream, item: TokenStream) -> TokenStream {
         #[used]
         static #rua_entrycnt_id: u32 = #entrycnt as u32;
 
-        use rua::{state::VM, value::{RsFunc, Value}, InterpretError};
+        use rua_core::{state::VM, value::{RsFunc, Value}, InterpretError};
         use crate::#module_name::*;
         #[no_mangle]
         pub extern "C" fn #entry (vm: &mut VM) -> u32 {

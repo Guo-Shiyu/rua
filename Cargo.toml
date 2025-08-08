@@ -1,25 +1,18 @@
-[package]
-name = "rua"
-version = "0.2.1"
-edition = "2021"
-
 [workspace]
 members = [
-    ".",
-    "src/std/stddecl",
-    "src/std/base",
-    "src/std/string",
-    "src/std/table",
+    "rua-core",
+    "rua-std-base",
+    "rua-std-table",
+    "rua-std-string",
+    "rua-std-decl",
 ]
 
-[lib]
-name = "rua"
-path = "src/lib.rs"
-
-[[bin]]
-name = "ruac"
-path = "src/bin/ruac.rs"
-
-[[bin]]
-name = "rua"
-path = "src/bin/rua.rs"
+[workspace.package]
+version = "0.2.1"
+edition = "2024"
+license = "MIT"
+authors = ["Shiyu"]
+description = "A short description of my package"
+rust-version = "1.89"
+default-run = "rua"
+documentation = "https://example.com/bar"

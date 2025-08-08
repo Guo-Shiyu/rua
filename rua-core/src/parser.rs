@@ -501,7 +501,7 @@ impl Parser<'_> {
                         other => {
                             return Err(self.error(SyntaxError::InvalidAttribute {
                                 attr: other.to_string(),
-                            }))
+                            }));
                         }
                     };
 
@@ -1110,7 +1110,7 @@ mod test {
             std::env::current_dir().unwrap().display()
         );
 
-        let dir = std::fs::read_dir("./test/").expect(&emsg);
+        let dir = std::fs::read_dir("../test/").expect(&emsg);
 
         let mut src_paths = dir
             .map(|e| e.map(|e| e.path()))

@@ -452,13 +452,15 @@ impl VM {
     pub fn pop(&mut self) -> Option<Value> {
         debug_assert!(self.top >= self.slotend);
         self.try_shrink_stack();
-        (self.top > self.slotend).then(|| unsafe { self.pop_unchecked() })
+        (self.top > self.slotend).then(|| self.pop_unchecked())
     }
 
-    pub unsafe fn pop_unchecked(&mut self) -> Value {
+    pub fn pop_unchecked(&mut self) -> Value {
         debug_assert!(self.top > self.slotend);
-        self.top = self.top.sub(1);
-        *self.top
+        unsafe {
+            self.top = self.top.sub(1);
+            *self.top
+        }
     }
 
     fn try_shrink_stack(&mut self) {
@@ -623,11 +625,11 @@ impl VM {
         }
     }
 
-    pub fn frame_iter(&self) -> std::slice::Iter<Frame> {
+    pub fn frame_iter(&self) -> std::slice::Iter<'_, Frame> {
         self.callchain.iter()
     }
 
-    pub fn frame_iter_mut(&mut self) -> std::slice::IterMut<Frame> {
+    pub fn frame_iter_mut(&mut self) -> std::slice::IterMut<'_, Frame> {
         self.callchain.iter_mut()
     }
 
@@ -667,10 +669,12 @@ impl VM {
         self.heap.check_gc()
     }
 
-    unsafe fn stack_peek(&self, idx: i32) -> *mut Value {
-        match idx.cmp(&0) {
-            Ordering::Equal | Ordering::Greater => self.slotend.offset(idx as isize),
-            Ordering::Less => self.top.offset(idx as isize),
+    fn stack_peek(&self, idx: i32) -> *mut Value {
+        unsafe {
+            match idx.cmp(&0) {
+                Ordering::Equal | Ordering::Greater => self.slotend.offset(idx as isize),
+                Ordering::Less => self.top.offset(idx as isize),
+            }
         }
     }
 
@@ -681,7 +685,7 @@ impl VM {
     ///
     /// If the index out of the bound of stack, `None` will be returned.
     pub fn peek(&self, idx: i32) -> Option<Value> {
-        let slot_ptr = unsafe { self.stack_peek(idx) };
+        let slot_ptr = self.stack_peek(idx);
         if slot_ptr >= self.func && slot_ptr < self.top {
             Some(unsafe { *slot_ptr })
         } else {
@@ -689,8 +693,8 @@ impl VM {
         }
     }
 
-    pub unsafe fn peek_unchecked(&self, idx: i32) -> Value {
-        *self.stack_peek(idx)
+    pub fn peek_unchecked(&self, idx: i32) -> Value {
+        unsafe { *self.stack_peek(idx) }
     }
 
     pub fn peek_and_then<T>(&self, idx: i32, op: impl FnOnce(Value) -> T) -> Option<T> {
@@ -889,7 +893,7 @@ impl VM {
     }
 
     fn execute(&mut self) -> Result<(), InterpretError> {
-        use OpCode::*;
+        use self::OpCode::*;
         use Value::*;
 
         macro_rules! arth_op_impl {
@@ -1326,31 +1330,40 @@ mod test {
         use crate::heap::{MemStat, StrImpl};
 
         let mut vm = VM::new();
-        let long = "l.o.n.g.".repeat(4);
+        let long = "l.o.n.g.".repeat(8);
         assert!(!StrImpl::able_to_internalize(&long));
 
+        let origin = vm.heap.total_alloc_bytes();
         for _ in 0..3 {
-            let origin = vm.heap.total_alloc_bytes();
             vm.take_str(long.clone());
             vm.full_gc();
             assert_eq!(origin, vm.heap.total_alloc_bytes());
         }
+    }
 
-        let origin = vm.heap.total_alloc_bytes();
+    #[test]
+    fn stack_marked_as_rootset() {
+        use crate::heap::MemStat;
+        let mut vm = VM::default();
+
+        let long = "l.o.n.g.".repeat(8);
+        let refreshed = vm.heap.total_alloc_bytes();
         for n in 1..=3 {
             let mut to_push = long.clone();
             to_push.push_str(&n.to_string());
             let val = vm.take_str(to_push);
-            assert_eq!(vm.push(val).unwrap(), ());
+            assert!(vm.push(val).is_ok());
             vm.full_gc();
-            assert_eq!(origin + val.mem_ref() * n, vm.heap.total_alloc_bytes());
+
+            dbg!(refreshed, n, vm.heap.total_alloc_bytes());
+            assert_eq!(refreshed + val.mem_ref() * n, vm.heap.total_alloc_bytes());
         }
 
         // pop 2 item, remain 1 long string (n=1)
         let _ = vm.pop();
         let val = vm.pop().unwrap();
         vm.full_gc();
-        assert_eq!(origin + val.mem_ref(), vm.heap.total_alloc_bytes());
+        assert_eq!(refreshed + val.mem_ref(), vm.heap.total_alloc_bytes());
     }
 
     #[test]
@@ -1428,7 +1441,7 @@ mod test {
         let call = r#"
             print ("")
         "#;
-        assert_eq!(vm.unsafe_script(call, None).unwrap(), ());
+        assert!(vm.unsafe_script(call, None).is_ok());
         check_init_state(&mut vm);
         Ok(())
     }

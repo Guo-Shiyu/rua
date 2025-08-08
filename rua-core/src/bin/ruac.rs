@@ -1,4 +1,6 @@
-use rua::{
+extern crate rua_core;
+
+use rua_core::{
     ast::{dump_ast, DumpPrecison},
     codegen::{dump_chunk, CodeGen},
     heap::Heap,
@@ -17,10 +19,21 @@ struct CliArg {
 }
 
 impl CliArg {
+    const RUAC_HELP_MSGS: &'static str = r#"
+Usage: luac [options] [filenames]
+Try 'luac -h' for more information.
+  -l       list (use -l -l for full listing)
+  -o name  output to file 'name' (default is \"luac.out\")
+  -p       parse only
+  -s       strip debug information
+  -d       dump ast in statement precison
+  -v       show version information
+    "#;
+
     fn parse() -> Self {
         let (mut list, mut parse_only, mut strip_debug, mut dump_stmt, mut optimize) =
             (0, false, false, false, false);
-        let (output, mut src) = ("luac.out".to_string(), String::new());
+        let (output, mut input) = ("luac.out".to_string(), String::new());
         for arg in std::env::args().skip(1) {
             match arg.as_str() {
                 "-l" => list += 1,
@@ -43,29 +56,19 @@ impl CliArg {
                 //     output = std::env::args().unwrap_or("luac.out".to_string());
                 // }
                 unknown if unknown.starts_with('-') => {
-                    let help = [
-                        "Usage: luac [options] [filenames]",
-                        "Try 'luac -h' for more information.",
-                        "  -l       list (use -l -l for full listing)",
-                        "  -o name  output to file 'name' (default is \"luac.out\")",
-                        "  -p       parse only",
-                        "  -s       strip debug information",
-                        "  -d       dump ast in statement precison",
-                        "  -v       show version information",
-                    ]
-                    .join("\n");
-                    println!("luac: unrecognized option '{}'", arg);
+                    println!("luac: unrecognized option '{arg}'");
+                    let help = Self::RUAC_HELP_MSGS;
                     println!("{help}");
                     std::process::exit(1);
                 }
                 _ => {
-                    src = arg;
+                    input = arg;
                 }
             }
         }
 
         CliArg {
-            input: src,
+            input,
             list,
             parse_only,
             strip_debug,
@@ -106,9 +109,9 @@ fn main() -> Result<(), InterpretError> {
 
     if args.list > 0 {
         if args.list == 1 {
-            println!("{}", chunk);
+            println!("{chunk}");
         } else if args.list >= 2 {
-            println!("{:?}", chunk);
+            println!("{chunk:?}");
         }
     }
 

@@ -1,4 +1,5 @@
 use std::{
+    convert::TryInto,
     fmt::{Debug, Display},
     hash::{Hash, Hasher},
 };
@@ -132,9 +133,9 @@ impl TryInto<TagBox> for Value {
 impl Debug for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.is_str() {
-            write!(f, "\"{}\"", self)
+            write!(f, "\"{self}\"")
         } else {
-            write!(f, "{}", self)
+            write!(f, "{self}")
         }
     }
 }
@@ -145,9 +146,9 @@ impl Display for Value {
         const LAST_8_DIGIT: usize = 0xFFFFFFFF;
         match self {
             Nil => write!(f, "nil"),
-            Bool(b) => write!(f, "{}", b),
-            Int(i) => write!(f, "{}", i),
-            Float(fl) => write!(f, "{}", fl),
+            Bool(b) => write!(f, "{b}"),
+            Int(i) => write!(f, "{i}"),
+            Float(fl) => write!(f, "{fl}"),
             Str(s) => write!(f, "{}", s.as_str()),
             Table(t) => write!(f, "table: 0x{:X}", t.address() & LAST_8_DIGIT),
             Fn(cls) => write!(f, "function: 0x{:X}", cls.address() & LAST_8_DIGIT),
@@ -171,7 +172,7 @@ impl PartialEq for Value {
             (Value::Bool(l), Value::Bool(r)) => l.eq(&r),
             (Value::Int(l), Value::Int(r)) => l.eq(&r),
             (Value::Float(l), Value::Float(r)) => l.eq(&r),
-            (Value::RsFn(l), Value::RsFn(r)) => l.eq(&r),
+            (Value::RsFn(l), Value::RsFn(r)) => std::ptr::fn_addr_eq(l, r),
             (Value::Str(l), Value::Str(r)) => l.eq(&r),
             (Value::Table(l), Value::Table(r)) => l.eq(&r),
             (Value::Fn(l), Value::Fn(r)) => l.eq(&r),
@@ -394,6 +395,8 @@ pub type RsFunc = fn(&mut VM) -> Result<usize, InterpretError>;
 
 #[cfg(test)]
 mod test {
+    use crate::heap::MemStat;
+
     use super::*;
 
     #[test]
@@ -409,7 +412,7 @@ mod test {
         assert_eq!(l, r);
 
         assert_eq!(nil.to_ne_bytes(), other_nil.to_ne_bytes());
-        assert!(l.into_iter().all(|c| c == 0));
+        assert!(l.iter().all(|c| *c == 0));
     }
 
     #[test]
@@ -461,31 +464,34 @@ mod test {
             assert!(STR_IMPL_SIZE <= 64);
         }
 
+        let short_str = "hello world";
         {
-            let short = "hello world";
-            let str_repr = StrImpl::from_short(short, None);
+            let short = StrImpl::from_short(short_str, None);
 
-            assert!(str_repr.is_internalized());
-            assert_eq!(str_repr.len(), short.len());
-            assert_eq!(str_repr.as_str(), short);
+            assert!(short.is_internalized());
+            assert_eq!(short.len(), short_str.len());
+            assert_eq!(short.as_str(), short_str);
 
-            let other_str = StrImpl::from_short(short, None);
-            assert_eq!(other_str.as_str(), str_repr.as_str());
-            assert_eq!(other_str.hashval(), str_repr.hashval());
+            let other_str = StrImpl::from_short(short_str, None);
+            assert_eq!(other_str.as_str(), short.as_str());
+            assert_eq!(other_str.hashval(), short.hashval());
 
-            assert_eq!(other_str.as_str(), str_repr.as_str());
+            assert_eq!(other_str.as_str(), short.as_str());
+
+            assert_eq!(short.mem_ref(), 0);
         }
 
+        let long_str = "hello world".repeat(10);
+        let long = StrImpl::from(long_str.clone());
         {
-            let long_str = "hello world".repeat(10);
             assert!(!StrImpl::able_to_internalize(long_str.as_str()));
 
-            let long = StrImpl::from(long_str.clone());
             assert!(long.is_long());
             assert_eq!(long.len(), long_str.len());
             assert_eq!(long.as_str(), long_str);
             assert!(!long.has_hashed());
             assert_ne!(long.hashval(), 0);
+            assert_eq!(long.mem_ref(), long.len() * std::mem::size_of::<char>());
         }
     }
 

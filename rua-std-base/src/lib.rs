@@ -1,8 +1,10 @@
-use stddecl::ruastd;
+extern crate rua_core;
+extern crate rua_std_decl;
+use rua_std_decl::ruastd;
 
 #[ruastd]
 mod base {
-    use rua::{state::VM, value::Value, InterpretError};
+    use rua_core::{state::VM, value::Value, InterpretError};
 
     pub fn print(vm: &mut VM) -> Result<usize, InterpretError> {
         let n = vm.top();
@@ -11,7 +13,7 @@ mod base {
                 print!(" ");
             }
             // SAFETY: we has checked the size of stack
-            print!("{}", unsafe { vm.peek_unchecked(i) });
+            print!("{}", vm.peek_unchecked(i));
         }
         if n >= 1 {
             println!();
@@ -30,7 +32,7 @@ mod base {
         }
 
         // take first variable to check
-        let first = unsafe { vm.peek_unchecked(1) };
+        let first = vm.peek_unchecked(1);
         if first.is_falsey() {
             let errmsg = if vm.top() == 2 {
                 let errobj = unsafe { vm.pop().unwrap_unchecked() };
@@ -88,7 +90,7 @@ mod base {
 
     pub fn type_(vm: &mut VM) -> Result<usize, InterpretError> {
         if vm.top() >= 1 {
-            let var = unsafe { vm.pop_unchecked() };
+            let var = vm.pop_unchecked();
             let ts = vm.new_str(var.typestr());
             vm.push(ts)?;
             Ok(1)

@@ -1,7 +1,5 @@
 [package]
-name = "stddecl"
-version = "0.1.0"
-edition = "2021"
+name = "rua-std-decl"
 
 [lib]
 proc-macro = true

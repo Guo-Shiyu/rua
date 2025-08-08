@@ -198,7 +198,7 @@ pub enum OpCode {
 
 impl Display for OpCode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let buf = format!("{:?}", self);
+        let buf = format!("{self:?}");
         f.write_str(buf.as_str())?;
         for _ in buf.len()..12 {
             f.write_str(" ")?;
@@ -449,12 +449,12 @@ impl OpCode {
 impl Debug for Instruction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mode = self.mode();
-        write!(f, "{} ", mode)?;
+        write!(f, "{mode} ")?;
 
         match mode {
             OpMode::IABC => {
                 let (code, a, b, c, k) = self.repr_abck();
-                write!(f, "{:<16}\t{:<3} {:<3} {:<3}", code, a, b, c)?;
+                write!(f, "{code:<16}\t{a:<3} {b:<3} {c:<3}")?;
                 if k {
                     f.write_str("k")?;
                 } else {
@@ -464,7 +464,7 @@ impl Debug for Instruction {
             }
             OpMode::IABx => {
                 let (code, a, bx) = self.repr_abx();
-                write!(f, "{code:<16}\t{:<3} {:<3}     ", a, bx)
+                write!(f, "{code:<16}\t{a:<3} {bx:<3}     ")
             }
             OpMode::IAsBx => {
                 let (code, a, sbx) = self.repr_asbx();
@@ -670,7 +670,7 @@ impl Proto {
 
         for (idx, code) in p.code.iter().enumerate() {
             let line = p.pcline.get(idx).unwrap_or(&0);
-            write!(f, "\t{idx}\t[{}]\t{:?>8} ; ", line, code)?;
+            write!(f, "\t{idx}\t[{line}]\t{code:?>8} ; ")?;
             p.isc_extra_info(f, code, idx)?;
             writeln!(f)?;
         }
@@ -689,7 +689,7 @@ impl Proto {
             self_addr & LAST_8_DIGIT
         )?;
         for (idx, k) in p.kst.iter().enumerate() {
-            writeln!(f, "\t{}\t{:?}", idx, k)?;
+            writeln!(f, "\t{idx}\t{k:?}")?;
         }
 
         writeln!(
@@ -725,10 +725,10 @@ impl Proto {
             OpMode::IABC => {
                 let (isc, a, b, c, k) = code.repr_abck();
                 match isc {
-                    MOVE => write!(f, "r({}) = r({})", a, b),
-                    LOADFALSE => write!(f, "r({}) = false", a),
+                    MOVE => write!(f, "r({a}) = r({b})"),
+                    LOADFALSE => write!(f, "r({a}) = false"),
                     LFALSESKIP => write!(f, "r({}) = false; --> {}", a, idx + 2),
-                    LOADTRUE => write!(f, "r({}) = true", a),
+                    LOADTRUE => write!(f, "r({a}) = true"),
                     LOADNIL => write!(f, "r({}) ... r({}) = nil", a, a + b),
                     GETTABUP => write!(
                         f,
@@ -759,7 +759,7 @@ impl Proto {
                             write!(f, "r({})[{}] = r({})", a, self.kst[b as usize], c)
                         }
                     }
-                    NEWTABLE => write!(f, "r({}) = {{}}", a),
+                    NEWTABLE => write!(f, "r({a}) = {{}}"),
                     EQ => write!(
                         f,
                         "If r({}) {}= r({}), --> {}",
@@ -869,14 +869,14 @@ impl Proto {
                         bx,
                         self.subfn[bx as usize].address()
                     ),
-                    NEWTABLE => write!(f, "r({}) = {{}}", a),
+                    NEWTABLE => write!(f, "r({a}) = {{}}"),
                     _ => Ok(()),
                 }
             }
             OpMode::IAsBx => {
                 let (op, a, sbx) = code.repr_asbx();
                 match op {
-                    LOADI => write!(f, "r({}) = {}", a, sbx),
+                    LOADI => write!(f, "r({a}) = {sbx}"),
                     LOADF => write!(f, "r({}) = {}", a, sbx as f64),
                     _ => Ok(()),
                 }
@@ -920,7 +920,7 @@ pub enum ExprStatus {
     Up(RegIndex),   // index of updecl
 }
 
-use OpCode::*;
+use self::OpCode::*;
 
 /// Code generation intermidiate state for each Proto
 pub struct GenState {
@@ -1485,7 +1485,7 @@ impl CodeGen {
                 els,
             } => self.walk_branch_stmt(exp, then, els, mem),
             Stmt::NumericFor(num) => self.walk_numberic_loop(num, mem),
-            Stmt::GenericFor(gen) => self.walk_generic_for(gen, mem),
+            Stmt::GenericFor(genfor) => self.walk_generic_for(genfor, mem),
             Stmt::LocalVarDecl { names, exprs } => self.walk_local_decl(names, exprs, mem),
             Stmt::Expr(exp) => {
                 let _ = self.walk_common_expr(exp, Ctx::Ignore, mem)?;
@@ -2644,7 +2644,7 @@ impl CodeGen {
 
     // isc for single const operand
     fn try_select_const_isc(bop: BinOp) -> Option<OpCode> {
-        use BinOp::*;
+        use self::BinOp::*;
 
         match bop {
             Add => Some(ADDK),
@@ -2664,7 +2664,7 @@ impl CodeGen {
 
     /// select instruction for single immediate operand
     fn try_select_imm_isc(bop: BinOp) -> Option<OpCode> {
-        use BinOp::*;
+        use self::BinOp::*;
 
         match bop {
             Add => Some(ADDI),
@@ -2680,7 +2680,7 @@ impl CodeGen {
     }
 
     fn default_isc(bop: BinOp) -> OpCode {
-        use BinOp::*;
+        use self::BinOp::*;
 
         match bop {
             Add => ADD,
@@ -3037,7 +3037,7 @@ impl ChunkDumper {
             0x00 => Value::Nil,
             0x01 => Value::Bool(false),
             0x11 => Value::Bool(true),
-            0x03 => Value::Int(unsafe { std::mem::transmute(Self::undump_varint(r)?) }),
+            0x03 => Value::Int(usize::cast_signed(Self::undump_varint(r)?) as i64),
             0x13 => Value::Float(Self::undump_float(r)?),
             0x04 | 0x14 => mem.take_str(Self::undump_string(r)?).into(),
             _ => unreachable!(),
@@ -3241,7 +3241,7 @@ mod test {
         };
 
         let flt_to_write = [0.01, 789.0, 449.7, -1000000.555];
-        for f in flt_to_write.into_iter() {
+        for f in flt_to_write {
             let tmp_file = std::fs::File::create(tmpfile.clone()).unwrap();
             let mut writer = BufWriter::new(tmp_file);
             ChunkDumper::dump_float(f, &mut writer).unwrap();
