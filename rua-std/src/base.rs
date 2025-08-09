@@ -1,10 +1,24 @@
-extern crate rua_core;
-extern crate rua_std_decl;
-use rua_std_decl::ruastd;
+#![allow(clippy::module_inception)]
 
-#[ruastd]
+extern crate rua_core;
+extern crate rua_std_macro;
+use rua_std_macro::rua_std_decl;
+
+#[rua_std_decl]
 mod base {
-    use rua_core::{InterpretError, state::VM, value::Value};
+    use rua_core::{InterpretError, heap::MetaOperator, state::VM, value::Value};
+
+    /// FIXME: fix rua_std_decl and ffi:open_lib to make the hook useable
+    /// create string about meta operators lazily
+    pub fn rua_on_lib_open(vm: &mut VM) -> Result<usize, InterpretError> {
+        for builtin in VM::TYPE_STRS
+            .iter()
+            .chain(MetaOperator::METATOPS_STRS.iter())
+        {
+            vm.new_fixed(builtin);
+        }
+        Ok(0)
+    }
 
     pub fn print(vm: &mut VM) -> Result<usize, InterpretError> {
         let n = vm.top();
@@ -101,24 +115,18 @@ mod base {
 }
 
 #[cfg(test)]
-mod tests {
+mod test {
     use super::*;
 
-    /// Test `ruastd` macro here to avoid introduce dependency to `stddecl`.
     #[test]
-    fn empty_foreign_module() {
-        #[ruastd]
-        mod empty {}
-    }
-
-    #[test]
-    fn show_entry_info() {
+    fn check_entry_info() {
         let mut vm: VM = VM::new();
 
         assert!(luaopen_base(&mut vm) == __rua_base_num);
+        assert_eq!(__rua_base_names.len(), __rua_base_num as usize);
+
         let mut genv = vm.genv().as_table().unwrap();
-        use std::ops::Deref;
-        println!("{:?}", genv.deref());
+        assert_eq!(genv.len(), __rua_base_num as usize);
 
         // type is keyword in rust, which is a function name in lua
         let key = vm.new_str("type");

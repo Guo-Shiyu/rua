@@ -1,7 +1,7 @@
 use std::{env, io::Write as _};
 
 extern crate rua_core;
-use rua_core::{ffi::Stdlib, state::VM, InterpretError};
+use rua_core::{InterpretError, state::VM};
 
 fn eval(vm: &mut VM, line: &str) -> Result<(), InterpretError> {
     if line.trim().is_empty() {
@@ -14,7 +14,7 @@ fn eval(vm: &mut VM, line: &str) -> Result<(), InterpretError> {
 
 fn main() -> Result<(), InterpretError> {
     let mut vm = VM::new();
-    vm.open(Stdlib::Base)?;
+    // vm.open(Stdlib::Base)?;
     if let Some(file) = env::args().nth(1) {
         vm.script_file(&file)?;
     } else {
@@ -27,19 +27,26 @@ fn main() -> Result<(), InterpretError> {
 fn repl(mut vm: VM) -> Result<(), InterpretError> {
     println!("Rua REPL (Read-Eval-Print Loop)");
     println!("Type your Rua scripts below. Press Ctrl+C to exit.");
-    // try add return statement to the input to keep the return value on the stack.
-    const ADD_RETURN: &str = "return ";
-    let mut line = ADD_RETURN.to_string();
+    const CHUNK: &str = "stdin";
+
+    let mut line = String::with_capacity(128);
     loop {
         print!("> ");
         std::io::stdout().flush().unwrap();
         std::io::stdin().read_line(&mut line)?;
 
-        if line.trim().len() == ADD_RETURN.len() {
+        let trimed = line.trim();
+        if trimed.is_empty() {
+            line.clear();
             continue;
         }
 
-        match vm.load(&line, Some("stdin".to_string())) {
+        let loaded = vm.load(&line, Some(CHUNK.to_string())).or_else(|_| {
+            let as_expr = format!("return {line}");
+            vm.load(&as_expr, Some(CHUNK.to_string()))
+        });
+
+        match loaded {
             // the expression was valid, so call the function on the top of stack.
             Ok(_) => {}
 
@@ -49,7 +56,7 @@ fn repl(mut vm: VM) -> Result<(), InterpretError> {
             }
         };
 
-        line = ADD_RETURN.to_string();
+        line.clear();
     }
 }
 
@@ -62,7 +69,7 @@ mod test {
     #[test]
     fn hello_world() -> Result<(), InterpretError> {
         let mut vm = VM::new();
-        vm.open(Stdlib::Base)?;
+        // vm.open(Stdlib::Base)?;
 
         let src = r#"
             print "Hello Rua!"
@@ -97,7 +104,6 @@ mod test {
             })
             .for_each(|filepath| {
                 let mut vm = VM::new();
-                assert_ne!(vm.open(Stdlib::Base).unwrap(), 0);
                 let res = vm.safe_script_file(filepath, None, Some(PanicFn::PANIC));
                 assert!(res.is_ok());
             });

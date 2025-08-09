@@ -18,13 +18,13 @@ use syn::{ItemMod, parse_macro_input};
 
 /// Introduce `luaopen_#mod_name` to current file. All function in mod will be treated as `RsFunc` and added to vm on open.
 #[proc_macro_attribute]
-pub fn ruastd(_attr: TokenStream, item: TokenStream) -> TokenStream {
+pub fn rua_std_decl(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as ItemMod);
     let module_name = input.ident.clone();
 
     let mut fns = Vec::new();
 
-    if let None = input.content {
+    if input.content.is_none() {
         return quote! {
             #input
         }
@@ -74,7 +74,7 @@ pub fn ruastd(_attr: TokenStream, item: TokenStream) -> TokenStream {
         static #rua_entrycnt_id: u32 = #entrycnt as u32;
 
         use rua_core::{state::VM, value::{RsFunc, Value}, InterpretError};
-        use crate::#module_name::*;
+        use crate::#module_name::#module_name::*;
         #[unsafe(no_mangle)]
         pub extern "C" fn #entry (vm: &mut VM) -> u32 {
             for (name, ptr) in [#(stringify!(#fns)),*].iter().zip([#(#fns),*].iter()) {

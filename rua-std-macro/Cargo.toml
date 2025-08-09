@@ -1,5 +1,5 @@
 [package]
-name = "rua-std-decl"
+name = "rua-std-macro"
 edition.workspace = true
 version.workspace = true
 

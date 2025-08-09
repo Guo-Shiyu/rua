@@ -1,12 +1,6 @@
 [workspace]
 resolver = "2"
-members = [
-    "rua-core",
-    "rua-std-base",
-    "rua-std-table",
-    "rua-std-string",
-    "rua-std-decl",
-]
+members = ["rua-core", "rua-std", "rua-std-macro"]
 
 [workspace.package]
 version = "0.2.1"

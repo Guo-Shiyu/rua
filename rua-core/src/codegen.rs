@@ -1992,12 +1992,13 @@ impl CodeGen {
 
             Ctx::NonRealloc { dest } => {
                 let mut status = self.emit_expr(node.inner(), dest, def, mem)?;
-                if let ExprStatus::Reg(real) = status {
-                    if real != dest {
-                        self.emit(Isc::iabc(MOVE, dest, real, 0), def.0);
-                        status = ExprStatus::Reg(dest)
-                    }
+                if let ExprStatus::Reg(real) = status
+                    && real != dest
+                {
+                    self.emit(Isc::iabc(MOVE, dest, real, 0), def.0);
+                    status = ExprStatus::Reg(dest)
                 }
+
                 Ok(status)
             }
 
@@ -2060,7 +2061,7 @@ impl CodeGen {
             } => {
                 // TODO:
                 // expr codegen: multi level Table Index optimize
-                return self.walk_common_expr(node, Ctx::Keep, mem);
+                self.walk_common_expr(node, Ctx::Keep, mem)
             }
         }
     }

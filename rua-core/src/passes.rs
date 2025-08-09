@@ -382,7 +382,7 @@ fn try_fold(exp: &mut Expr) -> AfterFoldStatus {
                         match (op, lhs.inner_ref(), rhs.inner_ref()) {
                             (BinOp::Concat, Expr::Literal(l1), Expr::Literal(l2)) => {
                                 let mut cat = l1.clone();
-                                cat.push_str(&l2);
+                                cat.push_str(l2);
                                 *exp = Expr::Literal(cat);
                                 StillConst
                             }
@@ -494,17 +494,17 @@ impl MutVisitor for ConstantFolder {
         then_blk: &mut BasicBlock,
         else_blk: &mut Option<BasicBlock>,
     ) {
-        if let AfterFoldStatus::StillConst = try_fold(cond) {
-            if let Some(b) = cond.try_eval_as_const_bool() {
-                if b {
-                    // `if true then ...`, drop else block
-                    let _ = std::mem::take(else_blk);
-                } else {
-                    // `if false then ...` drop then block
-                    let _ = std::mem::take(then_blk);
-                    if else_blk.is_none() {
-                        *else_blk = Some(BasicBlock::default());
-                    }
+        if let AfterFoldStatus::StillConst = try_fold(cond)
+            && let Some(b) = cond.try_eval_as_const_bool()
+        {
+            if b {
+                // `if true then ...`, drop else block
+                let _ = std::mem::take(else_blk);
+            } else {
+                // `if false then ...` drop then block
+                let _ = std::mem::take(then_blk);
+                if else_blk.is_none() {
+                    *else_blk = Some(BasicBlock::default());
                 }
             }
         };

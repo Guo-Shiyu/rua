@@ -257,8 +257,8 @@ impl From<std::io::Error> for InterpretError {
 }
 
 pub struct ModuleNotFound {
-    path: String,
-    lib: String,
+    pub path: String,
+    pub lib: String,
 }
 
 impl From<ModuleNotFound> for InterpretError {
@@ -268,8 +268,8 @@ impl From<ModuleNotFound> for InterpretError {
 }
 
 pub struct BadModule {
-    path: String,
-    entry: String,
+    pub path: String,
+    pub entry: String,
 }
 
 impl From<BadModule> for InterpretError {

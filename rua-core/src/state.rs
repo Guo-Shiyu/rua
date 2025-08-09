@@ -9,14 +9,13 @@ use std::{
 };
 
 use crate::{
+    InterpretError,
     ast::Block,
     codegen::{ChunkDumper, CodeGen, Instruction, OpCode, OpMode, Proto, UpvalDecl},
-    ffi::{self, Stdlib},
     heap::{Gc, GcOp, Heap, LuaClosure, MetaOperator, Table, Tag, UpVal},
     parser::Parser,
     passes,
     value::Value,
-    InterpretError,
 };
 
 pub type RegIndex = i32;
@@ -370,32 +369,6 @@ impl VM {
         vm.top = unsafe { vm.slotend.offset(1) };
         vm.global = vm.heap.alloc_table();
         vm
-    }
-
-    pub fn open(&mut self, lib: Stdlib) -> Result<usize, InterpretError> {
-        let mut nfunc = 0;
-        for entry in crate::ffi::get_std_libs(lib) {
-            nfunc += ffi::open_lib(self, entry)?;
-        }
-
-        // create string about meta operators lazily
-        if lib == Stdlib::Base {
-            for builtin in Self::TYPE_STRS
-                .iter()
-                .chain(MetaOperator::METATOPS_STRS.iter())
-            {
-                self.new_fixed(builtin);
-            }
-        }
-
-        Ok(nfunc as usize)
-    }
-
-    pub fn open_libs(&mut self, libs: &[Stdlib]) -> Result<(), InterpretError> {
-        for lib in libs.iter() {
-            self.open(*lib)?;
-        }
-        Ok(())
     }
 
     pub fn genv(&self) -> Value {
@@ -1268,9 +1241,10 @@ impl VM {
 
                         CLOSURE => {
                             let ocf = unsafe { self.func.read() };
-                            debug_assert!(ocf
-                                .as_luafn()
-                                .is_some_and(|cl| { cl.subproto().len() > bx as usize }));
+                            debug_assert!(
+                                ocf.as_luafn()
+                                    .is_some_and(|cl| { cl.subproto().len() > bx as usize })
+                            );
 
                             let cf = unsafe { ocf.as_luafn().unwrap_unchecked() };
                             let r = *unsafe { cf.subproto().get_unchecked(bx as usize) };
@@ -1403,9 +1377,10 @@ mod test {
             VM::MAX_STACK_SPACE - VM::RESERVE_STACK_SPACE
         );
 
-        assert!(vm
-            .push(Value::Int(999))
-            .is_err_and(|e| matches!(e, InterpretError::StackOverflow)));
+        assert!(
+            vm.push(Value::Int(999))
+                .is_err_and(|e| matches!(e, InterpretError::StackOverflow))
+        );
 
         // pop until stak has been clear
         while vm.top() != 0 {
@@ -1435,11 +1410,14 @@ mod test {
         }
 
         let mut vm = VM::new();
-        vm.open(Stdlib::Base)?;
 
         check_init_state(&mut vm);
         let call = r#"
-            print ("")
+            function test(a)
+                return a + 1
+            end
+
+            test(1)
         "#;
         assert!(vm.unsafe_script(call, None).is_ok());
         check_init_state(&mut vm);

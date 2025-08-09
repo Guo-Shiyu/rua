@@ -5,9 +5,9 @@ use std::{
 };
 
 use crate::{
+    InterpretError,
     heap::{Gc, LuaClosure, RsClosure, StrImpl, Table, Tag, TagBox, TypeTag, UserData},
     state::VM,
-    InterpretError,
 };
 
 #[repr(C)]
@@ -373,7 +373,7 @@ impl Value {
             Value::Bool(b) => (0x1, b as _),
             Value::Int(i) => (0x2, i as _),
             Value::Float(f) => (0x4, f.to_bits()),
-            Value::RsFn(f) => (0x8, f as _),
+            Value::RsFn(f) => (0x8, f as u64),
             Value::Str(p) => (0x10, TagBox::from(p).raw_repr()),
             Value::Table(p) => (0x20, TagBox::from(p).raw_repr()),
             Value::Fn(p) => (0x40, TagBox::from(p).raw_repr()),

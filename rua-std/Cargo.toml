@@ -4,9 +4,9 @@ edition.workspace = true
 version.workspace = true
 
 [lib]
-name = "base"
+name = "rua54"
 crate-type = ["cdylib"]
 
 [dependencies]
 rua-core = { path = "../rua-core" }
-rua-std-decl = { path = "../rua-std-decl" }
+rua-std-macro = { path = "../rua-std-macro" }
