@@ -291,7 +291,7 @@ pub enum Expr {
     // anonymous function defination, e.g, : function () ... end
     Lambda(FuncBody),
 
-    // table.key | table[key]
+    // prefix.key | prefix[key]
     Subscript {
         prefix: ExprNode,
         key: ExprNode,

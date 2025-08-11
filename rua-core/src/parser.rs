@@ -50,12 +50,11 @@ impl Parser<'_> {
         // treat whole file as a function body
         let mut block = parser.block()?;
 
-        debug_assert!(block.name() == Block::ANONYMOUS_CHUNK);
-        debug_assert!(parser.current.is_eof());
-        debug_assert!(parser.ahead.is_eof());
+        if !parser.current.is_eof() {
+            return Err(parser.unexpected(&[Token::Eof]));
+        }
 
         block.chunkname = chunkname;
-
         Ok(block)
     }
 

@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, LinkedList},
-    fmt::{Debug, Display},
+    fmt::{Debug, Display, write},
     io::{BufReader, BufWriter, Read, Write},
     num::NonZeroU32,
     ops::{Deref, DerefMut},
@@ -8,8 +8,8 @@ use std::{
 
 use crate::{
     ast::{
-        Attribute, BasicBlock, BinOp, Block, Expr, ExprNode, Field, FieldKey, FuncBody, FuncCall,
-        GenericFor, NumericFor, ParameterList, SrcLoc, Stmt, StmtNode, UnOp,
+        ArgumentList, Attribute, BasicBlock, BinOp, Block, Expr, ExprNode, Field, FieldKey,
+        FuncBody, FuncCall, GenericFor, NumericFor, ParameterList, SrcLoc, Stmt, StmtNode, UnOp,
     },
     heap::{Gc, GcOp, Heap, MemStat, Tag, TypeTag},
     state::RegIndex,
@@ -738,7 +738,7 @@ impl Proto {
                         self.kst[c as usize]
                     ),
                     GETI => write!(f, "r({}) = r({})[{}]", a, b, c),
-                    GETFIELD => write!(f, "r({}) = r({})[{}]", a, b, self.kst[c as usize]),
+                    GETFIELD => write!(f, "r({}) = r({})[{:?}]", a, b, self.kst[c as usize]),
                     SETTABUP => write!(
                         f,
                         "{}[{}] = {}",
@@ -760,6 +760,16 @@ impl Proto {
                         }
                     }
                     NEWTABLE => write!(f, "r({a}) = {{}}"),
+                    SELF => write!(
+                        f,
+                        "r({}) = r({})[{:?}], r({}) = r({})",
+                        a,
+                        b,
+                        self.kst[c as usize],
+                        a + 1,
+                        b
+                    ),
+                    ADDI => write!(f, "r({a}) = r({b}) + {}", self.kst[c as usize],),
                     EQ => write!(
                         f,
                         "If r({}) {}= r({}), --> {}",
@@ -929,6 +939,7 @@ pub struct GenState {
     pub loopbp: LinkedList<Vec<(u32, u32)>>, // loop backpatch (iscidx, pc), used for `break`
     pub nextreg: RegIndex,                   // next free reg index
     pub maxreg: u8,                          // max reg index
+    pub depth: u8,                           // table index depth of current expression
     pub ksts: Vec<Value>,                    // constants
     pub upvals: Vec<UpvalDecl>,              // upvalue declration
     pub code: Vec<Instruction>,              // byte code
@@ -955,6 +966,7 @@ impl GenState {
             loopbp: LinkedList::default(),
             nextreg: 0,
             maxreg: 0,
+            depth: 0,
             ksts: Vec::new(),
             upvals: Vec::new(),
             subproto: Vec::new(),
@@ -1205,9 +1217,6 @@ enum ExprGenCtx {
 
     // expr is the single value to be returned
     PotentialTailCall,
-
-    // intermidiate table can be cached
-    MultiLevelTableIndex { _depth: u8, _dest: RegIndex },
 }
 
 impl ExprGenCtx {
@@ -1488,7 +1497,7 @@ impl CodeGen {
             Stmt::GenericFor(genfor) => self.walk_generic_for(genfor, mem),
             Stmt::LocalVarDecl { names, exprs } => self.walk_local_decl(names, exprs, mem),
             Stmt::Expr(exp) => {
-                let _ = self.walk_common_expr(exp, Ctx::Ignore, mem)?;
+                self.walk_common_expr(exp, Ctx::Ignore, mem)?;
                 Ok(())
             }
         }
@@ -1522,27 +1531,28 @@ impl CodeGen {
         self.enter_loop();
         let condbeg = cond.def_begin();
         let blockend = cond.def_end();
-        let cond = {
-            let sts = self.walk_common_expr(cond, Ctx::Keep, mem)?;
-            // TODO:
-            // if let Some(flag) = self.try_eval_as_const_bool(&sts) {
-            //     if flag {
-            //         // while true, elimitate TEST, JMP instruction
-            //     } else {
-            //         // while false, skip loop body.
-            //     }
-            // }
-            self.load_expr_to_local(sts, condbeg)
-        };
-        self.emit(Isc::iabck(TEST, cond, 0, 0), condbeg);
-        let (bpidx, oldpc) = self.set_recover_point(condbeg);
-        self.walk_basic_block(block, mem)?;
-        self.leave_loop();
-        let step = (self.cur_pc() - oldpc) as i32;
-        self.emit_backpatch(bpidx, Isc::isj(JMP, step));
 
-        // -2: current pc is the next isc and JMP self is another instruction
-        self.emit(Isc::isj(JMP, -step - 2), blockend);
+        let condsts = self.walk_common_expr(cond, Ctx::Keep, mem)?;
+        if let Some(flag) = self.try_eval_as_const_bool(&condsts)
+            && !flag
+        {
+            // TODO: if the loop body contains a label which could be jumped into from other code, we should not skip it.
+            // it's a while false loop, skip loop body.
+            self.leave_loop();
+        } else {
+            let condreg = self.load_expr_to_local(condsts, condbeg);
+            self.emit(Isc::iabck(TEST, condreg, 0, 0), condbeg);
+            let (bpidx, oldpc) = self.set_recover_point(condbeg);
+            self.walk_basic_block(block, mem)?;
+
+            self.leave_loop();
+            let step = (self.cur_pc() - oldpc) as i32;
+            self.emit_backpatch(bpidx, Isc::isj(JMP, step));
+
+            // -2: current pc is the next isc and JMP self is another instruction
+            self.emit(Isc::isj(JMP, -step - 2), blockend);
+        }
+
         Ok(())
     }
 
@@ -1793,6 +1803,49 @@ impl CodeGen {
         }
     }
 
+    fn emit_call_with_args(
+        &mut self,
+        callisc: OpCode,
+        fnreg: RegIndex,
+        mut args: SrcLoc<ArgumentList>,
+        exp_ret: u32,
+        callln: u32,
+        is_self_call: bool,
+        mem: &mut Heap,
+    ) -> Result<ExprStatus, CodeGenError> {
+        // arguments
+        let nparam = args.namelist.len();
+        for (index, param) in std::mem::take(&mut args.namelist).into_iter().enumerate() {
+            let preg = self.alloc_free_reg();
+            // assert_eq!(
+            //     preg,
+            //     if is_self_call {
+            //         // the self argument use 1 register
+            //         fnreg + index as i32 + 2
+            //     } else {
+            //         fnreg + index as i32 + 1
+            //     }
+            // );
+            self.walk_common_expr(param, Ctx::must_use(preg), mem)?;
+        }
+
+        // call function
+        let argnum = if is_self_call { nparam + 2 } else { nparam + 1 } as i32;
+        self.emit(
+            Isc::iabc(callisc, fnreg, argnum, exp_ret as i32 + 1),
+            callln,
+        );
+
+        // reserve enough space for return value
+        if exp_ret as usize > nparam {
+            for _ in nparam..exp_ret as usize {
+                self.alloc_free_reg();
+            }
+        }
+
+        Ok(ExprStatus::Reg(fnreg))
+    }
+
     fn walk_fn_call(
         &mut self,
         call: FuncCall,
@@ -1801,59 +1854,34 @@ impl CodeGen {
         tail_call: bool,
         mem: &mut Heap,
     ) -> Result<ExprStatus, CodeGenError> {
+        let callisc = if tail_call { TAILCALL } else { CALL };
         match call {
             FuncCall::MethodCall {
-                prefix: _,
-                method: _,
-                args: _,
+                prefix,
+                method,
+                args,
             } => {
-                todo!("method call")
-            }
-            FuncCall::FreeFnCall { prefix, mut args } => {
-                let nparam = args.namelist.len();
-                let callln = prefix.def_begin();
-
-                let fnreg_real = match self.walk_common_expr(prefix, Ctx::must_use(fnreg), mem)? {
-                    ExprStatus::Reg(reg) => {
-                        // function
-                        if reg != self.nextreg - 1 {
-                            let tail = self.alloc_free_reg();
-                            self.emit(Isc::iabc(MOVE, tail, fnreg, 0), callln);
-                            tail
-                        } else {
-                            reg
-                        }
-                    }
+                let callln = method.def_begin();
+                let objreg = match self.walk_common_expr(prefix, Ctx::Keep, mem)? {
+                    ExprStatus::Reg(reg) => reg,
                     _ => unreachable!(),
                 };
 
-                debug_assert_eq!(fnreg, fnreg_real);
+                // method name
+                let kreg = self.find_or_create_kstr(method.as_str(), mem);
+                self.emit(Isc::iabc(SELF, fnreg, objreg, kreg), callln);
+                self.alloc_free_reg(); // reserve free reg for self, the first argument
+                dbg!(self.nextreg);
+                let res =
+                    self.emit_call_with_args(callisc, fnreg, args, exp_ret, callln, true, mem);
+                dbg!(self.nextreg);
+                res
+            }
 
-                let mut n: u32 = 0;
-                for param in std::mem::take(&mut args.namelist).into_iter() {
-                    n += 1;
-                    let preg = self.alloc_free_reg();
-                    let _ = self.walk_common_expr(param, Ctx::must_use(preg), mem);
-                }
-                while n != 0 {
-                    self.free_reg();
-                    n -= 1;
-                }
-
-                let callisc = if tail_call { TAILCALL } else { CALL };
-                self.emit(
-                    Isc::iabc(callisc, fnreg, (nparam + 1) as i32, exp_ret as i32 + 1),
-                    callln,
-                );
-
-                // reserve enuogh space for return value
-                if exp_ret as usize > nparam {
-                    for _ in nparam..exp_ret as usize {
-                        self.alloc_free_reg();
-                    }
-                }
-
-                Ok(ExprStatus::Reg(fnreg))
+            FuncCall::FreeFnCall { prefix, args } => {
+                let callln = prefix.def_begin();
+                self.walk_common_expr(prefix, Ctx::must_use(fnreg), mem)?;
+                self.emit_call_with_args(callisc, fnreg, args, exp_ret, callln, false, mem)
             }
         }
     }
@@ -1972,6 +2000,22 @@ impl CodeGen {
                         let reg = self.lookup_and_load(id, None, def.0, mem);
                         ExprStatus::Reg(reg)
                     }
+                    // TODO: fix subscription code gen
+                    // Expr::Subscript { prefix, key } => {
+                    //     if let Expr::Ident(id) = &**prefix {
+                    //         let tablereg =
+                    //             self.lookup_and_load(id.clone(), None, prefix.def_begin(), mem);
+                    //         // let dest = self.alloc_free_reg()
+                    //         // dbg!(&id, &key);
+                    //         // let kreg = self.alloc_const_reg(k)
+                    //         // self.emit(Isc::iabc(GETFIELD, dest, tablereg, ), line);
+                    //         todo!()
+                    //     } else {
+                    //         let reg = self.alloc_free_reg();
+                    //         self.walk_common_expr(prefix, Ctx::must_use(reg), mem)?;
+                    //         self.walk_common_expr(key, Ctx::must_use(reg), mem)?
+                    //     }
+                    // }
                     otherwise => {
                         let free = self.alloc_free_reg();
                         self.emit_expr(otherwise, free, def, mem)?
@@ -2054,15 +2098,6 @@ impl CodeGen {
                     Ok(status)
                 }
             },
-
-            Ctx::MultiLevelTableIndex {
-                _depth: _,
-                _dest: _,
-            } => {
-                // TODO:
-                // expr codegen: multi level Table Index optimize
-                self.walk_common_expr(node, Ctx::Keep, mem)
-            }
         }
     }
 
@@ -2074,16 +2109,16 @@ impl CodeGen {
         let pre_state = self.nextreg;
         match node {
             Expr::Subscript { prefix, key } => {
-                let _ = self.walk_common_expr(prefix, Ctx::Ignore, mem);
-                let _ = self.walk_common_expr(key, Ctx::Ignore, mem);
+                self.walk_common_expr(prefix, Ctx::Ignore, mem)?;
+                self.walk_common_expr(key, Ctx::Ignore, mem)?;
             }
             Expr::FuncCall(call) => {
                 let next = self.alloc_free_reg();
-                let _ = self.walk_fn_call(call, next, 0, false, mem);
+                self.walk_fn_call(call, next, 0, false, mem)?;
             }
             Expr::TableCtor(ctor) => {
                 for field in ctor {
-                    let _ = self.walk_common_expr(field.val, Ctx::Ignore, mem);
+                    self.walk_common_expr(field.val, Ctx::Ignore, mem)?;
                 }
             }
             Expr::BinaryOp {
@@ -2091,11 +2126,11 @@ impl CodeGen {
                 op: _,
                 rhs: r,
             } => {
-                let _ = self.walk_common_expr(l, Ctx::Ignore, mem);
-                let _ = self.walk_common_expr(r, Ctx::Ignore, mem);
+                self.walk_common_expr(l, Ctx::Ignore, mem)?;
+                self.walk_common_expr(r, Ctx::Ignore, mem)?;
             }
             Expr::UnaryOp { op: _, expr } => {
-                let _ = self.walk_common_expr(expr, Ctx::Ignore, mem);
+                self.walk_common_expr(expr, Ctx::Ignore, mem)?;
             }
 
             // no side-effect, skip codegen for other expression in ignore case.
@@ -2171,19 +2206,21 @@ impl CodeGen {
 
             Expr::Subscript { prefix, key } => {
                 let key_status = self.walk_common_expr(key, Ctx::Keep, mem)?;
-                match self.walk_common_expr(
-                    prefix,
-                    Ctx::MultiLevelTableIndex {
-                        _depth: 1,
-                        _dest: dest,
-                    },
-                    mem,
-                )? {
+
+                self.depth += 1;
+                let ctx = if self.depth == 1 {
+                    Ctx::Keep
+                } else {
+                    Ctx::must_use(dest)
+                };
+                let res = match self.walk_common_expr(prefix, ctx, mem)? {
                     ExprStatus::Reg(pre) | ExprStatus::Call(pre) => {
                         self.emit_index_local(key_status, def.0, pre, dest)
                     }
                     _ => unreachable!(),
-                }
+                };
+                self.depth -= 1;
+                res
             }
 
             Expr::TableCtor(fields) => self.walk_table_ctor(fields, dest, def, mem)?,
@@ -2404,7 +2441,7 @@ impl CodeGen {
             (lit @ ExprStatus::LitInt(imm), ExprStatus::Reg(r))
             | (ExprStatus::Reg(r), lit @ ExprStatus::LitInt(imm)) => {
                 if let Some(iisc) = Self::try_select_imm_isc(op) {
-                    self.emit(Isc::iabc(iisc, r, imm as i32, 0), def.0)
+                    self.emit(Isc::iabc(iisc, dest, r, imm as i32), def.0)
                 } else {
                     let reg = self.load_expr_to_local(lit, def.1);
                     self.emit(Isc::iabc(Self::default_isc(op), dest, r, reg), def.1)
@@ -3130,6 +3167,101 @@ mod test {
         assert_eq!(std::mem::size_of::<Instruction>(), 4);
     }
 
+    fn codegen_snippet(src: &str, heap: &mut Heap) -> Proto {
+        use crate::parser::Parser;
+        let block = Parser::parse(src, None).unwrap();
+        CodeGen::codegen(block, false, heap).unwrap()
+    }
+
+    #[test]
+    fn codegen_global_var_load() {
+        let src = r#"
+        local a = G.a
+        "#;
+
+        let mut heap = Heap::default();
+        let proto = codegen_snippet(src, &mut heap);
+
+        // dbg!(&proto);
+        assert_eq!(proto.code[1].get_op(), OpCode::GETTABUP);
+        assert_eq!(proto.code[2].get_op(), OpCode::GETFIELD);
+        assert_eq!(proto.code.len(), 4);
+    }
+
+    #[test]
+    fn codegen_fn_call_and_tail_call() {
+        let src = r#"
+        f(16, 16)
+        local a = 1
+        f(a, a + 1)
+
+        G.f(1, 2)
+        "#;
+
+        let mut heap = Heap::default();
+        let proto = codegen_snippet(src, &mut heap);
+
+        // dbg!(&proto);
+        assert_eq!(proto.code[1].get_op(), OpCode::GETTABUP);
+        assert_eq!(proto.code[4].get_op(), OpCode::CALL);
+        assert_eq!(proto.code[9].get_op(), OpCode::CALL);
+        assert_eq!(proto.code[14].get_op(), OpCode::CALL);
+    }
+
+    #[test]
+    fn codegen_self_call() {
+        let src = r#"
+        local a = {}
+        a:call(16, 16)
+        a.b:call(16, 16, 16)
+        a.b.c:call(16, 16, 16)
+        "#;
+
+        let mut heap = Heap::default();
+        let proto = codegen_snippet(src, &mut heap);
+
+        dbg!(&proto);
+        assert_eq!(proto.code[2].get_op(), OpCode::GETFIELD);
+        assert_eq!(proto.code[3].get_op(), OpCode::SELF);
+        assert_eq!(proto.code[7].get_op(), OpCode::CALL);
+        // assert_eq!(proto.code.len(), 9);
+    }
+
+    #[test]
+    fn codegen_self_tail_call() {
+        let src = r#"
+        local a = nil
+        return a.b:call(16, 16, 16)
+        return a.b.c:call(16, 16, 16)
+        "#;
+
+        let mut heap = Heap::default();
+        let proto = codegen_snippet(src, &mut heap);
+
+        dbg!(&proto);
+        assert_eq!(proto.code[2].get_op(), OpCode::GETFIELD);
+        assert_eq!(proto.code[3].get_op(), OpCode::SELF);
+        assert_eq!(proto.code[7].get_op(), OpCode::TAILCALL);
+        assert_eq!(proto.code.len(), 9);
+    }
+
+    #[test]
+    fn codegen_skip_while_false_loop() {
+        let src = r#"
+        while false do
+            print "Hello World"
+        end
+        "#;
+
+        let mut heap = Heap::default();
+        let res = codegen_snippet(src, &mut heap);
+
+        // only contain `VARARGPREP` and `RETURN0` instruction
+        assert_eq!(res.code[0].get_op(), OpCode::VARARGPREP);
+        assert_eq!(res.code[1].get_op(), OpCode::RETURN0);
+        assert_eq!(res.code.len(), 2);
+    }
+
     #[allow(dead_code)]
     fn dump_and_undump<W, R, T>(filename: &str, to_test: &[T], wop: W, rop: R)
     where
@@ -3166,12 +3298,6 @@ mod test {
             temp_dir.push("ruac.test.binary.proto");
             temp_dir
         };
-
-        // let src = r#"
-        //     local function f(a, b)
-        //         return a + b
-        //     end
-        // "#;
 
         let src = r#"
             print "Hello World"
