@@ -472,7 +472,7 @@ impl Debug for Instruction {
             }
             OpMode::IAx => {
                 let (code, ax) = self.repr_ax();
-                write!(f, "{code:<16}\t{ax:<3}      ")
+                write!(f, "{code:<16}\t{ax:<3}         ")
             }
             OpMode::IsJ => {
                 let (code, sj) = self.repr_sj();
@@ -737,6 +737,7 @@ impl Proto {
                         self.updecl[b as usize].name(),
                         self.kst[c as usize]
                     ),
+                    GETTABLE => write!(f, "r({a}) = r({b})[r({c})]"),
                     GETI => write!(f, "r({}) = r({})[{}]", a, b, c),
                     GETFIELD => write!(f, "r({}) = r({})[{:?}]", a, b, self.kst[c as usize]),
                     SETTABUP => write!(
@@ -856,6 +857,13 @@ impl Proto {
                         )
                     }
                     CALL => write!(f, "Call r({}) with {} in, {} out  <==", a, b - 1, c - 1),
+                    TAILCALL => write!(
+                        f,
+                        "Tail Call r({}) with {} in, {} out  <==",
+                        a,
+                        b - 1,
+                        c - 1
+                    ),
                     RETURN => write!(
                         f,
                         "Return {} values of r({}) ... r({})  =>",
@@ -864,7 +872,7 @@ impl Proto {
                         b - 2
                     ),
                     RETURN0 => write!(f, "Return 0 value  =>"),
-                    RETURN1 => write!(f, "Return r({:>5}) =>", a),
+                    RETURN1 => write!(f, "Return r({a}) =>"),
                     _ => Ok(()),
                 }
             }
@@ -939,7 +947,7 @@ pub struct GenState {
     pub loopbp: LinkedList<Vec<(u32, u32)>>, // loop backpatch (iscidx, pc), used for `break`
     pub nextreg: RegIndex,                   // next free reg index
     pub maxreg: u8,                          // max reg index
-    pub depth: u8,                           // table index depth of current expression
+    pub _depth: u8,                          // table index depth of current expression
     pub ksts: Vec<Value>,                    // constants
     pub upvals: Vec<UpvalDecl>,              // upvalue declration
     pub code: Vec<Instruction>,              // byte code
@@ -966,7 +974,7 @@ impl GenState {
             loopbp: LinkedList::default(),
             nextreg: 0,
             maxreg: 0,
-            depth: 0,
+            _depth: 0,
             ksts: Vec::new(),
             upvals: Vec::new(),
             subproto: Vec::new(),
@@ -1034,8 +1042,8 @@ impl GenState {
     }
 
     /// Free last allocated register on vm stack, return next available register
-    fn free_reg(&mut self) -> RegIndex {
-        self.nextreg -= 1;
+    fn free_reg_n(&mut self, n: i32) -> RegIndex {
+        self.nextreg -= n;
         self.nextreg
     }
 
@@ -1116,27 +1124,33 @@ impl GenState {
 
     fn emit_index_local(
         &mut self,
+        pfx_sts: ExprStatus,
         keys: ExprStatus,
         ln: u32,
-        pre_reg: RegIndex,
-        dest: RegIndex,
+        dest: Option<RegIndex>,
     ) -> ExprStatus {
+        let pfx_reg = match pfx_sts {
+            ExprStatus::Reg(r) => r,
+            _ => self.load_expr_to_local(pfx_sts, ln),
+        };
+        
+        let dest = dest.unwrap_or(pfx_reg);
         match keys {
             ExprStatus::LitInt(ki) => {
                 if ki.abs() <= Isc::MAX_C as i64 {
-                    self.emit(Isc::iabc(GETI, dest, pre_reg, ki as i32), ln);
+                    self.emit(Isc::iabc(GETI, dest, pfx_reg, ki as i32), ln);
                 } else {
                     let kreg = self.alloc_const_reg(ki.into());
-                    self.emit(Isc::iabc(GETFIELD, dest, pre_reg, kreg), ln);
+                    self.emit(Isc::iabc(GETFIELD, dest, pfx_reg, kreg), ln);
                 }
             }
 
             ExprStatus::Kst(kreg) => {
-                self.emit(Isc::iabc(GETFIELD, dest, pre_reg, kreg), ln);
+                self.emit(Isc::iabc(GETFIELD, dest, pfx_reg, kreg), ln);
             }
 
             ExprStatus::Reg(reg) => {
-                self.emit(Isc::iabc(GETTABLE, dest, pre_reg, reg), ln);
+                self.emit(Isc::iabc(GETTABLE, dest, pfx_reg, reg), ln);
             }
 
             _ => unreachable!(),
@@ -1759,7 +1773,7 @@ impl CodeGen {
         let pidx = self.subproto.len() - 1;
         self.emit(Isc::iabx(CLOSURE, dest, pidx as i32), def.0);
         debug_assert_eq!(self.nextreg, dest + 1);
-        self.free_reg();
+        self.free_reg_n(1);
 
         Ok(ExprStatus::Reg(dest))
     }
@@ -1813,6 +1827,11 @@ impl CodeGen {
         is_self_call: bool,
         mem: &mut Heap,
     ) -> Result<ExprStatus, CodeGenError> {
+        // reserve 1 register for `self` object at the register of the first argument
+        if is_self_call {
+            self.alloc_free_reg();
+        }
+
         // arguments
         let nparam = args.namelist.len();
         for (index, param) in std::mem::take(&mut args.namelist).into_iter().enumerate() {
@@ -1854,7 +1873,7 @@ impl CodeGen {
         tail_call: bool,
         mem: &mut Heap,
     ) -> Result<ExprStatus, CodeGenError> {
-        let callisc = if tail_call { TAILCALL } else { CALL };
+        let callsc = if tail_call { TAILCALL } else { CALL };
         match call {
             FuncCall::MethodCall {
                 prefix,
@@ -1862,26 +1881,23 @@ impl CodeGen {
                 args,
             } => {
                 let callln = method.def_begin();
-                let objreg = match self.walk_common_expr(prefix, Ctx::Keep, mem)? {
+                let pfxln = prefix.def_begin();
+
+                let objreg = match self.walk_common_expr(prefix, Ctx::must_use(fnreg), mem)? {
                     ExprStatus::Reg(reg) => reg,
-                    _ => unreachable!(),
+                    sts @ _ => self.load_expr_to_local(sts, pfxln),
                 };
 
                 // method name
                 let kreg = self.find_or_create_kstr(method.as_str(), mem);
-                self.emit(Isc::iabc(SELF, fnreg, objreg, kreg), callln);
-                self.alloc_free_reg(); // reserve free reg for self, the first argument
-                dbg!(self.nextreg);
-                let res =
-                    self.emit_call_with_args(callisc, fnreg, args, exp_ret, callln, true, mem);
-                dbg!(self.nextreg);
-                res
+                self.emit(Isc::iabck(SELF, fnreg, objreg, kreg), callln);
+                self.emit_call_with_args(callsc, fnreg, args, exp_ret, callln, true, mem)
             }
 
             FuncCall::FreeFnCall { prefix, args } => {
                 let callln = prefix.def_begin();
                 self.walk_common_expr(prefix, Ctx::must_use(fnreg), mem)?;
-                self.emit_call_with_args(callisc, fnreg, args, exp_ret, callln, false, mem)
+                self.emit_call_with_args(callsc, fnreg, args, exp_ret, callln, false, mem)
             }
         }
     }
@@ -2000,22 +2016,12 @@ impl CodeGen {
                         let reg = self.lookup_and_load(id, None, def.0, mem);
                         ExprStatus::Reg(reg)
                     }
-                    // TODO: fix subscription code gen
-                    // Expr::Subscript { prefix, key } => {
-                    //     if let Expr::Ident(id) = &**prefix {
-                    //         let tablereg =
-                    //             self.lookup_and_load(id.clone(), None, prefix.def_begin(), mem);
-                    //         // let dest = self.alloc_free_reg()
-                    //         // dbg!(&id, &key);
-                    //         // let kreg = self.alloc_const_reg(k)
-                    //         // self.emit(Isc::iabc(GETFIELD, dest, tablereg, ), line);
-                    //         todo!()
-                    //     } else {
-                    //         let reg = self.alloc_free_reg();
-                    //         self.walk_common_expr(prefix, Ctx::must_use(reg), mem)?;
-                    //         self.walk_common_expr(key, Ctx::must_use(reg), mem)?
-                    //     }
-                    // }
+                    Expr::Subscript { prefix, key } => {
+                        let line = key.def_begin();
+                        let pfxsts = self.walk_common_expr(prefix, Ctx::Keep, mem)?;
+                        let keysts = self.walk_common_expr(key, Ctx::Keep, mem)?;
+                        self.emit_index_local(pfxsts, keysts, line, None)
+                    }
                     otherwise => {
                         let free = self.alloc_free_reg();
                         self.emit_expr(otherwise, free, def, mem)?
@@ -2106,7 +2112,7 @@ impl CodeGen {
         node: Expr,
         mem: &mut Heap,
     ) -> Result<ExprStatus, CodeGenError> {
-        let pre_state = self.nextreg;
+        let pre_next_reg = self.nextreg;
         match node {
             Expr::Subscript { prefix, key } => {
                 self.walk_common_expr(prefix, Ctx::Ignore, mem)?;
@@ -2136,12 +2142,12 @@ impl CodeGen {
             // no side-effect, skip codegen for other expression in ignore case.
             _ => {}
         };
+
         // recover register state
-        let mut try_recover = self.nextreg;
-        debug_assert!(try_recover >= pre_state);
-        while try_recover != pre_state {
-            try_recover = self.free_reg();
-        }
+        let cur_next_reg = self.nextreg;
+        self.free_reg_n(cur_next_reg - pre_next_reg);
+
+        assert_eq!(self.nextreg, pre_next_reg);
         Ok(ExprStatus::Reg(RegIndex::MAX))
     }
 
@@ -2205,22 +2211,10 @@ impl CodeGen {
             Expr::Lambda(fnbody) => self.walk_fn_def(fnbody, dest, def, mem)?,
 
             Expr::Subscript { prefix, key } => {
-                let key_status = self.walk_common_expr(key, Ctx::Keep, mem)?;
-
-                self.depth += 1;
-                let ctx = if self.depth == 1 {
-                    Ctx::Keep
-                } else {
-                    Ctx::must_use(dest)
-                };
-                let res = match self.walk_common_expr(prefix, ctx, mem)? {
-                    ExprStatus::Reg(pre) | ExprStatus::Call(pre) => {
-                        self.emit_index_local(key_status, def.0, pre, dest)
-                    }
-                    _ => unreachable!(),
-                };
-                self.depth -= 1;
-                res
+                let line = key.def_begin();
+                let pfxsts = self.walk_common_expr(prefix, Ctx::Keep, mem)?;
+                let keysts = self.walk_common_expr(key, Ctx::Keep, mem)?;
+                self.emit_index_local(pfxsts, keysts, line, Some(dest))
             }
 
             Expr::TableCtor(fields) => self.walk_table_ctor(fields, dest, def, mem)?,
@@ -3174,9 +3168,11 @@ mod test {
     }
 
     #[test]
-    fn codegen_global_var_load() {
+    fn codegen_table_direct_index() {
         let src = r#"
         local a = G.a
+        local b = G.a.b
+        local c = G.a.b.c
         "#;
 
         let mut heap = Heap::default();
@@ -3185,7 +3181,31 @@ mod test {
         // dbg!(&proto);
         assert_eq!(proto.code[1].get_op(), OpCode::GETTABUP);
         assert_eq!(proto.code[2].get_op(), OpCode::GETFIELD);
-        assert_eq!(proto.code.len(), 4);
+        assert_eq!(proto.code[6].get_op(), OpCode::GETTABUP);
+        assert_eq!(proto.code[7].get_op(), OpCode::GETFIELD);
+        assert_eq!(proto.code[8].get_op(), OpCode::GETFIELD);
+        assert_eq!(proto.code[9].get_op(), OpCode::GETFIELD);
+        assert_eq!(proto.code.len(), 11);
+    }
+
+    #[test]
+    fn codegen_table_indirect_index() {
+        let src = r#"
+        local a = G["a"]
+        local b = G[a]
+        local c = G[a[b]]
+        "#;
+
+        let mut heap = Heap::default();
+        let proto = codegen_snippet(src, &mut heap);
+
+        dbg!(&proto);
+        assert_eq!(proto.code[1].get_op(), OpCode::GETTABUP);
+        assert_eq!(proto.code[2].get_op(), OpCode::GETFIELD);
+        assert_eq!(proto.code[5].get_op(), OpCode::GETTABUP);
+        assert_eq!(proto.code[6].get_op(), OpCode::GETTABLE);
+        assert_eq!(proto.code[7].get_op(), OpCode::GETTABLE);
+        assert_eq!(proto.code.len(), 9);
     }
 
     #[test]
@@ -3220,18 +3240,18 @@ mod test {
         let mut heap = Heap::default();
         let proto = codegen_snippet(src, &mut heap);
 
-        dbg!(&proto);
-        assert_eq!(proto.code[2].get_op(), OpCode::GETFIELD);
+        // dbg!(&proto);
+        assert_eq!(proto.code[2].get_op(), OpCode::EXTRAARG);
         assert_eq!(proto.code[3].get_op(), OpCode::SELF);
-        assert_eq!(proto.code[7].get_op(), OpCode::CALL);
-        // assert_eq!(proto.code.len(), 9);
+        assert_eq!(proto.code[8].get_op(), OpCode::SELF);
+        assert_eq!(proto.code[19].get_op(), OpCode::CALL);
     }
 
     #[test]
     fn codegen_self_tail_call() {
         let src = r#"
         local a = nil
-        return a.b:call(16, 16, 16)
+        a.b:call(16, 16, 16)
         return a.b.c:call(16, 16, 16)
         "#;
 

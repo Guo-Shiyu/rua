@@ -3,7 +3,7 @@ use std::{
     ops::{Deref, DerefMut},
 };
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 /// Warpper for an ast-node to attach source location info.
 ///
 /// `lineinfo` represent that (begin, end) of defination line number.
@@ -74,7 +74,7 @@ impl<T> DerefMut for SrcLoc<T> {
 /// ``` text
 /// block ::= {stat} [retstat]
 /// ```
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct Block {
     pub chunkname: Option<String>,
     pub stats: Vec<StmtNode>,
@@ -125,7 +125,7 @@ impl Block {
 ///        local function Name funcbody |
 ///        local attnamelist [`=` explist]
 /// ```
-
+#[derive(Debug)]
 pub enum Stmt {
     // assignment,  x = A | x.y.z = A
     Assign {
@@ -224,6 +224,7 @@ impl Stmt {
 ///
 /// args ::=  `(` [explist] `)` | tablector | LiteralString
 /// ```
+#[derive(Debug)]
 pub enum FuncCall {
     // i.e: func(1, 2, 3, ...)
     FreeFnCall {
@@ -243,6 +244,7 @@ pub enum FuncCall {
 /// funcbody ::= `(` [parlist] `)` block end
 /// paralist ::= namelist [`,` `...`] | `...`
 /// ```
+#[derive(Debug)]
 pub struct FuncBody {
     pub params: ParameterList,
     pub body: BasicBlock,
@@ -251,6 +253,7 @@ pub struct FuncBody {
 /// ``` text
 /// for Name `=` exp `,` exp [`,` exp] do block end
 /// ```
+#[derive(Debug)]
 pub struct NumericFor {
     pub iter: SrcLoc<String>,
     pub init: ExprNode,
@@ -262,6 +265,7 @@ pub struct NumericFor {
 /// ``` text
 /// for namelist in explist do block end
 /// ```
+#[derive(Debug)]
 pub struct GenericFor {
     pub iters: Vec<SrcLoc<String>>,
     pub exprs: Vec<ExprNode>,
@@ -275,7 +279,7 @@ pub struct GenericFor {
 ///
 /// prefixexp ::= var | functioncall | `(` exp `)`
 /// ```
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub enum Expr {
     #[default]
     Nil,
@@ -323,6 +327,14 @@ impl Expr {
             _ => None,
         }
     }
+
+    /// Returns `true` if the expr is [`Ident`].
+    ///
+    /// [`Ident`]: Expr::Ident
+    #[must_use]
+    pub fn is_ident(&self) -> bool {
+        matches!(self, Self::Ident(..))
+    }
 }
 
 /// There are two possible attributes: const, which declares a constant variable, that is, a variable that cannot be assigned to after its initialization;
@@ -358,6 +370,7 @@ impl From<Attribute> for u8 {
     }
 }
 
+#[derive(Debug)]
 pub struct FnHeader<H> {
     pub namelist: Vec<H>,
     pub vargs: bool,
@@ -378,11 +391,13 @@ pub type ArgumentList = FnHeader<ExprNode>;
 ///
 /// The difference is that `Expr` will be evaluated and the value of `Expr` will be treated as table's key,
 /// while `Key` will treated as table's key directly.
+#[derive(Debug)]
 pub enum FieldKey {
     Expr(ExprNode),
     Key(String),
 }
 
+#[derive(Debug)]
 pub struct Field {
     pub key: Option<FieldKey>,
     pub val: ExprNode,
@@ -411,7 +426,7 @@ impl Field {
 /// Binary operators in Lua 5.4
 /// 
 #[rustfmt::skip]
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum BinOp {
     // Notice that do not change the order of operators, there is a 
     // `binary_operator_priority` table in parser depends on that.
@@ -472,6 +487,7 @@ impl BinOp {
 /// ``` text
 /// unop ::= `-` | not | `#` | `~`
 /// ```
+#[derive(Debug)]
 pub enum UnOp {
     Minus,
     Not,
@@ -746,8 +762,7 @@ impl AstDumper {
 
     fn write_lable(&mut self, buf: &mut BufWriter<impl Write>, lable: char) -> Result<(), Error> {
         self.color(buf, NORMAL)?;
-        self.write_indent(buf)
-            .and_then(|_| write!(buf, "{lable} "))
+        self.write_indent(buf).and_then(|_| write!(buf, "{lable} "))
     }
 
     fn write_name(
